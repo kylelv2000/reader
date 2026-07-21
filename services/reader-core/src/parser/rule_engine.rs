@@ -480,6 +480,7 @@ impl RuleEngine {
                 last_chapter: clean_last_chapter(last_chapter),
                 update_time,
                 word_count,
+                total_chapter_num: None,
                 book_source_urls: None,
             });
         }
@@ -530,6 +531,7 @@ impl RuleEngine {
                 last_chapter: clean_last_chapter(last_chapter),
                 update_time,
                 word_count,
+                total_chapter_num: None,
                 book_source_urls: None,
             });
         }
@@ -747,6 +749,7 @@ impl RuleEngine {
                 last_chapter: clean_last_chapter(last_chapter),
                 update_time,
                 word_count,
+                total_chapter_num: None,
                 book_source_urls: None,
             });
         }
@@ -797,6 +800,7 @@ impl RuleEngine {
                 last_chapter: clean_last_chapter(last_chapter),
                 update_time,
                 word_count,
+                total_chapter_num: None,
                 book_source_urls: None,
             });
         }
@@ -845,6 +849,7 @@ impl RuleEngine {
                 last_chapter: clean_last_chapter(last_chapter),
                 update_time,
                 word_count,
+                total_chapter_num: None,
                 book_source_urls: None,
             });
         }
@@ -2105,6 +2110,7 @@ fn search_book_from_book(book: Book) -> Option<SearchBook> {
         last_chapter: book.latest_chapter_title,
         update_time: book.update_time,
         word_count: book.word_count,
+        total_chapter_num: book.total_chapter_num,
         book_source_urls: None,
     })
 }
@@ -2180,6 +2186,7 @@ fn build_search_book_from_json(
         last_chapter,
         update_time,
         word_count,
+        total_chapter_num: None,
         book_source_urls: None,
     })
 }

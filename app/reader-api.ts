@@ -105,10 +105,14 @@ export class ReaderApi {
       },
     } as RequestInit);
 
+    const envelope = (await response.json().catch(() => null)) as ApiEnvelope<T> | null;
     if (!response.ok) {
-      throw new ReaderApiError(`服务器返回 ${response.status}`, response.status === 401 ? "NEED_LOGIN" : response.status);
+      throw new ReaderApiError(
+        envelope?.errorMsg || `服务器返回 ${response.status}`,
+        response.status === 401 ? "NEED_LOGIN" : response.status,
+      );
     }
-    const envelope = (await response.json()) as ApiEnvelope<T>;
+    if (!envelope) throw new ReaderApiError("服务器响应格式无效");
     if (!envelope.isSuccess) {
       throw new ReaderApiError(envelope.errorMsg || "Reader 服务请求失败", envelope.data);
     }
@@ -605,7 +609,11 @@ export class ReaderApi {
       credentials: "include",
       signal,
     });
-    if (!response.ok || !response.body) throw new ReaderApiError(`换源搜索失败：${response.status}`);
+    if (!response.ok) {
+      const envelope = (await response.json().catch(() => null)) as ApiEnvelope<unknown> | null;
+      throw new ReaderApiError(envelope?.errorMsg || `换源搜索失败：${response.status}`);
+    }
+    if (!response.body) throw new ReaderApiError("换源搜索没有返回数据");
 
     const results = new Map<string, Book>();
     const reader = response.body.getReader();
@@ -635,11 +643,13 @@ export class ReaderApi {
     return { books: [...results.values()], lastIndex: nextLastIndex, hasMore };
   }
 
-  setBookSource(bookUrl: string, candidate: Book) {
+  setBookSource(book: Book, candidate: Book) {
     return this.request<Book>("/setBookSource", {
       method: "POST",
       body: JSON.stringify({
-        bookUrl,
+        bookUrl: book.bookUrl,
+        name: book.name,
+        author: book.author,
         newUrl: candidate.bookUrl,
         bookSourceUrl: candidate.origin,
       }),

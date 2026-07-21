@@ -56,7 +56,7 @@ const defaultPreferences: ReaderPreferences = {
   fontSize: 19,
   lineHeight: 1.9,
   contentWidth: 720,
-  fontFamily: "serif",
+  fontFamily: "system",
   pageMode: "scroll",
   chineseMode: "original",
 };
@@ -341,6 +341,7 @@ export function ReaderShell() {
   const [sourceCandidates, setSourceCandidates] = useState<Book[]>([]);
   const [showSourceSwitch, setShowSourceSwitch] = useState(false);
   const [sourceSwitching, setSourceSwitching] = useState(false);
+  const [sourceApplying, setSourceApplying] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [autoReading, setAutoReading] = useState(false);
   const [readerChrome, setReaderChrome] = useState(true);
@@ -368,6 +369,8 @@ export function ReaderShell() {
   const offlineDownloadRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const sourceSwitchAbortRef = useRef<AbortController | null>(null);
+  const sourceCandidatesForRef = useRef("");
+  const sourceSwitchBusyRef = useRef(false);
   const [shelfRefreshing, setShelfRefreshing] = useState(false);
 
   const api = useMemo(() => new ReaderApi(), []);
@@ -387,14 +390,19 @@ export function ReaderShell() {
   }, [sourceFilter, sourceQuery, sourceSort, sources]);
 
   const currentChapter = reader?.chapters[reader.chapterIndex];
-  const primaryBook = books[0];
+  const readerOfflineStatus = reader ? offlineStatus[reader.book.bookUrl] : undefined;
+  const sortedBooks = useMemo(
+    () => [...books].sort((left, right) => (right.durChapterTime || 0) - (left.durChapterTime || 0)),
+    [books],
+  );
+  const primaryBook = sortedBooks[0];
   const visibleBooks = useMemo(
     () => activeGroup === "all"
-      ? books
+      ? sortedBooks
       : activeGroup === "ungrouped"
-        ? books.filter((book) => !book.group)
-        : books.filter((book) => bookInGroup(book, activeGroup)),
-    [activeGroup, books],
+        ? sortedBooks.filter((book) => !book.group)
+        : sortedBooks.filter((book) => bookInGroup(book, activeGroup)),
+    [activeGroup, sortedBooks],
   );
   const shownBooks = visibleBooks.slice(0, shelfVisibleCount);
   const hasExploreSources = sources.some((source) => source.enabled !== false && source.enabledExplore !== false && Boolean(source.exploreUrl));
@@ -833,13 +841,17 @@ export function ReaderShell() {
       // chapter, retry, refresh the catalog, or switch source.
       setReader({ book, chapters, chapterIndex, content: "", loading: true });
       const content = await api.getBookContent(book, chapters[chapterIndex], chapterIndex);
-      setReader({ book, chapters, chapterIndex, content, loading: false });
-      if (preferredChapter || chapterIndex !== fallbackIndex) {
-        setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl
-          ? { ...item, durChapterIndex: chapterIndex, durChapterTitle: chapters[chapterIndex]?.title }
-          : item));
-        if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
-      }
+      const openedBook = {
+        ...book,
+        durChapterIndex: chapterIndex,
+        durChapterTitle: chapters[chapterIndex]?.title,
+        durChapterTime: Date.now(),
+        totalChapterNum: chapters.length,
+      };
+      setReader({ book: openedBook, chapters, chapterIndex, content, loading: false });
+      setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? openedBook : item));
+      void api.saveOfflineProgress(openedBook, chapters, chapterIndex);
+      if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
       window.setTimeout(() => readerTopRef.current?.scrollIntoView(), 10);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "打开书籍失败";
@@ -857,11 +869,24 @@ export function ReaderShell() {
     try {
       if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
       const content = await api.getBookContent(reader.book, reader.chapters[index], index);
-      setReader((current) => (current ? { ...current, chapterIndex: index, content, loading: false } : current));
+      const readAt = Date.now();
+      setReader((current) => (current ? {
+        ...current,
+        book: {
+          ...current.book,
+          durChapterIndex: index,
+          durChapterTitle: current.chapters[index]?.title,
+          durChapterTime: readAt,
+          totalChapterNum: current.chapters.length,
+        },
+        chapterIndex: index,
+        content,
+        loading: false,
+      } : current));
       setBooks((current) =>
         current.map((book) =>
           book.bookUrl === reader.book.bookUrl
-            ? { ...book, durChapterIndex: index, durChapterTitle: reader.chapters[index]?.title }
+            ? { ...book, durChapterIndex: index, durChapterTitle: reader.chapters[index]?.title, durChapterTime: readAt, totalChapterNum: reader.chapters.length }
             : book,
         ),
       );
@@ -1228,24 +1253,34 @@ export function ReaderShell() {
 
   async function loadAvailableSources(refresh = false) {
     if (!reader || !api || connection !== "connected") return toast("登录已过期，请重新登录");
+    setShowSourceSwitch(true);
+    if (!refresh && sourceCandidatesForRef.current === reader.book.bookUrl) {
+      setSourceSwitching(false);
+      return;
+    }
     sourceSwitchAbortRef.current?.abort();
     const controller = new AbortController();
     sourceSwitchAbortRef.current = controller;
-    setShowSourceSwitch(true);
     setSourceSwitching(true);
+    setSourceApplying(false);
     setSourceCandidates([]);
+    if (refresh) sourceCandidatesForRef.current = "";
     try {
       const result = await api.streamAvailableBookSources(
         reader.book,
         refresh,
-        (batch) => setSourceCandidates(() => {
-          const merged = new Map<string, Book>();
-          for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
-          return [...merged.values()];
-        }),
+        (batch) => {
+          sourceCandidatesForRef.current = reader.book.bookUrl;
+          setSourceCandidates(() => {
+            const merged = new Map<string, Book>();
+            for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
+            return [...merged.values()];
+          });
+        },
         controller.signal,
         -1,
       );
+      sourceCandidatesForRef.current = reader.book.bookUrl;
       setSourceCandidates(() => {
         const merged = new Map<string, Book>();
         for (const book of result.books) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
@@ -1259,25 +1294,43 @@ export function ReaderShell() {
     }
   }
 
+  function stopSourceScan() {
+    if (!sourceSwitching) return;
+    sourceCandidatesForRef.current = reader?.book.bookUrl || sourceCandidatesForRef.current;
+    sourceSwitchAbortRef.current?.abort();
+    sourceSwitchAbortRef.current = null;
+    setSourceSwitching(false);
+    toast(sourceCandidates.length ? `已停止，保留 ${sourceCandidates.length} 个可用书源` : "已停止扫描");
+  }
+
   async function switchBookSource(candidate: Book) {
-    if (!reader || !api) return;
+    if (!reader || !api || sourceSwitchBusyRef.current) return;
+    sourceSwitchBusyRef.current = true;
     const preferredChapter = {
-      title: currentChapter?.title,
-      progress: reader.chapters.length > 1 ? reader.chapterIndex / (reader.chapters.length - 1) : 0,
+      title: currentChapter?.title || reader.book.durChapterTitle,
+      progress: reader.chapters.length > 1
+        ? reader.chapterIndex / (reader.chapters.length - 1)
+        : (reader.book.totalChapterNum || 0) > 1
+          ? (reader.book.durChapterIndex || 0) / ((reader.book.totalChapterNum || 1) - 1)
+          : undefined,
     };
     sourceSwitchAbortRef.current?.abort();
     sourceSwitchAbortRef.current = null;
-    setSourceSwitching(true);
+    setSourceSwitching(false);
+    setSourceApplying(true);
     try {
-      const updated = await api.setBookSource(reader.book.bookUrl, candidate);
+      const updated = await api.setBookSource(reader.book, candidate);
       setBooks((current) => current.map((book) => book.bookUrl === reader.book.bookUrl ? updated : book));
+      sourceCandidatesForRef.current = "";
+      setSourceCandidates([]);
       setShowSourceSwitch(false);
       await openBook(updated, preferredChapter);
       toast(`已切换到 ${sourceNameFor(candidate)}`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "切换书源失败");
     } finally {
-      setSourceSwitching(false);
+      sourceSwitchBusyRef.current = false;
+      setSourceApplying(false);
     }
   }
 
@@ -1499,20 +1552,6 @@ export function ReaderShell() {
       if (offlineDownloadRef.current === controller) offlineDownloadRef.current = null;
       setOfflineDownload((current) => current?.bookUrl === book.bookUrl ? null : current);
     }
-  }
-
-  async function removeBookOffline(book: Book) {
-    await api.removeOfflineBook(book.bookUrl);
-    await refreshOfflineStatuses([book]);
-    toast(`已删除《${book.name}》的本机缓存`);
-  }
-
-  async function clearAllOfflineChapters() {
-    offlineDownloadRef.current?.abort();
-    await api.clearOfflineLibrary();
-    if (connection === "offline") setBooks([]);
-    setOfflineStatus({});
-    toast("这台设备的离线章节已清理");
   }
 
   async function loadWebdavFiles() {
@@ -1871,18 +1910,6 @@ export function ReaderShell() {
                         <small>{book.durChapterTitle || book.latestChapterTitle || "尚未开始"}</small>
                       </button>
                       <div className="mini-progress"><span style={{ width: `${progressFor(book)}%` }} /></div>
-                      <div className="book-card-actions">
-                        <button onClick={() => offlineDownload?.bookUrl === book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{offlineDownload?.bookUrl === book.bookUrl
-                          ? `${offlineDownload.done}/${offlineDownload.total || "?"}`
-                          : offlineStatus[book.bookUrl]?.cachedChapters
-                            && (offlineStatus[book.bookUrl].totalChapters || 0) > 0
-                            && offlineStatus[book.bookUrl].cachedChapters >= (offlineStatus[book.bookUrl].totalChapters || 0)
-                            ? "已缓存全部"
-                            : offlineStatus[book.bookUrl]?.cachedChapters
-                              ? `已缓存 ${offlineStatus[book.bookUrl].cachedChapters} 章`
-                              : "缓存章节"}</button>
-                        {Boolean(offlineStatus[book.bookUrl]?.cachedChapters) && <button onClick={() => removeBookOffline(book)} aria-label={`删除 ${book.name} 的本机缓存`}>×</button>}
-                      </div>
                     </article>
                   ))}
                 </div>
@@ -2088,7 +2115,7 @@ export function ReaderShell() {
                   <div className="panel-heading"><div><h2>备份与离线</h2></div></div>
                   <input ref={webdavFileRef} type="file" hidden onChange={uploadWebdavFile} />
                   <input ref={backupFileRef} type="file" accept="application/json,.json" hidden onChange={restoreBackup} />
-                  <div className="maintenance-actions"><button className="quiet-button" onClick={() => webdavFileRef.current?.click()}>上传 WebDAV 文件</button><button className="quiet-button" onClick={loadWebdavFiles}>刷新文件</button><button className="quiet-button" onClick={downloadFullBackup}>下载完整配置备份</button><button className="quiet-button" onClick={() => backupFileRef.current?.click()}>从配置备份恢复</button><button className="quiet-button danger-text" onClick={clearAllOfflineChapters}>清理本机离线章节</button></div>
+                  <div className="maintenance-actions"><button className="quiet-button" onClick={() => webdavFileRef.current?.click()}>上传 WebDAV 文件</button><button className="quiet-button" onClick={loadWebdavFiles}>刷新文件</button><button className="quiet-button" onClick={downloadFullBackup}>下载完整配置备份</button><button className="quiet-button" onClick={() => backupFileRef.current?.click()}>从配置备份恢复</button></div>
                   <div className="library-list">
                     {webdavFiles.length ? webdavFiles.map((file) => (
                       <article className="library-row backup-row" key={file.path}><span className="bookmark-mark">{file.isDirectory ? "◇" : "↥"}</span><div><strong>{file.name}</strong><small>{file.isDirectory ? "文件夹" : `${Math.max(1, Math.round(file.size / 1024))} KB`} · {new Date(file.lastModified).toLocaleString("zh-CN")}</small></div><div className="row-actions">{!file.isDirectory && <button className="text-button" onClick={() => downloadWebdavFile(file)}>下载</button>}<button className="text-button danger-text" onClick={() => deleteWebdavFile(file)}>删除</button></div></article>
@@ -2098,7 +2125,7 @@ export function ReaderShell() {
                     {books.map((book) => {
                       const status = offlineStatus[book.bookUrl];
                       const downloading = offlineDownload?.bookUrl === book.bookUrl;
-                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `本机已缓存 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "尚未缓存章节"}</small></div><div className="cache-actions"><button onClick={() => downloading ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button>{Boolean(status?.cachedChapters) && <button className="danger-text" onClick={() => removeBookOffline(book)}>删除缓存</button>}</div></article>;
+                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `当前设备已缓存 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "当前设备尚未缓存"}</small></div><div className="cache-actions"><button onClick={() => downloading ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button></div></article>;
                     })}
                   </div>
                 </section>
@@ -2137,7 +2164,8 @@ export function ReaderShell() {
             <button className="modal-close" onClick={() => setOfflinePickerBook(null)} aria-label="关闭">×</button>
             <p className="eyebrow">离线缓存</p>
             <h2 id="offline-picker-title">缓存《{offlinePickerBook.name}》</h2>
-            <p>从当前阅读位置开始缓存。完成后无需切换模式，断网时会自动读取本机章节。</p>
+            <p>从当前阅读位置开始缓存到这台设备的浏览器存储（IndexedDB），断网后会自动读取。</p>
+            <div className="offline-location"><span>当前位置</span><strong>{offlineStatus[offlinePickerBook.bookUrl]?.cachedChapters || 0} / {offlineStatus[offlinePickerBook.bookUrl]?.totalChapters || offlinePickerBook.totalChapterNum || "?"} 章</strong></div>
             <div className="offline-options">
               {([10, 50, 100, "all"] as const).map((amount) => <button key={amount} onClick={() => { const book = offlinePickerBook; setOfflinePickerBook(null); void downloadBookOffline(book, amount); }}>{amount === "all" ? "全部" : `${amount} 章`}</button>)}
             </div>
@@ -2212,8 +2240,8 @@ export function ReaderShell() {
           <div ref={readerTopRef} />
           <header className="reader-bar">
             <button onClick={() => { window.speechSynthesis?.cancel(); setSpeaking(false); setAutoReading(false); setReader(null); }} aria-label="退出阅读">←</button>
-            <div><strong>{reader.book.name}</strong><small>{currentChapter?.title}</small></div>
-            <div className="reader-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
+            <div className="reader-title"><strong>{reader.book.name}</strong><small>{currentChapter?.title}</small><em>{sourceNameFor(reader.book)}</em></div>
+            <div className="reader-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => offlineDownload?.bookUrl === reader.book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(reader.book)}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `${offlineDownload.done}/${offlineDownload.total || "?"}` : readerOfflineStatus?.cachedChapters ? `缓存 ${readerOfflineStatus.cachedChapters}` : "缓存"}</button><button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
           </header>
           <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap}>
             <p className="chapter-kicker">第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</p>
@@ -2244,7 +2272,7 @@ export function ReaderShell() {
               <label>字号 <output>{preferences.fontSize}px</output><input type="range" min="15" max="28" value={preferences.fontSize} onChange={(event) => setPreferences((current) => ({ ...current, fontSize: Number(event.target.value) }))} /></label>
               <label>行高 <output>{preferences.lineHeight.toFixed(1)}</output><input type="range" min="1.4" max="2.4" step="0.1" value={preferences.lineHeight} onChange={(event) => setPreferences((current) => ({ ...current, lineHeight: Number(event.target.value) }))} /></label>
               <label>版心宽度 <output>{preferences.contentWidth}px</output><input type="range" min="560" max="920" step="20" value={preferences.contentWidth} onChange={(event) => setPreferences((current) => ({ ...current, contentWidth: Number(event.target.value) }))} /></label>
-              <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "serif" }))}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "sans" }))}>黑体</button></div></div>
+              <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "system" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "system" }))}>系统</button><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "serif" }))}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "sans" }))}>黑体</button></div></div>
               <div className="setting-group"><span>翻页</span><div className="segmented"><button className={preferences.pageMode === "scroll" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, pageMode: "scroll" }))}>上下滚动</button><button className={preferences.pageMode === "paged" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, pageMode: "paged" }))}>左右翻页</button></div></div>
               <div className="setting-group"><span>文字</span><div className="segmented"><button className={preferences.chineseMode === "original" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "original" }))}>原文</button><button className={preferences.chineseMode === "simplified" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "simplified" }))}>简体</button><button className={preferences.chineseMode === "traditional" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "traditional" }))}>繁体</button></div></div>
               <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => setPreferences((current) => ({ ...current, theme: "system" }))}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => setPreferences((current) => ({ ...current, theme: "paper" }))}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => setPreferences((current) => ({ ...current, theme: "green" }))}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => setPreferences((current) => ({ ...current, theme: "night" }))}>夜间</button></div></div>
@@ -2252,12 +2280,13 @@ export function ReaderShell() {
           )}
           {showSourceSwitch && (
             <aside className="reader-drawer source-switch-drawer">
-              <header><div><p className="eyebrow">换源</p><h2>同名书籍的可用来源</h2></div><div className="drawer-header-actions"><button disabled={sourceSwitching} onClick={() => void loadAvailableSources(true)}>扫描全部书源</button><button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
-              <p className="drawer-note">优先显示上次扫描缓存；只有手动扫描才会用 4 路并发重新检测全部书源。切换前会校验目录和正文，并保留阅读进度。</p>
+              <header><div><p className="eyebrow">换源 · {sourceCandidates.length} 个可用来源</p><h2>{reader.book.name}</h2></div><div className="drawer-header-actions">{sourceSwitching ? <button className="stop-scan" onClick={stopSourceScan}>停止</button> : <button disabled={sourceApplying} onClick={() => void loadAvailableSources(true)}>重新扫描</button>}<button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
+              <div className="current-source-card"><span>当前书源</span><strong>{sourceNameFor(reader.book)}</strong><small>共 {reader.chapters.length} 章{reader.book.latestChapterTitle ? ` · 最新：${reader.book.latestChapterTitle}` : ""}</small></div>
+              <p className="drawer-note">优先读取上次结果；重新扫描时采用 4 路并发。候选通过目录和正文探测后才会显示，找到足够的来源即可停止。</p>
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
-                  <button key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.latestChapterTitle || "已匹配书名与作者"}</small><small>{candidate.bookUrl}</small></div><i>切换</i></button>
-                )) : sourceSwitching ? <div className="empty-state"><strong>正在用 4 路并发检测书源…</strong><span>匹配结果会立即显示，扫描完成后保存在服务器。</span></div> : <div className="empty-state"><strong>没有找到可用来源</strong><span>结果已缓存；书源变化后可手动扫描全部书源。</span></div>}
+                  <button disabled={sourceApplying} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "章节数待更新"}{candidate.latestChapterTitle ? ` · 最新：${candidate.latestChapterTitle}` : ""}</small></div><i>{sourceApplying ? "切换中" : "切换"}</i></button>
+                )) : sourceSwitching ? <div className="empty-state"><strong>正在检测可读书源…</strong><span>结果通过目录和正文校验后会立即显示。</span></div> : <div className="empty-state"><strong>没有已验证的可用来源</strong><span>可以重新扫描，出现结果后也可以随时停止。</span></div>}
               </div>
             </aside>
           )}
@@ -2277,7 +2306,7 @@ export function ReaderShell() {
               <header><div><p className="eyebrow">文章设置</p><h2>排版与主题</h2></div><button onClick={() => setShowReaderSettings(false)}>×</button></header>
               <label>字号 <output>{preferences.fontSize}px</output><input type="range" min="15" max="28" value={preferences.fontSize} onChange={(event) => setPreferences((current) => ({ ...current, fontSize: Number(event.target.value) }))} /></label>
               <label>行高 <output>{preferences.lineHeight.toFixed(1)}</output><input type="range" min="1.4" max="2.4" step="0.1" value={preferences.lineHeight} onChange={(event) => setPreferences((current) => ({ ...current, lineHeight: Number(event.target.value) }))} /></label>
-              <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "serif" }))}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "sans" }))}>黑体</button></div></div>
+              <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "system" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "system" }))}>系统</button><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "serif" }))}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, fontFamily: "sans" }))}>黑体</button></div></div>
               <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => setPreferences((current) => ({ ...current, theme: "system" }))}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => setPreferences((current) => ({ ...current, theme: "paper" }))}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => setPreferences((current) => ({ ...current, theme: "green" }))}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => setPreferences((current) => ({ ...current, theme: "night" }))}>夜间</button></div></div>
             </aside>
           )}

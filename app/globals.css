@@ -1266,6 +1266,27 @@ textarea:focus-visible {
   line-height: 1.7;
 }
 
+.offline-location {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+
+.offline-location span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.offline-location strong {
+  font-size: 12px;
+}
+
 .offline-options {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -2284,6 +2305,17 @@ textarea:focus-visible {
   font-size: 10px;
 }
 
+.reader-title em {
+  max-width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--accent);
+  font-size: 9px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .reader-actions {
   display: flex;
   justify-content: flex-end;
@@ -2300,15 +2332,25 @@ textarea:focus-visible {
 }
 
 .reading-paper.page-paged {
+  --reader-page-width: min(var(--reader-width), calc(100vw - 64px));
   width: 100%;
-  height: calc(100vh - 71px);
-  padding-right: max(6vw, calc((100vw - var(--reader-width)) / 2));
-  padding-left: max(6vw, calc((100vw - var(--reader-width)) / 2));
+  height: calc(100dvh - 71px);
+  padding-right: max(32px, calc((100vw - var(--reader-width)) / 2));
+  padding-left: max(32px, calc((100vw - var(--reader-width)) / 2));
   overflow-x: auto;
   overflow-y: hidden;
   column-fill: auto;
-  column-gap: max(12vw, 90px);
-  column-width: min(var(--reader-width), 78vw);
+  column-gap: calc(100vw - var(--reader-page-width));
+  column-width: var(--reader-page-width);
+  scrollbar-width: none;
+}
+
+.reading-paper.page-paged::-webkit-scrollbar {
+  display: none;
+}
+
+.font-system {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 .font-serif {
@@ -2531,6 +2573,48 @@ textarea:focus-visible {
   border: 0;
   border-bottom: 1px solid var(--reader-panel-line);
   cursor: pointer;
+}
+
+.candidate-list > button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.current-source-card {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  background: var(--reader-panel-active);
+  border: 1px solid var(--reader-panel-line);
+  border-radius: 12px;
+}
+
+.current-source-card span {
+  color: var(--reader-panel-muted);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.current-source-card strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.current-source-card small {
+  overflow: hidden;
+  color: var(--reader-panel-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reader-drawer .drawer-header-actions .stop-scan {
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
 }
 
 .candidate-list > button > span {
@@ -3286,11 +3370,12 @@ textarea:focus-visible {
   }
 
   .reading-paper.page-paged {
+    --reader-page-width: calc(100vw - 34px);
     width: 100%;
     height: calc(100dvh - 112px);
     padding: 34px 17px 52px;
     column-gap: 34px;
-    column-width: calc(100vw - 34px);
+    column-width: var(--reader-page-width);
     scroll-snap-type: x mandatory;
   }
 

@@ -11,6 +11,8 @@ pub struct SearchBook {
     pub intro: Option<String>,
     pub kind: Option<String>,
     pub last_chapter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chapter_num: Option<i32>,
     pub update_time: Option<String>,
     pub word_count: Option<String>,
     /// Book source URLs for the same book from different sources (for merged results)

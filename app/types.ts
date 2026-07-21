@@ -153,7 +153,7 @@ export interface ReaderPreferences {
   fontSize: number;
   lineHeight: number;
   contentWidth: number;
-  fontFamily: "serif" | "sans";
+  fontFamily: "system" | "serif" | "sans";
   pageMode: "scroll" | "paged";
   chineseMode: "original" | "simplified" | "traditional";
 }
