@@ -573,8 +573,10 @@ impl BookService {
             chapter_url,
             book_key
         );
-        if let Ok(Some(cached)) = self.cache.get(user_ns, &book_key, chapter_url).await {
-            tracing::debug!("get_content returning cached content, len={}", cached.len());
+        if let Some(cached) = self
+            .get_cached_content(user_ns, book_url, chapter_url)
+            .await?
+        {
             return Ok(cached);
         }
         tracing::debug!("get_content cache miss, fetching from network");
@@ -629,6 +631,27 @@ impl BookService {
                 .await;
         }
         Ok(all_content)
+    }
+
+    pub async fn get_cached_content(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        chapter_url: &str,
+    ) -> Result<Option<String>, AppError> {
+        let book_key = md5_hex(book_url);
+        if let Some(cached) = self.cache.get(user_ns, &book_key, chapter_url).await? {
+            tracing::debug!("get_content returning cached content, len={}", cached.len());
+            return Ok(Some(cached));
+        }
+        if let Some(legacy) = self
+            .load_legacy_chapter_content(user_ns, book_url, chapter_url)
+            .await?
+        {
+            let _ = self.cache.put(user_ns, &book_key, chapter_url, &legacy).await;
+            return Ok(Some(legacy));
+        }
+        Ok(None)
     }
 
     /// Delete all chapter content cache for a book
@@ -779,6 +802,55 @@ impl BookService {
             list.push(book.clone());
         }
 
+        self.write_bookshelf(user_ns, &list).await?;
+        Ok(book)
+    }
+
+    pub async fn replace_book_source(
+        &self,
+        user_ns: &str,
+        old_book_url: &str,
+        mut book: Book,
+    ) -> Result<Book, AppError> {
+        sanitize_book_urls(&mut book);
+        if book.origin.trim().is_empty() {
+            return Err(AppError::BadRequest("missing origin".to_string()));
+        }
+        if book.book_url.trim().is_empty() {
+            return Err(AppError::BadRequest("bookUrl required".to_string()));
+        }
+
+        let mut list = self.read_bookshelf(user_ns).await?;
+        let old_index = list
+            .iter()
+            .position(|item| item.book_url == old_book_url)
+            .ok_or_else(|| AppError::BadRequest("书籍未加入书架".to_string()))?;
+        let existing = list[old_index].clone();
+        if book.dur_chapter_index.is_none() {
+            book.dur_chapter_index = existing.dur_chapter_index;
+        }
+        if book.dur_chapter_title.is_none() {
+            book.dur_chapter_title = existing.dur_chapter_title;
+        }
+        if book.dur_chapter_time.is_none() {
+            book.dur_chapter_time = existing.dur_chapter_time;
+        }
+        if book.dur_chapter_pos.is_none() {
+            book.dur_chapter_pos = existing.dur_chapter_pos;
+        }
+        if book.group.is_none() {
+            book.group = existing.group;
+        }
+
+        list[old_index] = book.clone();
+        let new_url = book.book_url.clone();
+        list = list
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (index == old_index || item.book_url != new_url).then_some(item)
+            })
+            .collect();
         self.write_bookshelf(user_ns, &list).await?;
         Ok(book)
     }
@@ -1090,6 +1162,10 @@ impl BookService {
     ) -> Result<Option<Vec<BookChapter>>, AppError> {
         let path = self.chapter_list_cache_path(user_ns, toc_url);
         if !path.exists() {
+            if let Some((list, _)) = self.load_legacy_chapter_catalog(user_ns, toc_url).await? {
+                self.save_chapter_list_cache(user_ns, toc_url, &list).await?;
+                return Ok(Some(list));
+            }
             return Ok(None);
         }
         let data = fs::read_to_string(&path)
@@ -1098,6 +1174,90 @@ impl BookService {
         let list: Vec<BookChapter> =
             serde_json::from_str(&data).map_err(|e| AppError::BadRequest(e.to_string()))?;
         Ok(Some(list))
+    }
+
+    async fn load_legacy_chapter_catalog(
+        &self,
+        user_ns: &str,
+        toc_url: &str,
+    ) -> Result<Option<(Vec<BookChapter>, PathBuf)>, AppError> {
+        let root = self.storage_dir.join("data").join(user_ns);
+        if !root.exists() {
+            return Ok(None);
+        }
+        let file_name = format!("{}.json", md5_hex(toc_url));
+        let mut entries = fs::read_dir(&root)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?
+        {
+            if entry.file_name() == "chapters" || !entry.path().is_dir() {
+                continue;
+            }
+            let catalog_path = entry.path().join(&file_name);
+            if !catalog_path.is_file() {
+                continue;
+            }
+            let data = fs::read_to_string(&catalog_path)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            let chapters = serde_json::from_str::<Vec<BookChapter>>(&data)
+                .map_err(|error| AppError::BadRequest(error.to_string()))?;
+            return Ok(Some((chapters, catalog_path)));
+        }
+        Ok(None)
+    }
+
+    async fn load_legacy_chapter_content(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        chapter_url: &str,
+    ) -> Result<Option<String>, AppError> {
+        let toc_url = self
+            .get_bookshelf(user_ns)
+            .await
+            .ok()
+            .and_then(|books| books.into_iter().find(|book| book.book_url == book_url))
+            .and_then(|book| book.toc_url.filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| book_url.to_string());
+        // Reader stored old catalog/content caches under different keys across
+        // versions: some used tocUrl, while others always used bookUrl. Try both
+        // so books whose original source has disappeared remain readable.
+        let mut catalog = self
+            .load_legacy_chapter_catalog(user_ns, &toc_url)
+            .await?;
+        if catalog.is_none() && toc_url != book_url {
+            catalog = self
+                .load_legacy_chapter_catalog(user_ns, book_url)
+                .await?;
+        }
+        let Some((chapters, catalog_path)) = catalog else {
+            return Ok(None);
+        };
+        let requested_path = url::Url::parse(chapter_url)
+            .ok()
+            .map(|url| url.path().to_string());
+        let Some(chapter) = chapters.iter().find(|chapter| {
+            chapter.url == chapter_url
+                || (chapter.url.starts_with('/')
+                    && requested_path.as_deref() == Some(chapter.url.as_str()))
+        }) else {
+            return Ok(None);
+        };
+        let content_path = catalog_path
+            .with_extension("")
+            .join(format!("{}.txt", chapter.index));
+        if !content_path.is_file() {
+            return Ok(None);
+        }
+        fs::read_to_string(content_path)
+            .await
+            .map(Some)
+            .map_err(|error| AppError::Internal(error.into()))
     }
 
     pub async fn save_chapter_list_cache(
@@ -1906,6 +2066,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_legacy_chapter_list_and_reads_legacy_content() {
+        let (service, storage_dir) = test_book_service("legacy-chapter-cache");
+        let user_ns = "reader";
+        let book_url = "https://book.example/legacy";
+        let toc_url = "https://book.example/legacy/toc";
+        let legacy_chapter_url = "/legacy/1.html";
+        let chapter_url = "https://book.example/legacy/1.html";
+        let legacy_root = storage_dir
+            .join("data")
+            .join(user_ns)
+            .join("旧书_作者");
+        let legacy_key = crate::util::hash::md5_hex(toc_url);
+        tokio::fs::create_dir_all(legacy_root.join(&legacy_key))
+            .await
+            .unwrap();
+        let chapters = vec![BookChapter {
+            title: "第一章".to_string(),
+            url: legacy_chapter_url.to_string(),
+            index: 0,
+            ..BookChapter::default()
+        }];
+        tokio::fs::write(
+            legacy_root.join(format!("{legacy_key}.json")),
+            serde_json::to_string(&chapters).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(legacy_root.join(&legacy_key).join("0.txt"), "旧缓存正文")
+            .await
+            .unwrap();
+        service
+            .save_book(
+                user_ns,
+                Book {
+                    name: "旧书".to_string(),
+                    author: "作者".to_string(),
+                    book_url: book_url.to_string(),
+                    toc_url: Some(toc_url.to_string()),
+                    origin: "https://source.example".to_string(),
+                    ..Book::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let loaded = service
+            .load_chapter_list_cache(user_ns, toc_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded[0].url, legacy_chapter_url);
+        assert!(service.chapter_list_cache_path(user_ns, toc_url).is_file());
+        let content = service
+            .get_content(
+                user_ns,
+                book_url,
+                &BookSource::default(),
+                chapter_url,
+            )
+            .await
+            .unwrap();
+        assert_eq!(content, "旧缓存正文");
+        assert!(service
+            .cache
+            .exists(user_ns, &crate::util::hash::md5_hex(book_url), chapter_url)
+            .await);
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reads_legacy_content_keyed_by_book_url_when_toc_url_differs() {
+        let (service, storage_dir) = test_book_service("legacy-book-url-content-cache");
+        let user_ns = "reader";
+        let book_url = "https://book.example/legacy";
+        let toc_url = "https://book.example/legacy/toc";
+        let legacy_chapter_url = "/legacy/1.html";
+        let chapter_url = "https://book.example/legacy/1.html";
+        let legacy_root = storage_dir
+            .join("data")
+            .join(user_ns)
+            .join("旧书_作者");
+        let legacy_key = crate::util::hash::md5_hex(book_url);
+        tokio::fs::create_dir_all(legacy_root.join(&legacy_key))
+            .await
+            .unwrap();
+        let chapters = vec![BookChapter {
+            title: "第一章".to_string(),
+            url: legacy_chapter_url.to_string(),
+            index: 0,
+            ..BookChapter::default()
+        }];
+        tokio::fs::write(
+            legacy_root.join(format!("{legacy_key}.json")),
+            serde_json::to_string(&chapters).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(legacy_root.join(&legacy_key).join("0.txt"), "书籍地址缓存正文")
+            .await
+            .unwrap();
+        service
+            .save_book(
+                user_ns,
+                Book {
+                    name: "旧书".to_string(),
+                    author: "作者".to_string(),
+                    book_url: book_url.to_string(),
+                    toc_url: Some(toc_url.to_string()),
+                    origin: "https://source.example".to_string(),
+                    ..Book::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let content = service
+            .get_content(
+                user_ns,
+                book_url,
+                &BookSource::default(),
+                chapter_url,
+            )
+            .await
+            .unwrap();
+        assert_eq!(content, "书籍地址缓存正文");
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+    }
+
+    #[tokio::test]
     async fn get_shelf_book_prefers_latest_duplicate_progress() {
         let (service, storage_dir) = test_book_service("newest-duplicate-progress");
         let user_ns = "duplicate-user";
@@ -1980,6 +2269,41 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&storage_dir).await;
         assert_eq!(saved.dur_chapter_index, Some(0));
         assert_eq!(saved.dur_chapter_pos, Some(0));
+    }
+
+    #[tokio::test]
+    async fn replace_book_source_keeps_shelf_position_and_progress() {
+        let (service, storage_dir) = test_book_service("replace-source-position");
+        let user_ns = "replace-source-user";
+        let first = test_book(2, 500, 1000);
+        let old_url = first.book_url.clone();
+        let mut second = test_book(0, 0, 1000);
+        second.name = "第二本".to_string();
+        second.book_url = "https://book.example/2".to_string();
+        service.save_books(user_ns, vec![first, second.clone()]).await.unwrap();
+
+        let mut replacement = Book {
+            name: "第一本".to_string(),
+            author: "作者".to_string(),
+            book_url: "https://new-source.example/1".to_string(),
+            origin: "https://new-source.example".to_string(),
+            ..Book::default()
+        };
+        replacement.dur_chapter_index = None;
+        replacement.dur_chapter_title = None;
+        replacement.dur_chapter_pos = None;
+        let saved = service
+            .replace_book_source(user_ns, &old_url, replacement)
+            .await
+            .unwrap();
+        let shelf = service.get_bookshelf(user_ns).await.unwrap();
+
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+        assert_eq!(shelf.len(), 2);
+        assert_eq!(shelf[0].book_url, saved.book_url);
+        assert_eq!(shelf[1].book_url, second.book_url);
+        assert_eq!(saved.dur_chapter_index, Some(2));
+        assert_eq!(saved.dur_chapter_title.as_deref(), Some("第3章"));
     }
 
     #[tokio::test]

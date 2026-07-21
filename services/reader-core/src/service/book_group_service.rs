@@ -14,7 +14,21 @@ impl BookGroupService {
     }
 
     pub async fn get_groups(&self, user_ns: &str) -> Result<Vec<BookGroup>, AppError> {
-        self.docs.read_list(user_ns, "book_groups.json").await
+        let current = self.docs.read_list(user_ns, "book_groups.json").await?;
+        if !current.is_empty() {
+            return Ok(current);
+        }
+        let Some(value) = self.docs.get_value(user_ns, "bookGroup.json").await? else {
+            return Ok(current);
+        };
+        let mut legacy = serde_json::from_value::<Vec<BookGroup>>(value)
+            .map_err(|error| AppError::BadRequest(error.to_string()))?;
+        legacy.retain(|group| group.group_id > 0 && !group.group_name.trim().is_empty());
+        legacy.sort_by_key(|group| (group.order_no, group.group_id));
+        if !legacy.is_empty() {
+            self.save_groups(user_ns, &legacy).await?;
+        }
+        Ok(legacy)
     }
 
     pub async fn save_groups(

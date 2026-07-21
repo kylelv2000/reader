@@ -149,11 +149,11 @@ export class ReaderApi {
     return envelope.data;
   }
 
-  async getBookshelf(refresh = false) {
+  async getBookshelf(refresh = false, options?: { maxAgeMs?: number; limit?: number; concurrentCount?: number }) {
     if (!refresh) return this.request<Book[]>("/getBookshelf");
     const result = await this.request<{ books: Book[]; updated: number; failed: number }>("/refreshBookshelf", {
       method: "POST",
-      body: JSON.stringify({ concurrentCount: 3 }),
+      body: JSON.stringify({ concurrentCount: options?.concurrentCount ?? 2, maxAgeMs: options?.maxAgeMs, limit: options?.limit }),
     });
     return result.books;
   }
@@ -185,7 +185,7 @@ export class ReaderApi {
     url.searchParams.set("key", key);
     url.searchParams.set("lastIndex", "-1");
     url.searchParams.set("searchSize", "80");
-    url.searchParams.set("concurrentCount", "6");
+    url.searchParams.set("concurrentCount", "4");
     const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
       credentials: "include",
       signal,
@@ -221,7 +221,7 @@ export class ReaderApi {
       "/exploreBookGlobal",
       {
         method: "POST",
-        body: JSON.stringify({ category, cursor, page, limit: 24, concurrentCount: 6, scanLimit: 24 }),
+        body: JSON.stringify({ category, cursor, page, limit: 24, concurrentCount: 4, scanLimit: 24 }),
       },
     );
   }
@@ -266,8 +266,8 @@ export class ReaderApi {
     }
   }
 
-  async getBookContent(bookUrl: string, index: number, refresh = false, signal?: AbortSignal) {
-    const cacheKey = chapterCacheKey(this.cacheScope(), bookUrl, index);
+  async getBookContent(book: Book, chapter: Chapter, index: number, refresh = false, signal?: AbortSignal) {
+    const cacheKey = chapterCacheKey(this.cacheScope(), book.bookUrl, index);
     if (this.offlineMode) {
       const cached = await getCachedChapter(cacheKey);
       if (cached !== undefined) return cached;
@@ -276,7 +276,13 @@ export class ReaderApi {
     try {
       const content = await this.request<string>("/getBookContent", {
         method: "POST",
-        body: JSON.stringify({ url: bookUrl, index, refresh: refresh ? 1 : 0 }),
+        body: JSON.stringify({
+          bookUrl: book.bookUrl,
+          chapterUrl: chapter.url || book.bookUrl,
+          bookSourceUrl: book.origin,
+          index,
+          refresh: refresh ? 1 : 0,
+        }),
         signal,
       });
       void putCachedChapter(cacheKey, content);
@@ -297,7 +303,20 @@ export class ReaderApi {
   }
 
   async getOfflineBooks() {
-    return (await listCachedBooks(this.cacheScope())).map((cached) => cached.book);
+    const cachedBooks = await listCachedBooks(this.cacheScope());
+    const ranked = await Promise.all(cachedBooks.map(async (cached) => ({
+      cached,
+      chapterCount: (await getOfflineBookStatus(cached.key)).cachedChapters,
+    })));
+    const deduplicated = new Map<string, (typeof ranked)[number]>();
+    for (const candidate of ranked) {
+      const identity = `${candidate.cached.book.name.trim().toLowerCase()}\u0000${candidate.cached.book.author.trim().toLowerCase()}`;
+      const current = deduplicated.get(identity);
+      if (!current || candidate.chapterCount > current.chapterCount) {
+        deduplicated.set(identity, candidate);
+      }
+    }
+    return [...deduplicated.values()].map((candidate) => candidate.cached.book);
   }
 
   clearOfflineLibrary() {
@@ -318,33 +337,37 @@ export class ReaderApi {
 
   async downloadBookForOffline(
     book: Book,
+    amount: 10 | 50 | 100 | "all",
     onProgress?: (done: number, total: number) => void,
     signal?: AbortSignal,
   ) {
     const chapters = await this.getChapterList(book);
     if (!chapters.length) throw new ReaderApiError("没有可下载的章节");
     await putCachedBook(bookCacheKey(this.cacheScope(), book.bookUrl), book, chapters);
-    let nextIndex = 0;
+    const startIndex = Math.min(Math.max(0, book.durChapterIndex || 0), chapters.length - 1);
+    const endIndex = amount === "all" ? chapters.length : Math.min(chapters.length, startIndex + amount);
+    const selected = chapters.slice(startIndex, endIndex);
+    let nextOffset = 0;
     let completed = 0;
     let failed = 0;
     const worker = async () => {
-      while (nextIndex < chapters.length) {
+      while (nextOffset < selected.length) {
         if (signal?.aborted) throw new DOMException("下载已取消", "AbortError");
-        const index = nextIndex++;
+        const index = startIndex + nextOffset++;
         try {
-          await this.getBookContent(book.bookUrl, index, false, signal);
+          await this.getBookContent(book, chapters[index], index, false, signal);
         } catch (error) {
           if (signal?.aborted) throw error;
           failed += 1;
         } finally {
           completed += 1;
-          onProgress?.(completed, chapters.length);
+          onProgress?.(completed, selected.length);
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(2, chapters.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(2, selected.length) }, worker));
     if (failed) throw new ReaderApiError(`${failed} 章下载失败，可稍后继续`);
-    return { completed, total: chapters.length };
+    return { completed, total: selected.length };
   }
 
   saveProgress(bookUrl: string, index: number) {
@@ -555,10 +578,61 @@ export class ReaderApi {
         origin: book.origin,
         refresh: refresh ? 1 : 0,
         resultLimit: 40,
-        concurrentCount: 12,
+        concurrentCount: 4,
       }),
     });
     return Array.isArray(result) ? result : result.books || [];
+  }
+
+  async streamAvailableBookSources(
+    book: Book,
+    refresh: boolean,
+    onBatch: (books: Book[]) => void,
+    signal?: AbortSignal,
+    lastIndex = -1,
+  ) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/getAvailableBookSourceSSE`, isAbsolute ? undefined : origin);
+    url.searchParams.set("url", book.bookUrl);
+    url.searchParams.set("name", book.name);
+    url.searchParams.set("author", book.author);
+    if (book.origin) url.searchParams.set("origin", book.origin);
+    url.searchParams.set("lastIndex", String(lastIndex));
+    url.searchParams.set("concurrentCount", "4");
+    if (refresh) url.searchParams.set("refresh", "1");
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      credentials: "include",
+      signal,
+    });
+    if (!response.ok || !response.body) throw new ReaderApiError(`换源搜索失败：${response.status}`);
+
+    const results = new Map<string, Book>();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let nextLastIndex = lastIndex;
+    let hasMore = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const data = event.split("\n").find((line) => line.startsWith("data:"))?.slice(5).trim();
+        if (!data) continue;
+        const payload = JSON.parse(data) as { data?: Book[]; books?: Book[]; lastIndex?: number; hasMore?: boolean };
+        if (typeof payload.lastIndex === "number") nextLastIndex = payload.lastIndex;
+        if (typeof payload.hasMore === "boolean") hasMore = payload.hasMore;
+        for (const candidate of payload.data || payload.books || []) {
+          if (candidate.origin === book.origin) continue;
+          results.set(`${candidate.origin}\u0000${candidate.bookUrl}`, candidate);
+        }
+        onBatch([...results.values()]);
+      }
+    }
+    return { books: [...results.values()], lastIndex: nextLastIndex, hasMore };
   }
 
   setBookSource(bookUrl: string, candidate: Book) {

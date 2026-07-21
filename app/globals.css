@@ -96,20 +96,33 @@ textarea:focus-visible {
     var(--paper);
 }
 
-.auth-theme-button {
+.auth-theme-switch {
   position: fixed;
   top: 22px;
   right: 22px;
   z-index: 2;
-  display: grid;
-  width: 40px;
-  height: 40px;
-  place-items: center;
-  color: var(--ink);
+  display: flex;
+  gap: 2px;
+  padding: 3px;
   background: var(--elevated);
   border: 1px solid var(--line);
-  border-radius: 50%;
+  border-radius: 11px;
+  box-shadow: 0 8px 28px rgba(35, 37, 31, 0.08);
+}
+
+.auth-theme-switch button {
+  padding: 7px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
   cursor: pointer;
+}
+
+.auth-theme-switch button.active {
+  color: var(--ink);
+  background: var(--soft);
 }
 
 .auth-story {
@@ -917,6 +930,7 @@ textarea:focus-visible {
   font-size: clamp(14px, 1.25vw, 20px);
   font-weight: 600;
   line-height: 1.45;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.34);
 }
 
 .book-cover small {
@@ -925,6 +939,12 @@ textarea:focus-visible {
   margin-top: 16px;
   font-size: 9px;
   letter-spacing: 0.08em;
+  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.35);
+}
+
+.book-cover.has-cover > strong,
+.book-cover.has-cover > small {
+  opacity: 0;
 }
 
 .cover-index {
@@ -1138,7 +1158,7 @@ textarea:focus-visible {
 .source-summary-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  margin-top: 34px;
+  margin-top: 16px;
   background: #fff;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
@@ -1147,8 +1167,8 @@ textarea:focus-visible {
 .source-summary-grid div {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 21px 24px;
+  gap: 2px;
+  padding: 10px 16px;
   border-right: 1px solid var(--line);
 }
 
@@ -1158,7 +1178,7 @@ textarea:focus-visible {
 
 .source-summary-grid strong {
   font-family: Georgia, "Songti SC", serif;
-  font-size: 25px;
+  font-size: 18px;
   font-weight: 500;
 }
 
@@ -1168,7 +1188,7 @@ textarea:focus-visible {
 }
 
 .source-toolbar {
-  margin-top: 28px;
+  margin-top: 14px;
 }
 
 .source-toolbar > span {
@@ -1186,11 +1206,11 @@ textarea:focus-visible {
 
 .source-row {
   display: grid;
-  grid-template-columns: auto minmax(220px, 1fr) auto auto 76px auto auto;
-  gap: 16px;
+  grid-template-columns: auto minmax(180px, 1fr) auto auto 62px auto auto auto;
+  gap: 9px;
   align-items: center;
-  min-height: 74px;
-  padding: 13px 18px;
+  min-height: 51px;
+  padding: 7px 12px;
   border-bottom: 1px solid #eeece6;
 }
 
@@ -1234,6 +1254,64 @@ textarea:focus-visible {
 
 .source-row:last-child {
   border: 0;
+}
+
+.offline-picker {
+  width: min(430px, 100%);
+}
+
+.offline-picker > p:not(.eyebrow) {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.offline-options {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.offline-options button,
+.reader-error-state button,
+.drawer-header-actions button {
+  padding: 9px 12px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.reader-error-state {
+  display: grid;
+  min-height: 42vh;
+  place-content: center;
+  text-align: center;
+}
+
+.reader-error-state p {
+  max-width: 540px;
+  color: var(--muted);
+}
+
+.reader-error-state > div,
+.drawer-header-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.managed-group {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.managed-group button {
+  border: 0 !important;
+  border-radius: 0 !important;
 }
 
 .source-toggle {
@@ -2494,6 +2572,26 @@ textarea:focus-visible {
   cursor: pointer;
 }
 
+.reader-drawer .drawer-header-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.reader-drawer .drawer-header-actions button {
+  width: auto;
+  min-width: max-content;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 9px;
+}
+
+.reader-drawer .drawer-header-actions button:last-child {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+  border-radius: 50%;
+}
+
 .catalog-list {
   overflow-y: auto;
   margin: 10px -8px 0;
@@ -2740,6 +2838,10 @@ textarea:focus-visible {
     backdrop-filter: blur(16px);
   }
 
+  .mobile-nav.has-admin {
+    grid-template-columns: repeat(5, 1fr);
+  }
+
   .mobile-nav button {
     display: flex;
     flex-direction: column;
@@ -2770,7 +2872,7 @@ textarea:focus-visible {
   }
 
   .source-row {
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
     gap: 9px;
   }
 
@@ -2808,6 +2910,14 @@ textarea:focus-visible {
 }
 
 @media (max-width: 620px) {
+  .reader-overlay {
+    scrollbar-width: none;
+  }
+
+  .reader-overlay::-webkit-scrollbar {
+    display: none;
+  }
+
   .auth-panel {
     min-height: 100vh;
     padding: 18px;

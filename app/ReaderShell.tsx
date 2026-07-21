@@ -119,7 +119,16 @@ function progressFor(book: Book) {
 function coverStyle(book: Book): CSSProperties {
   const sum = Array.from(book.name).reduce((value, char) => value + char.charCodeAt(0), 0);
   const palette = coverPalettes[sum % coverPalettes.length];
-  return { backgroundColor: palette[0], color: palette[1] };
+  const coverUrl = book.customCoverUrl || book.coverUrl;
+  return {
+    backgroundColor: palette[0],
+    color: palette[1],
+    ...(coverUrl ? {
+      backgroundImage: `linear-gradient(180deg, rgba(20, 22, 19, 0.03), rgba(20, 22, 19, 0.28)), url("/reader3/cover?path=${encodeURIComponent(coverUrl)}")`,
+      backgroundPosition: "center",
+      backgroundSize: "cover",
+    } : {}),
+  };
 }
 
 function firstLetter(name: string) {
@@ -227,6 +236,35 @@ function extractRssSources(value: unknown): RssSource[] {
   return [];
 }
 
+function normalizedChapterTitle(title = "") {
+  return title
+    .toLowerCase()
+    .replace(/[（(]\s*第?\s*\d+\s*[\/／]\s*\d+\s*页\s*[)）]/g, "")
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function resolveChapterIndex(
+  chapters: Chapter[],
+  fallbackIndex: number,
+  preferred?: { title?: string; progress?: number },
+) {
+  if (!chapters.length) return 0;
+  const target = normalizedChapterTitle(preferred?.title);
+  if (target) {
+    const exact = chapters.findIndex((chapter) => normalizedChapterTitle(chapter.title) === target);
+    if (exact >= 0) return exact;
+    const partial = chapters.findIndex((chapter) => {
+      const candidate = normalizedChapterTitle(chapter.title);
+      return candidate.length >= 4 && (candidate.includes(target) || target.includes(candidate));
+    });
+    if (partial >= 0) return partial;
+  }
+  if (preferred?.progress !== undefined && Number.isFinite(preferred.progress)) {
+    return Math.round(Math.min(1, Math.max(0, preferred.progress)) * Math.max(0, chapters.length - 1));
+  }
+  return Math.min(Math.max(0, fallbackIndex), Math.max(0, chapters.length - 1));
+}
+
 export function ReaderShell() {
   const [view, setView] = useState<ViewName>("shelf");
   const [books, setBooks] = useState<Book[]>([]);
@@ -253,6 +291,7 @@ export function ReaderShell() {
   const [showCommand, setShowCommand] = useState(false);
   const [message, setMessage] = useState("");
   const [reader, setReader] = useState<ReaderSession | null>(null);
+  const [readerError, setReaderError] = useState("");
   const [showCatalog, setShowCatalog] = useState(false);
   const [showReaderSettings, setShowReaderSettings] = useState(false);
   const [showChapterSearch, setShowChapterSearch] = useState(false);
@@ -265,13 +304,15 @@ export function ReaderShell() {
   const [sourceDebugLog, setSourceDebugLog] = useState<string[]>([]);
   const [sourceDebugging, setSourceDebugging] = useState(false);
   const [convertedContent, setConvertedContent] = useState("");
-  const [activeGroup, setActiveGroup] = useState<number | "all">("all");
+  const [activeGroup, setActiveGroup] = useState<number | "all" | "ungrouped">("all");
   const [libraryTab, setLibraryTab] = useState<LibraryTab>("local");
   const [selectedRssSource, setSelectedRssSource] = useState<RssSource | null>(null);
   const [articleSession, setArticleSession] = useState<ArticleSession | null>(null);
   const [sourceEditor, setSourceEditor] = useState<BookSource | null>(null);
   const [showSourceEditor, setShowSourceEditor] = useState(false);
   const [sourceCandidates, setSourceCandidates] = useState<Book[]>([]);
+  const [sourceCandidateCursor, setSourceCandidateCursor] = useState(-1);
+  const [sourceCandidateHasMore, setSourceCandidateHasMore] = useState(false);
   const [showSourceSwitch, setShowSourceSwitch] = useState(false);
   const [sourceSwitching, setSourceSwitching] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -284,6 +325,7 @@ export function ReaderShell() {
   const [exploreEnabled, setExploreEnabled] = useState(false);
   const [offlineStatus, setOfflineStatus] = useState<Record<string, OfflineBookStatus>>({});
   const [offlineDownload, setOfflineDownload] = useState<{ bookUrl: string; done: number; total: number } | null>(null);
+  const [offlinePickerBook, setOfflinePickerBook] = useState<Book | null>(null);
   const [shelfVisibleCount, setShelfVisibleCount] = useState(48);
   const sourceFileRef = useRef<HTMLInputElement>(null);
   const localBookRef = useRef<HTMLInputElement>(null);
@@ -294,10 +336,12 @@ export function ReaderShell() {
   const readerTopRef = useRef<HTMLDivElement>(null);
   const readerOverlayRef = useRef<HTMLElement>(null);
   const readingPaperRef = useRef<HTMLElement>(null);
+  const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const autoTurnRef = useRef(false);
   const offlineDownloadRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
+  const sourceSwitchAbortRef = useRef<AbortController | null>(null);
   const [shelfRefreshing, setShelfRefreshing] = useState(false);
 
   const api = useMemo(() => new ReaderApi(), []);
@@ -319,7 +363,11 @@ export function ReaderShell() {
   const currentChapter = reader?.chapters[reader.chapterIndex];
   const primaryBook = books[0];
   const visibleBooks = useMemo(
-    () => activeGroup === "all" ? books : books.filter((book) => bookInGroup(book, activeGroup)),
+    () => activeGroup === "all"
+      ? books
+      : activeGroup === "ungrouped"
+        ? books.filter((book) => !book.group)
+        : books.filter((book) => bookInGroup(book, activeGroup)),
     [activeGroup, books],
   );
   const shownBooks = visibleBooks.slice(0, shelfVisibleCount);
@@ -448,6 +496,14 @@ export function ReaderShell() {
   }, [preferences]);
 
   useEffect(() => {
+    if (!showCatalog) return;
+    const frame = window.requestAnimationFrame(() => {
+      activeCatalogChapterRef.current?.scrollIntoView({ block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showCatalog, reader?.chapterIndex]);
+
+  useEffect(() => {
     localStorage.setItem("yomu-app-theme", appTheme);
     document.documentElement.dataset.theme = resolvedAppTheme;
     document.documentElement.style.colorScheme = resolvedAppTheme;
@@ -467,6 +523,27 @@ export function ReaderShell() {
     void hydrateFromServer(api, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
+
+  useEffect(() => {
+    if (connection !== "connected" || !profile.username) return;
+    const key = `yomu-shelf-refresh-at:${profile.username}`;
+    const lastRefresh = Number(localStorage.getItem(key) || 0);
+    if (Date.now() - lastRefresh < 24 * 60 * 60 * 1000) return;
+    const timer = window.setTimeout(() => {
+      void api.getBookshelf(true, {
+        maxAgeMs: 24 * 60 * 60 * 1000,
+        limit: 80,
+        concurrentCount: 2,
+      }).then((updatedBooks) => {
+        localStorage.setItem(key, String(Date.now()));
+        setBooks(updatedBooks);
+        void refreshOfflineStatuses(updatedBooks);
+      }).catch(() => undefined);
+    }, 8000);
+    return () => window.clearTimeout(timer);
+    // This is deliberately detached from login and runs at most once per device/day.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, connection, profile.username]);
 
   useEffect(() => {
     if (!autoReading || !reader) return;
@@ -520,42 +597,48 @@ export function ReaderShell() {
     window.setTimeout(() => setMessage(""), 2600);
   }
 
+  function sourceNameFor(book: Book) {
+    return book.originName
+      || sources.find((source) => source.bookSourceUrl === book.origin)?.bookSourceName
+      || book.origin
+      || "未知书源";
+  }
+
   async function hydrateFromServer(client: ReaderApi, refresh: boolean) {
     setConnection((current) => current === "connected" ? current : "checking");
     const storedProfile = getStoredProfile();
     if (storedProfile.username) client.setCacheNamespace(storedProfile.username);
     client.setOfflineMode(false);
     try {
-      const [user, serverBooks, serverSources] = await Promise.all([
+      const [user, serverBooks] = await Promise.all([
         client.getUserInfo(),
         client.getBookshelf(refresh),
-        client.getBookSources(),
       ]);
       setBooks(serverBooks);
-      setSources(serverSources);
-      const optional = await Promise.allSettled([
-        client.getBookGroups(),
-        client.getBookmarks(),
-        client.getRssSources(),
-        client.getReplaceRules(),
-      ]);
-      if (optional[0].status === "fulfilled") setGroups(optional[0].value as BookGroup[]);
-      if (optional[1].status === "fulfilled") setBookmarks(optional[1].value as Bookmark[]);
-      if (optional[2].status === "fulfilled") setRssSources(optional[2].value as RssSource[]);
-      if (optional[3].status === "fulfilled") setReplaceRules(optional[3].value as ReplaceRule[]);
       const sessionUsername = user.userInfo?.username || profile.username || "";
-      setProfile((current) => ({
-        ...current,
-        username: sessionUsername || current.username,
-      }));
+      setProfile((current) => ({ ...current, username: sessionUsername || current.username }));
       if (sessionUsername) {
         client.setCacheNamespace(sessionUsername);
         localStorage.setItem("yomu-username", sessionUsername);
       }
-      void refreshOfflineStatuses(serverBooks);
       setAdminAuthorized(Boolean(user.adminAuthorized));
       setConnection("connected");
-      if (refresh) toast(`已同步 ${serverBooks.length} 本书`);
+      void refreshOfflineStatuses(serverBooks);
+      if (refresh) toast(`已更新 ${serverBooks.length} 本书`);
+
+      void Promise.allSettled([
+        client.getBookSources(),
+        client.getBookGroups(),
+        client.getBookmarks(),
+        client.getRssSources(),
+        client.getReplaceRules(),
+      ]).then((optional) => {
+        if (optional[0].status === "fulfilled") setSources(optional[0].value as BookSource[]);
+        if (optional[1].status === "fulfilled") setGroups(optional[1].value as BookGroup[]);
+        if (optional[2].status === "fulfilled") setBookmarks(optional[2].value as Bookmark[]);
+        if (optional[3].status === "fulfilled") setRssSources(optional[3].value as RssSource[]);
+        if (optional[4].status === "fulfilled") setReplaceRules(optional[4].value as ReplaceRule[]);
+      });
     } catch (error) {
       if (error instanceof ReaderApiError && error.code === "NEED_LOGIN") {
         setConnection("signedout");
@@ -594,7 +677,7 @@ export function ReaderShell() {
       await api.login(username, password);
       localStorage.setItem("yomu-username", username);
       setProfile({ username });
-      await hydrateFromServer(api, true);
+      await hydrateFromServer(api, false);
     } catch (error) {
       setConnection("signedout");
       toast(error instanceof Error ? error.message : "登录失败");
@@ -700,7 +783,7 @@ export function ReaderShell() {
     }
   }
 
-  async function openBook(book: Book) {
+  async function openBook(book: Book, preferredChapter?: { title?: string; progress?: number }) {
     const fallbackIndex = Math.max(0, book.durChapterIndex || 0);
     setReader({
       book,
@@ -710,18 +793,34 @@ export function ReaderShell() {
       loading: true,
     });
     setReaderChrome(true);
+    setReaderError("");
     try {
       if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
       const chapters = await api.getChapterList(book);
       if (!chapters.length) throw new Error("这本书没有可读取的章节");
-      const chapterIndex = Math.min(fallbackIndex, Math.max(0, chapters.length - 1));
-      const content = await api.getBookContent(book.bookUrl, chapterIndex);
+      const chapterPreference = preferredChapter || (book.durChapterTitle
+        ? { title: book.durChapterTitle }
+        : undefined);
+      const chapterIndex = resolveChapterIndex(chapters, fallbackIndex, chapterPreference);
+      // Keep the usable catalog in the reader even if the selected chapter's
+      // source is temporarily unavailable. Users can still pick another cached
+      // chapter, retry, refresh the catalog, or switch source.
+      setReader({ book, chapters, chapterIndex, content: "", loading: true });
+      const content = await api.getBookContent(book, chapters[chapterIndex], chapterIndex);
       setReader({ book, chapters, chapterIndex, content, loading: false });
+      if (preferredChapter || chapterIndex !== fallbackIndex) {
+        setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl
+          ? { ...item, durChapterIndex: chapterIndex, durChapterTitle: chapters[chapterIndex]?.title }
+          : item));
+        if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
+      }
       prefetchNearby(book, chapters, chapterIndex);
       window.setTimeout(() => readerTopRef.current?.scrollIntoView(), 10);
     } catch (error) {
-      setReader(null);
-      toast(error instanceof Error ? error.message : "打开书籍失败");
+      const detail = error instanceof Error ? error.message : "打开书籍失败";
+      setReader((current) => current ? { ...current, loading: false } : current);
+      setReaderError(detail);
+      toast(detail);
     }
   }
 
@@ -729,9 +828,10 @@ export function ReaderShell() {
     if (!reader || index < 0 || index >= reader.chapters.length) return;
     setReader((current) => (current ? { ...current, chapterIndex: index, loading: true } : current));
     setShowCatalog(false);
+    setReaderError("");
     try {
       if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
-      const content = await api.getBookContent(reader.book.bookUrl, index);
+      const content = await api.getBookContent(reader.book, reader.chapters[index], index);
       setReader((current) => (current ? { ...current, chapterIndex: index, content, loading: false } : current));
       setBooks((current) =>
         current.map((book) =>
@@ -746,7 +846,9 @@ export function ReaderShell() {
       readerOverlayRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
       setReader((current) => (current ? { ...current, loading: false } : current));
-      toast(error instanceof Error ? error.message : "章节加载失败");
+      const detail = error instanceof Error ? error.message : "章节加载失败";
+      setReaderError(detail);
+      toast(detail);
     }
   }
 
@@ -800,7 +902,7 @@ export function ReaderShell() {
   function prefetchNearby(book: Book, chapters: Chapter[], index: number) {
     if (!api || connection !== "connected") return;
     for (const next of [index + 1, index + 2]) {
-      if (next < chapters.length) void api.getBookContent(book.bookUrl, next).catch(() => undefined);
+      if (next < chapters.length) void api.getBookContent(book, chapters[next], next).catch(() => undefined);
     }
   }
 
@@ -948,17 +1050,20 @@ export function ReaderShell() {
     URL.revokeObjectURL(url);
   }
 
-  async function deleteEditedSource() {
-    if (!sourceEditor) return;
-    if (!window.confirm(`确定删除书源“${sourceEditor.bookSourceName}”吗？`)) return;
+  async function deleteSource(source: BookSource, closeEditor = false) {
+    if (!window.confirm(`确定删除书源“${source.bookSourceName}”吗？`)) return;
     try {
-      if (api && connection === "connected") await api.deleteBookSource(sourceEditor);
-      setSources((current) => current.filter((source) => source.bookSourceUrl !== sourceEditor.bookSourceUrl));
-      setShowSourceEditor(false);
+      if (api && connection === "connected") await api.deleteBookSource(source);
+      setSources((current) => current.filter((item) => item.bookSourceUrl !== source.bookSourceUrl));
+      if (closeEditor) setShowSourceEditor(false);
       toast("书源已删除");
     } catch (error) {
       toast(error instanceof Error ? error.message : "书源删除失败");
     }
+  }
+
+  async function deleteEditedSource() {
+    if (sourceEditor) await deleteSource(sourceEditor, true);
   }
 
   function openSourceLogin(source: BookSource) {
@@ -1104,30 +1209,60 @@ export function ReaderShell() {
     speakNext();
   }
 
-  async function loadAvailableSources() {
+  async function loadAvailableSources(refresh = false, append = false) {
     if (!reader || !api || connection !== "connected") return toast("登录已过期，请重新登录");
+    sourceSwitchAbortRef.current?.abort();
+    const controller = new AbortController();
+    sourceSwitchAbortRef.current = controller;
     setShowSourceSwitch(true);
     setSourceSwitching(true);
-    setSourceCandidates([]);
+    if (!append) {
+      setSourceCandidates([]);
+      setSourceCandidateCursor(-1);
+      setSourceCandidateHasMore(false);
+    }
     try {
-      setSourceCandidates(await api.getAvailableBookSources(reader.book, true));
+      const result = await api.streamAvailableBookSources(
+        reader.book,
+        refresh,
+        (batch) => setSourceCandidates((current) => {
+          const merged = new Map((append ? current : []).map((book) => [`${book.origin}\u0000${book.bookUrl}`, book]));
+          for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
+          return [...merged.values()];
+        }),
+        controller.signal,
+        append ? sourceCandidateCursor : -1,
+      );
+      setSourceCandidates((current) => {
+        const merged = new Map((append ? current : []).map((book) => [`${book.origin}\u0000${book.bookUrl}`, book]));
+        for (const book of result.books) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
+        return [...merged.values()];
+      });
+      setSourceCandidateCursor(result.lastIndex);
+      setSourceCandidateHasMore(result.hasMore);
     } catch (error) {
-      toast(error instanceof Error ? error.message : "换源搜索失败");
+      if (!controller.signal.aborted) toast(error instanceof Error ? error.message : "换源搜索失败");
     } finally {
-      setSourceSwitching(false);
+      if (sourceSwitchAbortRef.current === controller) sourceSwitchAbortRef.current = null;
+      if (!controller.signal.aborted) setSourceSwitching(false);
     }
   }
 
   async function switchBookSource(candidate: Book) {
     if (!reader || !api) return;
+    const preferredChapter = {
+      title: currentChapter?.title,
+      progress: reader.chapters.length > 1 ? reader.chapterIndex / (reader.chapters.length - 1) : 0,
+    };
+    sourceSwitchAbortRef.current?.abort();
+    sourceSwitchAbortRef.current = null;
     setSourceSwitching(true);
     try {
       const updated = await api.setBookSource(reader.book.bookUrl, candidate);
       setBooks((current) => current.map((book) => book.bookUrl === reader.book.bookUrl ? updated : book));
       setShowSourceSwitch(false);
-      setReader(null);
-      await openBook(updated);
-      toast(`已切换到 ${candidate.originName || "新书源"}`);
+      await openBook(updated, preferredChapter);
+      toast(`已切换到 ${sourceNameFor(candidate)}`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "切换书源失败");
     } finally {
@@ -1293,6 +1428,22 @@ export function ReaderShell() {
     }
   }
 
+  async function removeBookGroup(group: BookGroup) {
+    if (!api || connection !== "connected") return toast("离线时无法删除分组");
+    if (!window.confirm(`删除分组“${group.groupName}”？组内书籍会保留并变为未分组。`)) return;
+    try {
+      const affected = books.filter((book) => bookInGroup(book, group.groupId));
+      await Promise.all(affected.map((book) => api.saveBookGroupId(book.bookUrl, 0)));
+      await api.deleteBookGroup(group.groupId);
+      setBooks((current) => current.map((book) => bookInGroup(book, group.groupId) ? { ...book, group: 0 } : book));
+      setGroups((current) => current.filter((item) => item.groupId !== group.groupId));
+      if (activeGroup === group.groupId) setActiveGroup("all");
+      toast("分组已删除，书籍仍保留在书架");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "分组删除失败");
+    }
+  }
+
   async function removeBook(book: Book) {
     if (connection !== "connected") return toast("离线时无法删除书籍");
     if (!window.confirm(`确定从书架删除《${book.name}》吗？本地书文件也会一并移除。`)) return;
@@ -1305,32 +1456,12 @@ export function ReaderShell() {
     }
   }
 
-  async function cacheWholeBook(book: Book) {
-    if (!api || connection !== "connected") return toast("登录已过期，请重新登录");
-    setLibraryBusy(true);
-    try {
-      await api.cacheBook(book.bookUrl, (progress) => {
-        try {
-          const data = JSON.parse(progress) as { index?: number; total?: number };
-          if (data.total) setMessage(`正在缓存《${book.name}》 ${data.index || 0}/${data.total}`);
-        } catch {
-          // Reader-compatible servers may send plain progress strings.
-        }
-      });
-      toast(`《${book.name}》已完成服务端缓存`);
-    } catch (error) {
-      toast(error instanceof Error ? error.message : "整本缓存失败");
-    } finally {
-      setLibraryBusy(false);
-    }
-  }
-
   async function refreshOfflineStatuses(items: Book[] = books) {
     const entries = await Promise.all(items.map(async (book) => [book.bookUrl, await api.getOfflineBookStatus(book.bookUrl)] as const));
     setOfflineStatus((current) => ({ ...current, ...Object.fromEntries(entries) }));
   }
 
-  async function downloadBookOffline(book: Book) {
+  async function downloadBookOffline(book: Book, amount: 10 | 50 | 100 | "all") {
     if (offlineDownload?.bookUrl === book.bookUrl) {
       offlineDownloadRef.current?.abort();
       return;
@@ -1343,6 +1474,7 @@ export function ReaderShell() {
       await navigator.storage?.persist?.().catch(() => false);
       await api.downloadBookForOffline(
         book,
+        amount,
         (done, total) => setOfflineDownload({ bookUrl: book.bookUrl, done, total }),
         controller.signal,
       );
@@ -1563,15 +1695,27 @@ export function ReaderShell() {
   }
 
   function changeView(next: ViewName) {
+    if (next === "library" && libraryTab === "admin") setLibraryTab("local");
     setView(next);
     setShowCommand(false);
+  }
+
+  function openAdmin() {
+    setView("library");
+    setLibraryTab("admin");
+    setShowCommand(false);
+    void loadUsers();
   }
 
   if (connection !== "connected" && connection !== "offline") {
     const waiting = connection === "checking" || connection === "authenticating";
     return (
       <main className="auth-shell">
-        <button className="auth-theme-button" onClick={toggleAppTheme} aria-label={resolvedAppTheme === "dark" ? "切换浅色模式" : "切换深色模式"}>{resolvedAppTheme === "dark" ? "☀" : "☾"}</button>
+        <div className="auth-theme-switch" aria-label="外观模式">
+          <button className={appTheme === "system" ? "active" : ""} onClick={() => setAppTheme("system")}>自动</button>
+          <button className={appTheme === "light" ? "active" : ""} onClick={() => setAppTheme("light")}>浅色</button>
+          <button className={appTheme === "dark" ? "active" : ""} onClick={() => setAppTheme("dark")}>深色</button>
+        </div>
         <section className="auth-panel">
           <div className="auth-card">
             <div className="auth-brand"><span className="brand-mark">阅</span><div><strong>Yomu</strong><small>轻阅读</small></div></div>
@@ -1615,6 +1759,7 @@ export function ReaderShell() {
               <span>{item.label}</span>
             </button>
           ))}
+          {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "nav-item active" : "nav-item"} onClick={openAdmin}><span className="nav-icon" aria-hidden="true">盾</span><span>后台</span></button>}
         </nav>
 
         <div className="sidebar-bottom">
@@ -1695,7 +1840,8 @@ export function ReaderShell() {
                   </div>
                   <div className="segmented compact shelf-groups" aria-label="书架分组">
                     <button className={activeGroup === "all" ? "active" : ""} onClick={() => setActiveGroup("all")}>全部</button>
-                    {groups.slice(0, 5).map((group) => (
+                    <button className={activeGroup === "ungrouped" ? "active" : ""} onClick={() => setActiveGroup("ungrouped")}>未分组</button>
+                    {groups.filter((group) => group.groupId > 0).map((group) => (
                       <button key={group.groupId} className={activeGroup === group.groupId ? "active" : ""} onClick={() => setActiveGroup(group.groupId)}>{group.groupName}</button>
                     ))}
                   </div>
@@ -1703,7 +1849,7 @@ export function ReaderShell() {
                 <div className="book-grid">
                   {shownBooks.map((book, index) => (
                     <article className="book-card" key={book.bookUrl}>
-                      <button className="book-cover" style={coverStyle(book)} onClick={() => openBook(book)} aria-label={`阅读 ${book.name}`}>
+                      <button className={book.customCoverUrl || book.coverUrl ? "book-cover has-cover" : "book-cover"} style={coverStyle(book)} onClick={() => openBook(book)} aria-label={`阅读 ${book.name}`}>
                         <span className="cover-index">{String(index + 1).padStart(2, "0")}</span>
                         <strong>{book.name}</strong>
                         <small>{book.author}</small>
@@ -1715,15 +1861,15 @@ export function ReaderShell() {
                       </button>
                       <div className="mini-progress"><span style={{ width: `${progressFor(book)}%` }} /></div>
                       <div className="book-card-actions">
-                        <button onClick={() => downloadBookOffline(book)}>{offlineDownload?.bookUrl === book.bookUrl
+                        <button onClick={() => offlineDownload?.bookUrl === book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{offlineDownload?.bookUrl === book.bookUrl
                           ? `${offlineDownload.done}/${offlineDownload.total || "?"}`
                           : offlineStatus[book.bookUrl]?.cachedChapters
                             && (offlineStatus[book.bookUrl].totalChapters || 0) > 0
                             && offlineStatus[book.bookUrl].cachedChapters >= (offlineStatus[book.bookUrl].totalChapters || 0)
-                            ? "已离线"
+                            ? "已缓存全部"
                             : offlineStatus[book.bookUrl]?.cachedChapters
-                              ? `${offlineStatus[book.bookUrl].cachedChapters}/${offlineStatus[book.bookUrl].totalChapters || "?"} 续传`
-                              : "离线"}</button>
+                              ? `已缓存 ${offlineStatus[book.bookUrl].cachedChapters} 章`
+                              : "缓存章节"}</button>
                         {Boolean(offlineStatus[book.bookUrl]?.cachedChapters) && <button onClick={() => removeBookOffline(book)} aria-label={`删除 ${book.name} 的本机缓存`}>×</button>}
                       </div>
                     </article>
@@ -1809,6 +1955,7 @@ export function ReaderShell() {
                     <span className="latency">{source.respondTime ? `${source.respondTime} ms` : "待检测"}</span>
                     <span className="source-order-actions"><button onClick={() => moveSource(source, -1)} aria-label={`${source.bookSourceName}上移`}>↑</button><button onClick={() => moveSource(source, 1)} aria-label={`${source.bookSourceName}下移`}>↓</button></span>
                     <button className="more-button" onClick={() => { setSourceEditor(source); setShowSourceEditor(true); }} aria-label={`编辑 ${source.bookSourceName}`}>编辑</button>
+                    <button className="more-button danger-text" onClick={() => void deleteSource(source)} aria-label={`删除 ${source.bookSourceName}`}>删除</button>
                   </article>
                 ))}
               </div>
@@ -1819,12 +1966,12 @@ export function ReaderShell() {
             <div className="view-content library-view">
               <section className="page-intro split-intro">
                 <div>
-                  <h1>资料库</h1>
+                  <h1>{libraryTab === "admin" ? "后台管理" : "资料库"}</h1>
                 </div>
                 <input ref={localBookRef} type="file" accept=".txt,.epub,.mobi,.pdf,text/plain,application/epub+zip,application/pdf" hidden onChange={uploadLocalBook} />
-                <button className="primary-button" disabled={libraryBusy} onClick={() => localBookRef.current?.click()}>{libraryBusy ? "处理中…" : "＋ 导入本地书"}</button>
+                {libraryTab !== "admin" && <button className="primary-button" disabled={libraryBusy} onClick={() => localBookRef.current?.click()}>{libraryBusy ? "处理中…" : "＋ 导入本地书"}</button>}
               </section>
-              <div className="tool-grid">
+              {libraryTab !== "admin" && <div className="tool-grid">
                 <button className={libraryTab === "local" ? "tool-card active" : "tool-card"} onClick={() => setLibraryTab("local") }>
                   <span className="tool-icon">Aa</span><strong>本地书仓</strong><small>TXT · EPUB · MOBI · PDF</small><em>{books.filter((book) => book.local || book.origin?.startsWith("local")).length} 本</em>
                 </button>
@@ -1840,16 +1987,13 @@ export function ReaderShell() {
                 <button className={libraryTab === "backup" ? "tool-card active" : "tool-card"} onClick={() => { setLibraryTab("backup"); void loadWebdavFiles(); } }>
                   <span className="tool-icon">存</span><strong>备份与缓存</strong><small>WebDAV · 离线章节 · 整本缓存</small><em>{webdavFiles.length} 个文件</em>
                 </button>
-                <button className={libraryTab === "admin" ? "tool-card active" : "tool-card"} onClick={() => { setLibraryTab("admin"); if (adminAuthorized) void loadUsers(); } }>
-                  <span className="tool-icon">管</span><strong>账户与安全</strong><small>密码、会话与用户权限</small><em>{adminAuthorized ? "管理员" : "个人"}</em>
-                </button>
-              </div>
+              </div>}
 
               {libraryTab === "local" && (
                 <section className="library-panel">
                   <div className="panel-heading"><div><h2>本地书与分组</h2></div></div>
                   <form className="inline-create" onSubmit={createBookGroup}><input name="groupName" placeholder="新分组名称" aria-label="新分组名称" /><button className="quiet-button">创建分组</button></form>
-                  <div className="group-chip-row"><span>分组：</span>{groups.length ? groups.map((group) => <button key={group.groupId} onClick={() => { setActiveGroup(group.groupId); setView("shelf"); }}>{group.groupName}</button>) : <small>尚未创建分组</small>}</div>
+                  <div className="group-chip-row"><span>分组：</span>{groups.length ? groups.map((group) => <span className="managed-group" key={group.groupId}><button onClick={() => { setActiveGroup(group.groupId); setView("shelf"); }}>{group.groupName}</button><button className="danger-text" onClick={() => removeBookGroup(group)} aria-label={`删除分组 ${group.groupName}`}>×</button></span>) : <small>尚未创建分组</small>}</div>
                   <div className="library-list">
                     {books.map((book) => (
                       <article className="library-row" key={`library-${book.bookUrl}`}>
@@ -1943,7 +2087,7 @@ export function ReaderShell() {
                     {books.map((book) => {
                       const status = offlineStatus[book.bookUrl];
                       const downloading = offlineDownload?.bookUrl === book.bookUrl;
-                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `本机 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "未下载到本机"}</small></div><div className="cache-actions"><button onClick={() => cacheWholeBook(book)}>服务器</button><button onClick={() => downloadBookOffline(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : status?.cachedChapters ? "继续下载" : "下载到本机"}</button>{Boolean(status?.cachedChapters) && <button className="danger-text" onClick={() => removeBookOffline(book)}>删除本机</button>}</div></article>;
+                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `本机已缓存 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "尚未缓存章节"}</small></div><div className="cache-actions"><button onClick={() => downloading ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button>{Boolean(status?.cachedChapters) && <button className="danger-text" onClick={() => removeBookOffline(book)}>删除缓存</button>}</div></article>;
                     })}
                   </div>
                 </section>
@@ -1967,13 +2111,28 @@ export function ReaderShell() {
         </div>
       </section>
 
-      <nav className="mobile-nav" aria-label="移动端导航">
+      <nav className={adminAuthorized ? "mobile-nav has-admin" : "mobile-nav"} aria-label="移动端导航">
         {navigation.map((item) => (
           <button key={`mobile-${item.id}`} className={view === item.id ? "active" : ""} onClick={() => changeView(item.id)}>
             <span>{item.icon}</span><small>{item.label}</small>
           </button>
         ))}
+        {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "active" : ""} onClick={openAdmin}><span>盾</span><small>后台</small></button>}
       </nav>
+
+      {offlinePickerBook && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setOfflinePickerBook(null)}>
+          <section className="modal offline-picker" role="dialog" aria-modal="true" aria-labelledby="offline-picker-title">
+            <button className="modal-close" onClick={() => setOfflinePickerBook(null)} aria-label="关闭">×</button>
+            <p className="eyebrow">离线缓存</p>
+            <h2 id="offline-picker-title">缓存《{offlinePickerBook.name}》</h2>
+            <p>从当前阅读位置开始缓存。完成后无需切换模式，断网时会自动读取本机章节。</p>
+            <div className="offline-options">
+              {([10, 50, 100, "all"] as const).map((amount) => <button key={amount} onClick={() => { const book = offlinePickerBook; setOfflinePickerBook(null); void downloadBookOffline(book, amount); }}>{amount === "all" ? "全部" : `${amount} 章`}</button>)}
+            </div>
+          </section>
+        </div>
+      )}
 
       {showConnect && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowConnect(false)}>
@@ -2043,28 +2202,29 @@ export function ReaderShell() {
           <header className="reader-bar">
             <button onClick={() => { window.speechSynthesis?.cancel(); setSpeaking(false); setAutoReading(false); setReader(null); }} aria-label="退出阅读">←</button>
             <div><strong>{reader.book.name}</strong><small>{currentChapter?.title}</small></div>
-            <div className="reader-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={loadAvailableSources}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
+            <div className="reader-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
           </header>
           <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap}>
             <p className="chapter-kicker">第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</p>
             <h1>{currentChapter?.title}</h1>
             <p className="chapter-book">{reader.book.name} · {reader.book.author}</p>
             {reader.loading ? <div className="reader-loading"><span /><span /><span /><p>正在整理书页…</p></div>
+              : readerError ? <div className="reader-error-state"><strong>这一页暂时没有打开</strong><p>{readerError}</p><div><button onClick={() => reader.chapters.length ? void loadChapter(reader.chapterIndex) : void openBook(reader.book)}>重试</button><button onClick={() => void loadAvailableSources(false)}>查找可用书源</button>{reader.chapters.length === 0 && <button onClick={() => void api.getChapterList(reader.book, true).then((chapters) => { setReader((current) => current ? { ...current, chapters } : current); setReaderError(""); }).catch((error) => setReaderError(error instanceof Error ? error.message : "目录刷新失败"))}>刷新目录</button>}</div></div>
               : readerSourceType === 1 && readerMediaUrls.length ? <div className="reader-audio-list">{readerMediaUrls.map((url, index) => <section key={url}><strong>{currentChapter?.title}{readerMediaUrls.length > 1 ? ` · ${index + 1}` : ""}</strong><audio controls preload="metadata" src={api.getBookResourceUrl(reader.book, url)} /></section>)}</div>
                 : readerSourceType === 2 && readerMediaUrls.length ? <div className="reader-comic-list">{readerMediaUrls.map((url, index) => <ComicImage key={url} src={api.getBookResourceUrl(reader.book, url)} alt={`${currentChapter?.title || "本章"} ${index + 1}`} />)}</div>
                   : readingContent.split(/\n{2,}/).map((paragraph, index) => <p key={`${reader.chapterIndex}-${index}`}>{highlightedText(paragraph, chapterQuery)}</p>)}
             <footer className="chapter-footer">
               <button onClick={() => changePageOrChapter(-1)} disabled={reader.chapterIndex === 0}>← 上一章</button>
-              <span>{Math.round(((reader.chapterIndex + 1) / reader.chapters.length) * 100)}%</span>
+              <span>{reader.chapters.length ? Math.round(((reader.chapterIndex + 1) / reader.chapters.length) * 100) : 0}%</span>
               <button onClick={() => changePageOrChapter(1)} disabled={reader.chapterIndex === reader.chapters.length - 1}>下一章 →</button>
             </footer>
           </article>
-          <div className="reader-progress"><span style={{ width: `${((reader.chapterIndex + 1) / reader.chapters.length) * 100}%` }} /></div>
+          <div className="reader-progress"><span style={{ width: `${reader.chapters.length ? ((reader.chapterIndex + 1) / reader.chapters.length) * 100 : 0}%` }} /></div>
 
           {showCatalog && (
             <aside className="reader-drawer catalog-drawer">
               <header><div><p className="eyebrow">目录</p><h2>{reader.book.name}</h2></div><button onClick={() => setShowCatalog(false)}>×</button></header>
-              <div className="catalog-list">{reader.chapters.map((chapter) => <button key={`${chapter.index}-${chapter.url}`} className={chapter.index === reader.chapterIndex ? "active" : ""} onClick={() => loadChapter(chapter.index)}><span>{String(chapter.index + 1).padStart(2, "0")}</span>{chapter.title}</button>)}</div>
+              <div className="catalog-list">{reader.chapters.map((chapter) => <button ref={chapter.index === reader.chapterIndex ? activeCatalogChapterRef : undefined} key={`${chapter.index}-${chapter.url}`} className={chapter.index === reader.chapterIndex ? "active" : ""} onClick={() => loadChapter(chapter.index)}><span>{String(chapter.index + 1).padStart(2, "0")}</span>{chapter.title}</button>)}</div>
             </aside>
           )}
           {showReaderSettings && (
@@ -2081,12 +2241,12 @@ export function ReaderShell() {
           )}
           {showSourceSwitch && (
             <aside className="reader-drawer source-switch-drawer">
-              <header><div><p className="eyebrow">换源</p><h2>同名书籍的可用来源</h2></div><button onClick={() => setShowSourceSwitch(false)}>×</button></header>
+              <header><div><p className="eyebrow">换源</p><h2>同名书籍的可用来源</h2></div><div className="drawer-header-actions">{sourceCandidateHasMore && <button disabled={sourceSwitching} onClick={() => void loadAvailableSources(false, true)}>继续查找</button>}<button disabled={sourceSwitching} onClick={() => void loadAvailableSources(true)}>重新搜索</button><button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
               <p className="drawer-note">会保留当前阅读进度，并重新获取目录和正文。</p>
               <div className="candidate-list">
-                {sourceSwitching ? <div className="empty-state"><strong>正在并发检测书源…</strong><span>服务器会缓存本次结果。</span></div> : sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
-                  <button key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{candidate.originName || candidate.origin || "未知书源"}</strong><small>{candidate.latestChapterTitle || candidate.bookUrl}</small></div><i>切换</i></button>
-                )) : <div className="empty-state"><strong>没有找到可用来源</strong><span>可以检查书源状态或稍后重试。</span></div>}
+                {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
+                  <button key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.latestChapterTitle || candidate.bookUrl}</small></div><i>切换</i></button>
+                )) : sourceSwitching ? <div className="empty-state"><strong>正在用 4 路并发检测书源…</strong><span>找到结果会立即显示，不必等待全部书源。</span></div> : <div className="empty-state"><strong>没有找到可用来源</strong><span>可以检查书源状态或重新搜索。</span></div>}
               </div>
             </aside>
           )}
