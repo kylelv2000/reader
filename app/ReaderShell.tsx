@@ -165,9 +165,37 @@ function getStoredExploreEnabled() {
 }
 
 function plainText(html: string) {
-  if (typeof window === "undefined") return html.replace(/<[^>]+>/g, " ");
-  const document = new DOMParser().parseFromString(html, "text/html");
-  return (document.body.textContent || "").replace(/\n{3,}/g, "\n\n").trim();
+  const withBreaks = html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|blockquote|h[1-6])>/gi, "\n\n");
+  const text = typeof window === "undefined"
+    ? withBreaks.replace(/<[^>]+>/g, " ")
+    : new DOMParser().parseFromString(withBreaks, "text/html").body.textContent || "";
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function readerParagraphs(content: string, chapterTitle = "") {
+  const normalizedTitle = normalizedChapterTitle(chapterTitle);
+  return content
+    .replace(/\r\n?/g, "\n")
+    .split(/\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => {
+      if (!paragraph) return false;
+      if (/^(?:javascript:\s*)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\([^)]*\);?$/i.test(paragraph)) {
+        return false;
+      }
+      if (normalizedTitle) {
+        const withoutPage = paragraph.replace(/[（(]?\s*第?\s*\d+\s*[\/／]\s*\d+\s*页\s*[)）]?\s*$/u, "");
+        if (normalizedChapterTitle(withoutPage) === normalizedTitle) return false;
+      }
+      return true;
+    });
 }
 
 function mediaUrls(content: string) {
@@ -311,8 +339,6 @@ export function ReaderShell() {
   const [sourceEditor, setSourceEditor] = useState<BookSource | null>(null);
   const [showSourceEditor, setShowSourceEditor] = useState(false);
   const [sourceCandidates, setSourceCandidates] = useState<Book[]>([]);
-  const [sourceCandidateCursor, setSourceCandidateCursor] = useState(-1);
-  const [sourceCandidateHasMore, setSourceCandidateHasMore] = useState(false);
   const [showSourceSwitch, setShowSourceSwitch] = useState(false);
   const [sourceSwitching, setSourceSwitching] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -814,7 +840,6 @@ export function ReaderShell() {
           : item));
         if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
       }
-      prefetchNearby(book, chapters, chapterIndex);
       window.setTimeout(() => readerTopRef.current?.scrollIntoView(), 10);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "打开书籍失败";
@@ -842,7 +867,6 @@ export function ReaderShell() {
       );
       void api.saveOfflineProgress(reader.book, reader.chapters, index);
       if (api && connection === "connected") void api.saveProgress(reader.book.bookUrl, index);
-      prefetchNearby(reader.book, reader.chapters, index);
       readerOverlayRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
       setReader((current) => (current ? { ...current, loading: false } : current));
@@ -897,13 +921,6 @@ export function ReaderShell() {
     if (ratio < 0.23) void changePageOrChapter(-1);
     else if (ratio > 0.77) void changePageOrChapter(1);
     else setReaderChrome((value) => !value);
-  }
-
-  function prefetchNearby(book: Book, chapters: Chapter[], index: number) {
-    if (!api || connection !== "connected") return;
-    for (const next of [index + 1, index + 2]) {
-      if (next < chapters.length) void api.getBookContent(book, chapters[next], next).catch(() => undefined);
-    }
   }
 
   async function importSources(event: ChangeEvent<HTMLInputElement>) {
@@ -1209,37 +1226,31 @@ export function ReaderShell() {
     speakNext();
   }
 
-  async function loadAvailableSources(refresh = false, append = false) {
+  async function loadAvailableSources(refresh = false) {
     if (!reader || !api || connection !== "connected") return toast("登录已过期，请重新登录");
     sourceSwitchAbortRef.current?.abort();
     const controller = new AbortController();
     sourceSwitchAbortRef.current = controller;
     setShowSourceSwitch(true);
     setSourceSwitching(true);
-    if (!append) {
-      setSourceCandidates([]);
-      setSourceCandidateCursor(-1);
-      setSourceCandidateHasMore(false);
-    }
+    setSourceCandidates([]);
     try {
       const result = await api.streamAvailableBookSources(
         reader.book,
         refresh,
-        (batch) => setSourceCandidates((current) => {
-          const merged = new Map((append ? current : []).map((book) => [`${book.origin}\u0000${book.bookUrl}`, book]));
+        (batch) => setSourceCandidates(() => {
+          const merged = new Map<string, Book>();
           for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
           return [...merged.values()];
         }),
         controller.signal,
-        append ? sourceCandidateCursor : -1,
+        -1,
       );
-      setSourceCandidates((current) => {
-        const merged = new Map((append ? current : []).map((book) => [`${book.origin}\u0000${book.bookUrl}`, book]));
+      setSourceCandidates(() => {
+        const merged = new Map<string, Book>();
         for (const book of result.books) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
         return [...merged.values()];
       });
-      setSourceCandidateCursor(result.lastIndex);
-      setSourceCandidateHasMore(result.hasMore);
     } catch (error) {
       if (!controller.signal.aborted) toast(error instanceof Error ? error.message : "换源搜索失败");
     } finally {
@@ -2212,7 +2223,7 @@ export function ReaderShell() {
               : readerError ? <div className="reader-error-state"><strong>这一页暂时没有打开</strong><p>{readerError}</p><div><button onClick={() => reader.chapters.length ? void loadChapter(reader.chapterIndex) : void openBook(reader.book)}>重试</button><button onClick={() => void loadAvailableSources(false)}>查找可用书源</button>{reader.chapters.length === 0 && <button onClick={() => void api.getChapterList(reader.book, true).then((chapters) => { setReader((current) => current ? { ...current, chapters } : current); setReaderError(""); }).catch((error) => setReaderError(error instanceof Error ? error.message : "目录刷新失败"))}>刷新目录</button>}</div></div>
               : readerSourceType === 1 && readerMediaUrls.length ? <div className="reader-audio-list">{readerMediaUrls.map((url, index) => <section key={url}><strong>{currentChapter?.title}{readerMediaUrls.length > 1 ? ` · ${index + 1}` : ""}</strong><audio controls preload="metadata" src={api.getBookResourceUrl(reader.book, url)} /></section>)}</div>
                 : readerSourceType === 2 && readerMediaUrls.length ? <div className="reader-comic-list">{readerMediaUrls.map((url, index) => <ComicImage key={url} src={api.getBookResourceUrl(reader.book, url)} alt={`${currentChapter?.title || "本章"} ${index + 1}`} />)}</div>
-                  : readingContent.split(/\n{2,}/).map((paragraph, index) => <p key={`${reader.chapterIndex}-${index}`}>{highlightedText(paragraph, chapterQuery)}</p>)}
+                  : readerParagraphs(readingContent, currentChapter?.title).map((paragraph, index) => <p key={`${reader.chapterIndex}-${index}`}>{highlightedText(paragraph, chapterQuery)}</p>)}
             <footer className="chapter-footer">
               <button onClick={() => changePageOrChapter(-1)} disabled={reader.chapterIndex === 0}>← 上一章</button>
               <span>{reader.chapters.length ? Math.round(((reader.chapterIndex + 1) / reader.chapters.length) * 100) : 0}%</span>
@@ -2241,12 +2252,12 @@ export function ReaderShell() {
           )}
           {showSourceSwitch && (
             <aside className="reader-drawer source-switch-drawer">
-              <header><div><p className="eyebrow">换源</p><h2>同名书籍的可用来源</h2></div><div className="drawer-header-actions">{sourceCandidateHasMore && <button disabled={sourceSwitching} onClick={() => void loadAvailableSources(false, true)}>继续查找</button>}<button disabled={sourceSwitching} onClick={() => void loadAvailableSources(true)}>重新搜索</button><button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
-              <p className="drawer-note">会保留当前阅读进度，并重新获取目录和正文。</p>
+              <header><div><p className="eyebrow">换源</p><h2>同名书籍的可用来源</h2></div><div className="drawer-header-actions"><button disabled={sourceSwitching} onClick={() => void loadAvailableSources(true)}>扫描全部书源</button><button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
+              <p className="drawer-note">优先显示上次扫描缓存；只有手动扫描才会用 4 路并发重新检测全部书源。切换前会校验目录和正文，并保留阅读进度。</p>
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
-                  <button key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.latestChapterTitle || candidate.bookUrl}</small></div><i>切换</i></button>
-                )) : sourceSwitching ? <div className="empty-state"><strong>正在用 4 路并发检测书源…</strong><span>找到结果会立即显示，不必等待全部书源。</span></div> : <div className="empty-state"><strong>没有找到可用来源</strong><span>可以检查书源状态或重新搜索。</span></div>}
+                  <button key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.latestChapterTitle || "已匹配书名与作者"}</small><small>{candidate.bookUrl}</small></div><i>切换</i></button>
+                )) : sourceSwitching ? <div className="empty-state"><strong>正在用 4 路并发检测书源…</strong><span>匹配结果会立即显示，扫描完成后保存在服务器。</span></div> : <div className="empty-state"><strong>没有找到可用来源</strong><span>结果已缓存；书源变化后可手动扫描全部书源。</span></div>}
               </div>
             </aside>
           )}

@@ -34,7 +34,9 @@ const DEFAULT_AVAILABLE_RESULT_LIMIT: usize = 20;
 const MAX_AVAILABLE_RESULT_LIMIT: usize = 100;
 const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 4;
 const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
-const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 5;
+const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
+const READER_PREFETCH_CHAPTERS: usize = 10;
+const READER_PREFETCH_CONCURRENT: usize = 2;
 const DEFAULT_GLOBAL_EXPLORE_LIMIT: usize = 20;
 const MAX_GLOBAL_EXPLORE_LIMIT: usize = 100;
 const DEFAULT_GLOBAL_EXPLORE_CONCURRENT: usize = 16;
@@ -1399,6 +1401,13 @@ pub async fn get_book_content(
             .get_cached_content(&user_ns, &book_url, &chapter_url)
             .await?
         {
+            spawn_reader_prefetch(
+                state.clone(),
+                user_ns.clone(),
+                book_url.clone(),
+                chapter_url.clone(),
+                req.index,
+            );
             return Ok(Json(ApiResponse::ok(serde_json::Value::String(content))));
         }
     }
@@ -1424,7 +1433,119 @@ pub async fn get_book_content(
         .book_service
         .get_content(&user_ns, &book_url, &source, &chapter_url)
         .await?;
+    spawn_reader_prefetch(
+        state,
+        user_ns,
+        book_url,
+        chapter_url,
+        req.index,
+    );
     Ok(Json(ApiResponse::ok(serde_json::Value::String(content))))
+}
+
+fn spawn_reader_prefetch(
+    state: AppState,
+    user_ns: String,
+    book_url: String,
+    chapter_url: String,
+    chapter_index: Option<i32>,
+) {
+    tokio::spawn(async move {
+        let window = chapter_index.map(|index| index.max(0) / 5).unwrap_or(-1);
+        let prefetch_key = format!("{}\u{0}{}\u{0}{}", user_ns, book_url, window);
+        {
+            let mut active = state.reader_prefetches.lock().await;
+            if !active.insert(prefetch_key.clone()) {
+                return;
+            }
+        }
+        prefetch_reader_chapters(
+            &state,
+            &user_ns,
+            &book_url,
+            &chapter_url,
+            chapter_index,
+        )
+        .await;
+        state.reader_prefetches.lock().await.remove(&prefetch_key);
+    });
+}
+
+async fn prefetch_reader_chapters(
+    state: &AppState,
+    user_ns: &str,
+    book_url: &str,
+    chapter_url: &str,
+    chapter_index: Option<i32>,
+) {
+    let Ok(Some(book)) = state.book_service.get_shelf_book(user_ns, book_url).await else {
+        return;
+    };
+    if book.origin.trim().is_empty()
+        || is_local_txt_origin(&book.origin)
+        || is_local_epub_origin(&book.origin)
+        || is_local_pdf_origin(&book.origin)
+        || is_local_mobi_origin(&book.origin)
+    {
+        return;
+    }
+    let Ok(source) = resolve_book_source(
+        state,
+        user_ns,
+        Some(book.origin.clone()),
+        None,
+        Some(book_url),
+    )
+    .await
+    else {
+        return;
+    };
+    let toc_url = book.toc_url.as_deref().unwrap_or(&book.book_url);
+    let Ok(Some(chapters)) = state
+        .book_service
+        .load_chapter_list_cache(user_ns, toc_url)
+        .await
+    else {
+        return;
+    };
+    let current = chapter_index
+        .filter(|index| *index >= 0)
+        .map(|index| index as usize)
+        .filter(|index| *index < chapters.len())
+        .or_else(|| chapters.iter().position(|chapter| chapter.url == chapter_url));
+    let Some(current) = current else { return; };
+    let upcoming = chapters
+        .into_iter()
+        .skip(current + 1)
+        .take(READER_PREFETCH_CHAPTERS)
+        .collect::<Vec<_>>();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        READER_PREFETCH_CONCURRENT,
+    ));
+    let mut tasks = JoinSet::new();
+    for chapter in upcoming {
+        if state
+            .book_service
+            .is_chapter_cached(user_ns, book_url, &chapter.url)
+            .await
+        {
+            continue;
+        }
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            break;
+        };
+        let service = state.book_service.clone();
+        let source = source.clone();
+        let user_ns = user_ns.to_string();
+        let book_url = book_url.to_string();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let _ = service
+                .cache_chapter(&user_ns, &book_url, &source, &chapter.url, false)
+                .await;
+        });
+    }
+    while tasks.join_next().await.is_some() {}
 }
 
 pub async fn delete_book_cache(
@@ -3136,37 +3257,34 @@ pub async fn get_available_book_source_sse(
                     &book.author,
                     AVAILABLE_SOURCE_SSE_RESULT_LIMIT,
                 );
-                if cached.is_empty() {
-                    // Ignore stale caches that only contain the current source.
-                } else {
-                    tokio::spawn(async move {
-                        let mut last_index = -1;
-                        for book in cached {
-                            last_index += 1;
-                            let payload = serde_json::json!({
-                                "lastIndex": last_index,
-                                "hasMore": false,
-                                "data": [book]
-                            });
-                            if tx
-                                .send(Event::default().data(payload.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                tokio::spawn(async move {
+                    let mut last_index = -1;
+                    for book in cached {
+                        last_index += 1;
+                        let payload = serde_json::json!({
+                            "lastIndex": last_index,
+                            "hasMore": false,
+                            "cached": true,
+                            "data": [book]
+                        });
+                        if tx
+                            .send(Event::default().data(payload.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
                         }
-                        let _ = tx
-                            .send(
-                                Event::default().event("end").data(
-                                    serde_json::json!({"lastIndex": last_index, "hasMore": false})
-                                        .to_string(),
-                                ),
-                            )
-                            .await;
-                    });
-                    return Ok(Sse::new(ReceiverStream::new(rx).map(Ok)));
-                }
+                    }
+                    let _ = tx
+                        .send(
+                            Event::default().event("end").data(
+                                serde_json::json!({"lastIndex": last_index, "hasMore": false, "cached": true})
+                                    .to_string(),
+                            ),
+                        )
+                        .await;
+                });
+                return Ok(Sse::new(ReceiverStream::new(rx).map(Ok)));
             }
         }
     }
@@ -3194,10 +3312,7 @@ pub async fn get_available_book_source_sse(
         let mut tasks = JoinSet::new();
 
         while next_index < sources.len() || !tasks.is_empty() {
-            while tasks.len() < concurrent_count
-                && next_index < sources.len()
-                && emitted < AVAILABLE_SOURCE_SSE_RESULT_LIMIT
-            {
+            while tasks.len() < concurrent_count && next_index < sources.len() {
                 let source_index = next_index;
                 let source = sources[source_index].clone();
                 let svc = state_clone.book_service.clone();
@@ -3213,7 +3328,7 @@ pub async fn get_available_book_source_sse(
                 next_index += 1;
             }
 
-            if emitted >= AVAILABLE_SOURCE_SSE_RESULT_LIMIT || tasks.is_empty() {
+            if tasks.is_empty() {
                 break;
             }
 
@@ -3228,7 +3343,7 @@ pub async fn get_available_book_source_sse(
                                 &target_author,
                                 Some(&book.origin),
                                 &mut seen,
-                                AVAILABLE_SOURCE_SSE_RESULT_LIMIT - emitted,
+                                AVAILABLE_SOURCE_SSE_RESULT_LIMIT.saturating_sub(emitted),
                             );
                             for book in matches {
                                 emitted += 1;
@@ -3245,9 +3360,6 @@ pub async fn get_available_book_source_sse(
                                 {
                                     tasks.abort_all();
                                     return;
-                                }
-                                if emitted >= AVAILABLE_SOURCE_SSE_RESULT_LIMIT {
-                                    break;
                                 }
                             }
                         }
@@ -3267,22 +3379,13 @@ pub async fn get_available_book_source_sse(
             }
         }
 
-        let has_more = next_index < sources.len() || !tasks.is_empty();
-        if has_more {
-            tasks.abort_all();
-        }
-        let final_last_idx = if has_more {
-            last_idx.max(next_index as i32 - 1)
-        } else {
-            last_idx
-        };
+        let has_more = false;
+        let final_last_idx = last_idx.max(next_index as i32 - 1);
 
-        if !has_more && last_index_start < 0 {
-            let _ = state_clone
-                .book_service
-                .save_book_sources_cache(&user_ns, &book.book_url, &all_results)
-                .await;
-        }
+        let _ = state_clone
+            .book_service
+            .save_book_sources_cache(&user_ns, &book.book_url, &all_results)
+            .await;
 
         let _ = tx
             .send(Event::default().event("end").data(
@@ -3719,6 +3822,7 @@ fn normalize_available_author(value: &str) -> String {
         .unwrap_or(&compact);
     without_label
         .trim_start_matches(['：', ':'])
+        .trim_end_matches('著')
         .trim()
         .to_string()
 }

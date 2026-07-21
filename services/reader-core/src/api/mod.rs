@@ -11,6 +11,7 @@ use crate::service::{
     update_service::UpdateService, user_service::UserService,
 };
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,4 +26,5 @@ pub struct AppState {
     pub local_pdf_book_service: Arc<LocalPdfBookService>,
     pub json_document_service: Arc<JsonDocumentService>,
     pub update_service: Arc<UpdateService>,
+    pub reader_prefetches: Arc<Mutex<std::collections::HashSet<String>>>,
 }
