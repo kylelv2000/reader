@@ -1,0 +1,228 @@
+import { createServer } from "node:http";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { chromium } from "playwright-core";
+
+const port = Number(process.env.PORT || 19090);
+const bridgeKey = process.env.WEBVIEW_BRIDGE_KEY || "";
+const maxConcurrent = Math.max(1, Number(process.env.WEBVIEW_MAX_CONCURRENT || 2));
+const maxBodyBytes = Math.max(64 * 1024, Number(process.env.WEBVIEW_MAX_BODY_BYTES || 2 * 1024 * 1024));
+const maxResponseBytes = Math.max(1024 * 1024, Number(process.env.WEBVIEW_MAX_RESPONSE_BYTES || 8 * 1024 * 1024));
+const browserIdleMs = Math.max(30, Number(process.env.WEBVIEW_IDLE_SECONDS || 120)) * 1000;
+let activeJobs = 0;
+let localBrowser;
+let browserLaunch;
+let idleTimer;
+
+async function getLocalBrowser() {
+  if (localBrowser?.isConnected()) return localBrowser;
+  browserLaunch ||= chromium.launch({
+    headless: true,
+  }).then((browser) => {
+    localBrowser = browser;
+    browser.on("disconnected", () => { localBrowser = undefined; });
+    return browser;
+  }).finally(() => { browserLaunch = undefined; });
+  return browserLaunch;
+}
+
+function scheduleBrowserIdleClose() {
+  clearTimeout(idleTimer);
+  if (activeJobs > 0 || !localBrowser) return;
+  idleTimer = setTimeout(async () => {
+    const browser = localBrowser;
+    localBrowser = undefined;
+    await browser?.close().catch(() => undefined);
+  }, browserIdleMs);
+  idleTimer.unref();
+}
+
+export function isSafePublicUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) return false;
+  if (url.username || url.password) return false;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return false;
+  return !isPrivateAddress(host);
+}
+
+function isPrivateAddress(host) {
+  if (host === "::1" || host === "0.0.0.0") return true;
+  if (isIP(host) === 4) {
+    const octets = host.split(".").map(Number);
+    if (
+      octets[0] === 10 ||
+      octets[0] === 127 ||
+      octets[0] === 0 ||
+      octets[0] >= 224 ||
+      (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && [0, 2, 168].includes(octets[1])) ||
+      (octets[0] === 198 && [18, 19].includes(octets[1])) ||
+      (octets[0] === 198 && octets[1] === 51 && octets[2] === 100) ||
+      (octets[0] === 203 && octets[1] === 0 && octets[2] === 113)
+    ) return true;
+  }
+  if (isIP(host) === 6) {
+    const first = Number.parseInt(host.split(":", 1)[0] || "0", 16);
+    if (
+      host === "::" ||
+      host === "::1" ||
+      host.startsWith("::ffff:") ||
+      host.startsWith("64:ff9b:") ||
+      host.startsWith("2001:0000:") ||
+      host.startsWith("2001:db8:") ||
+      host.startsWith("2002:") ||
+      (first & 0xfe00) === 0xfc00 ||
+      (first & 0xffc0) === 0xfe80 ||
+      (first & 0xffc0) === 0xfec0 ||
+      (first & 0xff00) === 0xff00
+    ) return true;
+  }
+  return false;
+}
+
+async function isSafeResolvedUrl(value) {
+  if (!isSafePublicUrl(value)) return false;
+  const host = new URL(value).hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return true;
+  try {
+    const addresses = await lookup(host, { all: true, verbatim: true });
+    return addresses.length > 0 && addresses.every(({ address }) => !isPrivateAddress(address));
+  } catch {
+    return false;
+  }
+}
+
+function json(response, status, payload) {
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  response.end(JSON.stringify(payload));
+}
+
+async function readJson(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxBodyBytes) throw new Error("request body too large");
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+function parseCookieHeader(rawCookie, url) {
+  if (!rawCookie) return [];
+  const target = new URL(url);
+  return rawCookie.split(";").map((entry) => {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) return null;
+    return {
+      name: entry.slice(0, separator).trim(),
+      value: entry.slice(separator + 1).trim(),
+      domain: target.hostname,
+      path: "/",
+      secure: target.protocol === "https:",
+    };
+  }).filter(Boolean);
+}
+
+export async function runWebViewJob(payload, browser = undefined) {
+  if (!await isSafeResolvedUrl(payload.url)) throw new Error("unsafe or invalid target URL");
+  const method = String(payload.method || "GET").toUpperCase();
+  if (!['GET', 'POST'].includes(method)) throw new Error("unsupported HTTP method");
+  const delayMs = Math.min(15_000, Math.max(0, Number(payload.delayMs || 0)));
+  const suppliedHeaders = Object.fromEntries(
+    (Array.isArray(payload.headers) ? payload.headers : [])
+      .filter((entry) => Array.isArray(entry) && entry.length === 2)
+      .map(([name, value]) => [String(name), String(value)])
+      .filter(([name]) => !["host", "content-length", "connection", "proxy-authorization", "x-webview-key"].includes(name.toLowerCase()) && !name.toLowerCase().startsWith("x-forwarded-")),
+  );
+  const cookieKey = Object.keys(suppliedHeaders).find((name) => name.toLowerCase() === "cookie");
+  const cookieHeader = cookieKey ? suppliedHeaders[cookieKey] : "";
+  if (cookieKey) delete suppliedHeaders[cookieKey];
+
+  const connectedBrowser = browser || await getLocalBrowser();
+  let context;
+  try {
+    context = await connectedBrowser.newContext({
+      extraHTTPHeaders: suppliedHeaders,
+      javaScriptEnabled: true,
+      serviceWorkers: "block",
+    });
+    const cookies = parseCookieHeader(cookieHeader, payload.url);
+    if (cookies.length) await context.addCookies(cookies);
+    const page = await context.newPage();
+    await page.route("**/*", async (route) => {
+      const request = route.request();
+      if (["image", "media", "font"].includes(request.resourceType())) return route.abort();
+      if (!await isSafeResolvedUrl(request.url())) return route.abort("blockedbyclient");
+      return route.continue();
+    });
+    if (method === "POST") {
+      let firstDocument = true;
+      await page.route(payload.url, async (route) => {
+        if (!firstDocument) return route.continue();
+        firstDocument = false;
+        return route.continue({ method: "POST", postData: payload.body || "", headers: suppliedHeaders });
+      });
+    }
+    const response = await page.goto(payload.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    if (payload.webJs) {
+      const script = String(payload.webJs);
+      if (script.length > 64 * 1024) throw new Error("webJs is too large");
+      await Promise.race([
+        page.evaluate((source) => (0, eval)(source), script),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("webJs timed out")), 8_000)),
+      ]);
+    }
+    if (delayMs) await page.waitForTimeout(delayMs);
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+    const responseHeaders = response ? await response.allHeaders() : {};
+    const browserCookies = await context.cookies();
+    const headers = Object.entries(responseHeaders);
+    if (browserCookies.length) headers.push(["set-cookie", browserCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ")]);
+    const body = await page.content();
+    if (Buffer.byteLength(body) > maxResponseBytes) throw new Error("rendered page is too large");
+    if (!await isSafeResolvedUrl(page.url())) throw new Error("navigation ended at an unsafe URL");
+    return {
+      url: page.url(),
+      status: response?.status() || 200,
+      body,
+      contentType: responseHeaders["content-type"] || "text/html; charset=utf-8",
+      headers,
+      isSuccessful: response ? response.ok() : true,
+    };
+  } finally {
+    if (context) await context.close();
+  }
+}
+
+export const server = createServer(async (request, response) => {
+  if (request.url === "/health" && request.method === "GET") return json(response, 200, { ok: true, activeJobs });
+  if (request.url !== "/v1/fetch" || request.method !== "POST") return json(response, 404, { error: "not found" });
+  if (!bridgeKey || request.headers["x-webview-key"] !== bridgeKey) return json(response, 401, { error: "unauthorized" });
+  if (activeJobs >= maxConcurrent) return json(response, 429, { error: "webview capacity reached" });
+  activeJobs += 1;
+  try {
+    const result = await runWebViewJob(await readJson(request));
+    return json(response, 200, result);
+  } catch (error) {
+    return json(response, 400, { error: error instanceof Error ? error.message : "webview request failed" });
+  } finally {
+    activeJobs -= 1;
+    scheduleBrowserIdleClose();
+  }
+});
+
+server.headersTimeout = 10_000;
+server.requestTimeout = 35_000;
+server.keepAliveTimeout = 5_000;
+server.maxHeadersCount = 100;
+
+if (process.env.NODE_ENV !== "test") server.listen(port, "0.0.0.0");

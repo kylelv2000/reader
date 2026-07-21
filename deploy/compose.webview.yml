@@ -1,0 +1,32 @@
+services:
+  reader-core:
+    environment:
+      WEBVIEW_BRIDGE_URL: http://webview-bridge:19090
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?set WEBVIEW_BRIDGE_KEY in deploy/.env}
+      REQUEST_TIMEOUT_SECS: 45
+    depends_on:
+      webview-bridge:
+        condition: service_healthy
+
+  webview-bridge:
+    image: docker.io/komqaq/yomu-reader:webview-${YOMU_IMAGE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?set WEBVIEW_BRIDGE_KEY in deploy/.env}
+      WEBVIEW_MAX_CONCURRENT: ${WEBVIEW_MAX_CONCURRENT:-1}
+      WEBVIEW_IDLE_SECONDS: ${WEBVIEW_IDLE_SECONDS:-120}
+      WEBVIEW_MAX_RESPONSE_BYTES: ${WEBVIEW_MAX_RESPONSE_BYTES:-8388608}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:19090/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+    shm_size: 512mb
+    mem_limit: 896m
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

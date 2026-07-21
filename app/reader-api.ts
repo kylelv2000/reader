@@ -1,0 +1,702 @@
+import type {
+  Book,
+  BookGroup,
+  Bookmark,
+  BookSource,
+  Chapter,
+  ReplaceRule,
+  ReaderUser,
+  OfflineBookStatus,
+  RssArticle,
+  RssSource,
+  SourceTestSummary,
+  WebdavFile,
+} from "./types";
+import {
+  bookCacheKey,
+  chapterCacheKey,
+  deleteOfflineScope,
+  deleteOfflineBook,
+  getCachedBook,
+  getCachedChapter,
+  getOfflineBookStatus,
+  listCachedBooks,
+  putCachedBook,
+  putCachedChapter,
+} from "./offline-store";
+
+interface ApiEnvelope<T> {
+  isSuccess: boolean;
+  data: T;
+  errorMsg?: string;
+}
+
+export class ReaderApiError extends Error {
+  code?: unknown;
+
+  constructor(message: string, code?: unknown) {
+    super(message);
+    this.name = "ReaderApiError";
+    this.code = code;
+  }
+}
+
+function normalizeBaseUrl(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return "/reader3";
+  return trimmed.endsWith("/reader3") ? trimmed : `${trimmed}/reader3`;
+}
+
+function readCookie(name: string) {
+  if (typeof document === "undefined") return "";
+  const prefix = `${name}=`;
+  for (const part of document.cookie.split(";")) {
+    const value = part.trim();
+    if (value.startsWith(prefix)) {
+      try { return decodeURIComponent(value.slice(prefix.length)); } catch { return ""; }
+    }
+  }
+  return "";
+}
+
+export class ReaderApi {
+  readonly baseUrl: string;
+  private cacheNamespace = "anonymous";
+  private offlineMode = false;
+
+  constructor(baseUrl = "") {
+    this.baseUrl = normalizeBaseUrl(baseUrl);
+  }
+
+  setCacheNamespace(username: string) {
+    this.cacheNamespace = username.trim().toLowerCase() || "anonymous";
+  }
+
+  setOfflineMode(value: boolean) {
+    this.offlineMode = value;
+  }
+
+  private cacheScope() {
+    return `${this.baseUrl}\u0000${this.cacheNamespace}`;
+  }
+
+  private async request<T>(
+    path: string,
+    options: RequestInit & { query?: Record<string, string | number | undefined> } = {},
+  ): Promise<T> {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}${path}`, isAbsolute ? undefined : origin);
+    const query = { ...options.query };
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
+    });
+
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      ...options,
+      query: undefined,
+      credentials: "include",
+      headers: {
+        ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(!["GET", "HEAD", "OPTIONS"].includes(options.method || "GET")
+          ? { "X-Yomu-CSRF": readCookie("yomu_csrf") }
+          : {}),
+        ...options.headers,
+      },
+    } as RequestInit);
+
+    if (!response.ok) {
+      throw new ReaderApiError(`服务器返回 ${response.status}`, response.status === 401 ? "NEED_LOGIN" : response.status);
+    }
+    const envelope = (await response.json()) as ApiEnvelope<T>;
+    if (!envelope.isSuccess) {
+      throw new ReaderApiError(envelope.errorMsg || "Reader 服务请求失败", envelope.data);
+    }
+    return envelope.data;
+  }
+
+  getUserInfo() {
+    return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/session");
+  }
+
+  login(username: string, password: string) {
+    return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+  }
+
+  logout() {
+    return this.authRequest<null>("/auth/logout", { method: "POST", body: "{}" });
+  }
+
+  private async authRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const response = await fetch(path, {
+      ...options,
+      credentials: "include",
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(!["GET", "HEAD", "OPTIONS"].includes(options.method || "GET")
+          ? { "X-Yomu-CSRF": readCookie("yomu_csrf") }
+          : {}),
+        ...options.headers,
+      },
+    });
+    const envelope = (await response.json().catch(() => null)) as ApiEnvelope<T> | null;
+    if (!response.ok || !envelope?.isSuccess) {
+      throw new ReaderApiError(envelope?.errorMsg || `服务器返回 ${response.status}`, response.status === 401 ? "NEED_LOGIN" : response.status);
+    }
+    return envelope.data;
+  }
+
+  async getBookshelf(refresh = false) {
+    if (!refresh) return this.request<Book[]>("/getBookshelf");
+    const result = await this.request<{ books: Book[]; updated: number; failed: number }>("/refreshBookshelf", {
+      method: "POST",
+      body: JSON.stringify({ concurrentCount: 3 }),
+    });
+    return result.books;
+  }
+
+  getBookSources() {
+    return this.request<BookSource[]>("/getBookSources");
+  }
+
+  getBookGroups() {
+    return this.request<BookGroup[]>("/getBookGroups");
+  }
+
+  getBookmarks() {
+    return this.request<Bookmark[]>("/getBookmarks");
+  }
+
+  getRssSources() {
+    return this.request<RssSource[]>("/getRssSources");
+  }
+
+  getReplaceRules() {
+    return this.request<ReplaceRule[]>("/getReplaceRules");
+  }
+
+  async searchBooks(key: string, onBatch?: (books: Book[]) => void, signal?: AbortSignal) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/searchBookMultiSSE`, isAbsolute ? undefined : origin);
+    url.searchParams.set("key", key);
+    url.searchParams.set("lastIndex", "-1");
+    url.searchParams.set("searchSize", "80");
+    url.searchParams.set("concurrentCount", "6");
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      credentials: "include",
+      signal,
+    });
+    if (!response.ok || !response.body) throw new ReaderApiError(`搜索失败：${response.status}`);
+
+    const books = new Map<string, Book>();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const data = event.split("\n").find((line) => line.startsWith("data:"))?.slice(5).trim();
+        if (!data) continue;
+        const payload = JSON.parse(data) as { data?: Book[]; errorMsg?: string };
+        if (payload.errorMsg) throw new ReaderApiError(payload.errorMsg);
+        for (const book of payload.data || []) {
+          books.set(`${book.name.trim()}\u0000${book.author.trim()}`, book);
+        }
+        if (payload.data?.length) onBatch?.([...books.values()]);
+      }
+    }
+    return [...books.values()];
+  }
+
+  exploreBooks(category = "mixed", cursor = 0, page = 1) {
+    return this.request<{ books: Book[]; nextCursor: number; hasMore: boolean; failed: number }>(
+      "/exploreBookGlobal",
+      {
+        method: "POST",
+        body: JSON.stringify({ category, cursor, page, limit: 24, concurrentCount: 6, scanLimit: 24 }),
+      },
+    );
+  }
+
+  saveBook(book: Book) {
+    return this.request<unknown>("/saveBook", { method: "POST", body: JSON.stringify(book) });
+  }
+
+  saveBooks(books: Book[]) {
+    return this.request<unknown>("/saveBooks", { method: "POST", body: JSON.stringify(books) });
+  }
+
+  deleteBook(bookUrl: string) {
+    return this.request<unknown>("/deleteBook", {
+      method: "POST",
+      body: JSON.stringify({ bookUrl }),
+    });
+  }
+
+  async getChapterList(book: Book, refresh = false) {
+    const key = bookCacheKey(this.cacheScope(), book.bookUrl);
+    if (this.offlineMode) {
+      const cached = await getCachedBook(key);
+      if (cached?.chapters.length) return cached.chapters;
+      throw new ReaderApiError("这本书尚未下载到本机");
+    }
+    try {
+      const chapters = await this.request<Chapter[]>("/getChapterList", {
+        method: "POST",
+        body: JSON.stringify({
+          url: book.bookUrl,
+          bookSourceUrl: book.origin,
+          refresh: refresh ? 1 : 0,
+        }),
+      });
+      void putCachedBook(key, book, chapters);
+      return chapters;
+    } catch (error) {
+      const cached = await getCachedBook(key);
+      if (cached?.chapters.length) return cached.chapters;
+      throw error;
+    }
+  }
+
+  async getBookContent(bookUrl: string, index: number, refresh = false, signal?: AbortSignal) {
+    const cacheKey = chapterCacheKey(this.cacheScope(), bookUrl, index);
+    if (this.offlineMode) {
+      const cached = await getCachedChapter(cacheKey);
+      if (cached !== undefined) return cached;
+      throw new ReaderApiError("这一章尚未下载到本机");
+    }
+    try {
+      const content = await this.request<string>("/getBookContent", {
+        method: "POST",
+        body: JSON.stringify({ url: bookUrl, index, refresh: refresh ? 1 : 0 }),
+        signal,
+      });
+      void putCachedChapter(cacheKey, content);
+      return content;
+    } catch (error) {
+      const cached = await getCachedChapter(cacheKey);
+      if (cached !== undefined) return cached;
+      throw error;
+    }
+  }
+
+  getOfflineBookStatus(bookUrl: string): Promise<OfflineBookStatus> {
+    return getOfflineBookStatus(bookCacheKey(this.cacheScope(), bookUrl));
+  }
+
+  removeOfflineBook(bookUrl: string) {
+    return deleteOfflineBook(bookCacheKey(this.cacheScope(), bookUrl));
+  }
+
+  async getOfflineBooks() {
+    return (await listCachedBooks(this.cacheScope())).map((cached) => cached.book);
+  }
+
+  clearOfflineLibrary() {
+    return deleteOfflineScope(this.cacheScope());
+  }
+
+  async saveOfflineProgress(book: Book, chapters: Chapter[], index: number) {
+    const key = bookCacheKey(this.cacheScope(), book.bookUrl);
+    const cached = await getCachedBook(key);
+    if (!cached) return;
+    await putCachedBook(key, {
+      ...cached.book,
+      durChapterIndex: index,
+      durChapterTitle: chapters[index]?.title,
+      durChapterTime: Date.now(),
+    }, chapters);
+  }
+
+  async downloadBookForOffline(
+    book: Book,
+    onProgress?: (done: number, total: number) => void,
+    signal?: AbortSignal,
+  ) {
+    const chapters = await this.getChapterList(book);
+    if (!chapters.length) throw new ReaderApiError("没有可下载的章节");
+    await putCachedBook(bookCacheKey(this.cacheScope(), book.bookUrl), book, chapters);
+    let nextIndex = 0;
+    let completed = 0;
+    let failed = 0;
+    const worker = async () => {
+      while (nextIndex < chapters.length) {
+        if (signal?.aborted) throw new DOMException("下载已取消", "AbortError");
+        const index = nextIndex++;
+        try {
+          await this.getBookContent(book.bookUrl, index, false, signal);
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          failed += 1;
+        } finally {
+          completed += 1;
+          onProgress?.(completed, chapters.length);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, chapters.length) }, worker));
+    if (failed) throw new ReaderApiError(`${failed} 章下载失败，可稍后继续`);
+    return { completed, total: chapters.length };
+  }
+
+  saveProgress(bookUrl: string, index: number) {
+    return this.request<unknown>("/saveBookProgress", {
+      method: "POST",
+      body: JSON.stringify({ url: bookUrl, index }),
+    });
+  }
+
+  saveBookSources(sources: BookSource[]) {
+    return this.request<unknown>("/saveBookSources", {
+      method: "POST",
+      body: JSON.stringify(sources),
+    });
+  }
+
+  saveBookSource(source: BookSource) {
+    return this.request<unknown>("/saveBookSource", {
+      method: "POST",
+      body: JSON.stringify(source),
+    });
+  }
+
+  deleteBookSource(source: BookSource) {
+    return this.request<unknown>("/deleteBookSource", {
+      method: "POST",
+      body: JSON.stringify(source),
+    });
+  }
+
+  getBookSourceLoginUrl(source: BookSource) {
+    if (!source.loginUrl) throw new ReaderApiError("这个书源没有配置登录地址");
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/bookSourceProxy`, isAbsolute ? undefined : origin);
+    url.searchParams.set("bookSourceUrl", source.bookSourceUrl);
+    url.searchParams.set("url", source.loginUrl);
+    return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
+  }
+
+  getBookResourceUrl(book: Book, resourceUrl: string) {
+    if (!/^https?:\/\//i.test(resourceUrl) || !book.origin) return resourceUrl;
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/bookSourceProxy`, isAbsolute ? undefined : origin);
+    url.searchParams.set("bookSourceUrl", book.origin);
+    url.searchParams.set("url", resourceUrl);
+    return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
+  }
+
+  testBookSources(sources: BookSource[], keyword = "我的") {
+    return this.request<SourceTestSummary>("/testBookSources", {
+      method: "POST",
+      body: JSON.stringify({
+        bookSourceUrls: sources.map((source) => source.bookSourceUrl),
+        keyword,
+        markInvalid: true,
+        concurrent: 8,
+      }),
+    });
+  }
+
+  deleteInvalidBookSources() {
+    return this.request<{ deleted: number }>("/deleteInvalidBookSources", { method: "POST" });
+  }
+
+  saveBookGroup(group: BookGroup) {
+    return this.request<unknown>("/saveBookGroup", {
+      method: "POST",
+      body: JSON.stringify(group),
+    });
+  }
+
+  saveBookGroups(groups: BookGroup[]) {
+    return this.request<unknown>("/saveBookGroupOrder", {
+      method: "POST",
+      body: JSON.stringify(groups),
+    });
+  }
+
+  deleteBookGroup(groupId: number) {
+    return this.request<unknown>("/deleteBookGroup", {
+      method: "POST",
+      body: JSON.stringify({ groupId }),
+    });
+  }
+
+  saveBookGroupId(bookUrl: string, groupId: number) {
+    return this.request<unknown>("/saveBookGroupId", {
+      method: "POST",
+      body: JSON.stringify({ bookUrl, groupId }),
+    });
+  }
+
+  saveBookmark(bookmark: Bookmark) {
+    return this.request<unknown>("/saveBookmark", {
+      method: "POST",
+      body: JSON.stringify(bookmark),
+    });
+  }
+
+  saveBookmarks(bookmarks: Bookmark[]) {
+    return this.request<unknown>("/saveBookmarks", {
+      method: "POST",
+      body: JSON.stringify(bookmarks),
+    });
+  }
+
+  deleteBookmark(bookmark: Bookmark) {
+    return this.request<unknown>("/deleteBookmark", {
+      method: "POST",
+      body: JSON.stringify(bookmark),
+    });
+  }
+
+  getRssArticles(source: RssSource, page = 1) {
+    return this.request<{ first: RssArticle[]; second?: unknown }>("/getRssArticles", {
+      method: "POST",
+      body: JSON.stringify({
+        sourceUrl: source.sourceUrl,
+        sortName: source.sourceName,
+        sortUrl: source.sortUrl || source.sourceUrl,
+        page,
+      }),
+    });
+  }
+
+  getRssContent(sourceUrl: string, article: RssArticle) {
+    return this.request<string>("/getRssContent", {
+      method: "POST",
+      body: JSON.stringify({ sourceUrl, link: article.link, origin: article.origin }),
+    });
+  }
+
+  saveRssSource(source: RssSource) {
+    return this.request<unknown>("/saveRssSource", {
+      method: "POST",
+      body: JSON.stringify(source),
+    });
+  }
+
+  saveRssSources(sources: RssSource[]) {
+    return this.request<unknown>("/saveRssSources", {
+      method: "POST",
+      body: JSON.stringify(sources),
+    });
+  }
+
+  deleteRssSource(source: RssSource) {
+    return this.request<unknown>("/deleteRssSource", {
+      method: "POST",
+      body: JSON.stringify(source),
+    });
+  }
+
+  saveReplaceRule(rule: ReplaceRule) {
+    return this.request<unknown>("/saveReplaceRule", {
+      method: "POST",
+      body: JSON.stringify(rule),
+    });
+  }
+
+  saveReplaceRules(rules: ReplaceRule[]) {
+    return this.request<unknown>("/saveReplaceRules", {
+      method: "POST",
+      body: JSON.stringify(rules),
+    });
+  }
+
+  deleteReplaceRule(rule: ReplaceRule) {
+    return this.request<unknown>("/deleteReplaceRule", {
+      method: "POST",
+      body: JSON.stringify(rule),
+    });
+  }
+
+  async uploadLocalBook(file: File) {
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const route = {
+      txt: "/uploadTxtBook",
+      epub: "/uploadEpubBook",
+      mobi: "/uploadMobiBook",
+      pdf: "/uploadPdfBook",
+    }[extension || ""];
+    if (!route) throw new ReaderApiError("仅支持 TXT、EPUB、MOBI 和 PDF");
+    const body = new FormData();
+    body.append("file", file);
+    return this.request<Book>(route, { method: "POST", body });
+  }
+
+  async downloadLocalBook(bookUrl: string) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/exportLocalBook`, isAbsolute ? undefined : origin);
+    url.searchParams.set("url", bookUrl);
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, { credentials: "include" });
+    if (!response.ok) throw new ReaderApiError(`本地书导出失败：${response.status}`);
+    return response.blob();
+  }
+
+  async getAvailableBookSources(book: Book, refresh = false) {
+    const result = await this.request<Book[] | { books: Book[] }>("/getAvailableBookSource", {
+      method: "POST",
+      body: JSON.stringify({
+        url: book.bookUrl,
+        name: book.name,
+        author: book.author,
+        origin: book.origin,
+        refresh: refresh ? 1 : 0,
+        resultLimit: 40,
+        concurrentCount: 12,
+      }),
+    });
+    return Array.isArray(result) ? result : result.books || [];
+  }
+
+  setBookSource(bookUrl: string, candidate: Book) {
+    return this.request<Book>("/setBookSource", {
+      method: "POST",
+      body: JSON.stringify({
+        bookUrl,
+        newUrl: candidate.bookUrl,
+        bookSourceUrl: candidate.origin,
+      }),
+    });
+  }
+
+  deleteBookCache(bookUrl: string) {
+    return this.request<unknown>("/deleteBookCache", {
+      method: "POST",
+      body: JSON.stringify({ bookUrl }),
+    });
+  }
+
+  async cacheBook(bookUrl: string, onProgress?: (message: string) => void) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/cacheBookSSE`, isAbsolute ? undefined : origin);
+    url.searchParams.set("url", bookUrl);
+    url.searchParams.set("concurrentCount", "12");
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      credentials: "include",
+    });
+    if (!response.ok || !response.body) throw new ReaderApiError(`整本缓存失败：${response.status}`);
+    const decoder = new TextDecoder();
+    const reader = response.body.getReader();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const data = event.split("\n").find((line) => line.startsWith("data:"))?.slice(5).trim();
+        if (data) onProgress?.(data);
+      }
+    }
+  }
+
+  getWebdavFiles(path = "/") {
+    return this.request<WebdavFile[]>("/getWebdavFileList", { query: { path } });
+  }
+
+  uploadWebdavFile(file: File, path = "/") {
+    const body = new FormData();
+    body.append("path", path);
+    body.append("file", file);
+    return this.request<WebdavFile[]>("/uploadFileToWebdav", { method: "POST", body });
+  }
+
+  deleteWebdavFile(path: string) {
+    return this.request<unknown>("/deleteWebdavFile", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    });
+  }
+
+  async downloadWebdavFile(path: string) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/getWebdavFile`, isAbsolute ? undefined : origin);
+    url.searchParams.set("path", path);
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      credentials: "include",
+    });
+    if (!response.ok) throw new ReaderApiError(`文件下载失败：${response.status}`);
+    return response.blob();
+  }
+
+  getUsers() {
+    return this.request<ReaderUser[]>("/getUserList");
+  }
+
+  addUser(username: string, password: string) {
+    return this.request<ReaderUser[]>("/addUser", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+  }
+
+  updateUser(username: string, values: Partial<Pick<ReaderUser, "enableWebdav" | "enableLocalStore">>) {
+    return this.request<ReaderUser[]>("/updateUser", {
+      method: "POST",
+      body: JSON.stringify({ username, ...values }),
+    });
+  }
+
+  deleteUsers(usernames: string[]) {
+    return this.request<ReaderUser[]>("/deleteUsers", {
+      method: "POST",
+      body: JSON.stringify(usernames),
+    });
+  }
+
+  changePassword(oldPassword: string, newPassword: string) {
+    return this.request<unknown>("/changePassword", {
+      method: "POST",
+      body: JSON.stringify({ oldPassword, newPassword }),
+    });
+  }
+
+  resetPassword(username: string, password: string) {
+    return this.request<unknown>("/resetPassword", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+  }
+
+  async debugBookSource(source: BookSource, keyword: string, onMessage: (message: string) => void) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/bookSourceDebugSSE`, isAbsolute ? undefined : origin);
+    url.searchParams.set("bookSourceUrl", source.bookSourceUrl);
+    url.searchParams.set("keyword", keyword);
+    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+      credentials: "include",
+    });
+    if (!response.ok || !response.body) throw new ReaderApiError(`书源调试失败：${response.status}`);
+    const stream = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await stream.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const data = event.split("\n").find((line) => line.startsWith("data:"))?.slice(5).trim();
+        if (data) onMessage(data);
+      }
+    }
+  }
+}

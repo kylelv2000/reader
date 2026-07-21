@@ -1,0 +1,85 @@
+name: yomu-reader
+
+services:
+  yomu-app:
+    image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      READER_CORE_ORIGIN: http://reader-core:18080
+      YOMU_PUBLIC_ORIGIN: ${YOMU_PUBLIC_ORIGIN:?Set the external HTTPS origin in deploy/.env}
+      YOMU_SESSION_SECRET: ${YOMU_SESSION_SECRET:?Set a random session secret in deploy/.env}
+      YOMU_COOKIE_SECURE: ${YOMU_COOKIE_SECURE:-true}
+      YOMU_SESSION_TTL_SECONDS: ${YOMU_SESSION_TTL_SECONDS:-604800}
+      YOMU_MAX_BODY_BYTES: ${YOMU_MAX_BODY_BYTES:-2097152}
+      YOMU_MAX_UPLOAD_BYTES: ${YOMU_MAX_UPLOAD_BYTES:-104857600}
+    depends_on:
+      reader-core:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${YOMU_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  reader-core:
+    image: docker.io/komqaq/yomu-reader:core-${YOMU_IMAGE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 18080
+      DATABASE_URL: sqlite:/app/storage/reader.db?mode=rwc
+      SECURE: "${READER_SECURE:-true}"
+      SECURE_KEY: "${READER_SECURE_KEY:?Set READER_SECURE_KEY in deploy/.env}"
+      INVITE_CODE: "${READER_INVITE_CODE:?Set a private bootstrap invite code in deploy/.env}"
+      ALLOW_REGISTRATION: "false"
+      USER_LIMIT: "${READER_USER_LIMIT:-10}"
+      USER_BOOK_LIMIT: "${READER_USER_BOOK_LIMIT:-2000}"
+      REQUEST_TIMEOUT_SECS: "${READER_REQUEST_TIMEOUT_SECS:-20}"
+      MAX_OUTBOUND_CONCURRENT: "${READER_MAX_OUTBOUND_CONCURRENT:-16}"
+      LOG_LEVEL: "${READER_LOG_LEVEL:-info}"
+    expose:
+      - "18080"
+    volumes:
+      - ${READER_STORAGE:-reader-storage}:/app/storage
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+
+  admin-init:
+    profiles: ["setup"]
+    image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}
+    command: ["node", "services/security-gateway/bootstrap.mjs"]
+    environment:
+      READER_CORE_ORIGIN: http://reader-core:18080
+      READER_INVITE_CODE: ${READER_INVITE_CODE:-}
+      READER_SECURE_KEY: ${READER_SECURE_KEY:-}
+      YOMU_ADMIN_USERNAME: ${YOMU_ADMIN_USERNAME:-}
+      YOMU_ADMIN_PASSWORD: ${YOMU_ADMIN_PASSWORD:-}
+    depends_on:
+      reader-core:
+        condition: service_healthy
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  reader-storage:

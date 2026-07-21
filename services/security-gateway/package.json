@@ -1,0 +1,13 @@
+{
+  "name": "yomu-security-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "NODE_ENV=test node --test server.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
