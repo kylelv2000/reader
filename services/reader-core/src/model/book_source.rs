@@ -14,6 +14,9 @@ pub struct BookSource {
     pub book_url_pattern: Option<String>,
     pub custom_order: Option<i32>,
     pub enabled: Option<bool>,
+    pub auto_disabled_reason: Option<String>,
+    #[serde(deserialize_with = "deserialize_i64_option")]
+    pub auto_disabled_at: Option<i64>,
     pub enabled_explore: Option<bool>,
     pub enabled_cookie_jar: Option<bool>,
     pub js_lib: Option<String>,

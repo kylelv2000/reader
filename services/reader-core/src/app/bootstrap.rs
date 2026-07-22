@@ -62,6 +62,7 @@ pub async fn run() -> anyhow::Result<()> {
         json_document_service,
         update_service,
         reader_prefetches: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        chapter_fetches: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app: Router = api::router::build_router(state);

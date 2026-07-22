@@ -870,6 +870,12 @@ impl BookService {
         if book.group.is_none() {
             book.group = existing.group;
         }
+        if book.custom_cover_url.is_none() {
+            book.custom_cover_url = existing.custom_cover_url;
+        }
+        if book.cover_url.is_none() {
+            book.cover_url = existing.cover_url;
+        }
 
         list[old_index] = book.clone();
         let new_url = book.book_url.clone();
@@ -1100,6 +1106,122 @@ impl BookService {
         Ok(())
     }
 
+    pub async fn replace_book_cover(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        source_url: &str,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        let (bytes, content_type) = self.fetch_cover_source(user_ns, source_url).await?;
+        self.store_book_cover(
+            user_ns,
+            book_url,
+            &md5_hex(source_url),
+            &bytes,
+            &content_type,
+        )
+        .await?;
+        let discovery_failure = self
+            .book_cover_cache_dir(user_ns, book_url)
+            .join("cover-discovery-miss.json");
+        if discovery_failure.exists() {
+            let _ = fs::remove_file(discovery_failure).await;
+        }
+        Ok((bytes, content_type))
+    }
+
+    pub async fn clear_book_cover_cache(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+    ) -> Result<(), AppError> {
+        for path in [
+            self.book_cover_data_path(user_ns, book_url),
+            self.book_cover_meta_path(user_ns, book_url),
+            self.book_cover_failure_path(user_ns, book_url),
+            self.book_cover_cache_dir(user_ns, book_url)
+                .join("cover-discovery-miss.json"),
+        ] {
+            if path.exists() {
+                fs::remove_file(path)
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn get_or_cache_book_cover_candidate(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        source_url: &str,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        let base = self.book_cover_candidate_base(user_ns, book_url, source_url);
+        let data_path = base.with_extension("bin");
+        let meta_path = base.with_extension("json");
+        let failure_path = base.with_extension("miss.json");
+        if data_path.is_file() && meta_path.is_file() {
+            let bytes = fs::read(data_path)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            let metadata = fs::read_to_string(meta_path)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            let metadata = serde_json::from_str::<BookCoverCacheMeta>(&metadata)
+                .map_err(|error| AppError::Internal(error.into()))?;
+            return Ok((bytes, metadata.content_type));
+        }
+        if failure_path.is_file() {
+            if let Ok(data) = fs::read_to_string(&failure_path).await {
+                if serde_json::from_str::<BookCoverFailure>(&data).is_ok_and(|failure| {
+                    failure.retry_after > chrono::Utc::now().timestamp()
+                }) {
+                    return Err(AppError::NotFound(
+                        "cover candidate retry is temporarily paused".to_string(),
+                    ));
+                }
+            }
+        }
+        match self.fetch_cover_source(user_ns, source_url).await {
+            Ok((bytes, content_type)) => {
+                if let Some(parent) = data_path.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|error| AppError::Internal(error.into()))?;
+                }
+                fs::write(&data_path, &bytes)
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+                let metadata = serde_json::to_vec(&BookCoverCacheMeta {
+                    content_type: content_type.clone(),
+                    source_hash: md5_hex(source_url),
+                })
+                .map_err(|error| AppError::Internal(error.into()))?;
+                fs::write(meta_path, metadata)
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+                if failure_path.exists() {
+                    let _ = fs::remove_file(failure_path).await;
+                }
+                Ok((bytes, content_type))
+            }
+            Err(error) => {
+                if let Some(parent) = failure_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                let failure = BookCoverFailure {
+                    source_hash: md5_hex(source_url),
+                    retry_after: chrono::Utc::now().timestamp() + COVER_FAILURE_RETRY_SECONDS,
+                };
+                if let Ok(data) = serde_json::to_vec(&failure) {
+                    let _ = fs::write(failure_path, data).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn fetch_cover_source(
         &self,
         user_ns: &str,
@@ -1204,6 +1326,17 @@ impl BookService {
     fn book_cover_failure_path(&self, user_ns: &str, book_url: &str) -> PathBuf {
         self.book_cover_cache_dir(user_ns, book_url)
             .join("cover-miss.json")
+    }
+
+    fn book_cover_candidate_base(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        source_url: &str,
+    ) -> PathBuf {
+        self.book_cover_cache_dir(user_ns, book_url)
+            .join("cover-candidates")
+            .join(md5_hex(source_url))
     }
 
     pub async fn cover_discovery_retry_blocked(&self, user_ns: &str, book_url: &str) -> bool {
@@ -2809,7 +2942,8 @@ mod tests {
     async fn replace_book_source_keeps_shelf_position_and_progress() {
         let (service, storage_dir) = test_book_service("replace-source-position");
         let user_ns = "replace-source-user";
-        let first = test_book(2, 500, 1000);
+        let mut first = test_book(2, 500, 1000);
+        first.custom_cover_url = Some("https://covers.example/fixed.jpg".to_string());
         let old_url = first.book_url.clone();
         let mut second = test_book(0, 0, 1000);
         second.name = "第二本".to_string();
@@ -2838,6 +2972,10 @@ mod tests {
         assert_eq!(shelf[1].book_url, second.book_url);
         assert_eq!(saved.dur_chapter_index, Some(2));
         assert_eq!(saved.dur_chapter_title.as_deref(), Some("第3章"));
+        assert_eq!(
+            saved.custom_cover_url.as_deref(),
+            Some("https://covers.example/fixed.jpg")
+        );
     }
 
     #[tokio::test]

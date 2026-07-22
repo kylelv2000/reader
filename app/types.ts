@@ -39,6 +39,8 @@ export interface BookSource {
   bookSourceGroup?: string;
   bookSourceType?: number;
   enabled?: boolean;
+  autoDisabledReason?: string;
+  autoDisabledAt?: number;
   enabledExplore?: boolean;
   exploreUrl?: string;
   respondTime?: number;

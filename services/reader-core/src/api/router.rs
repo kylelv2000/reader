@@ -184,6 +184,11 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::book_source_debug_sse),
         )
         .route("/reader3/cover", get(handlers::get_book_cover))
+        .route(
+            "/reader3/coverCandidate",
+            get(handlers::get_book_cover_candidate),
+        )
+        .route("/reader3/setBookCover", post(handlers::set_book_cover))
         .route("/reader3/getRssSources", get(handlers::get_rss_sources))
         .route("/reader3/saveRssSource", post(handlers::save_rss_source))
         .route("/reader3/saveRssSources", post(handlers::save_rss_sources))

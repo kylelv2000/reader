@@ -237,6 +237,22 @@ export class ReaderApi {
     return this.request<unknown>("/saveBook", { method: "POST", body: JSON.stringify(book) });
   }
 
+  setBookCover(bookUrl: string, coverUrl?: string) {
+    return this.request<Book>("/setBookCover", {
+      method: "POST",
+      body: JSON.stringify({ bookUrl, coverUrl: coverUrl?.trim() || null }),
+    });
+  }
+
+  getBookCoverCandidateUrl(bookUrl: string, coverUrl: string) {
+    const isAbsolute = this.baseUrl.startsWith("http");
+    const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+    const url = new URL(`${this.baseUrl}/coverCandidate`, isAbsolute ? undefined : origin);
+    url.searchParams.set("bookUrl", bookUrl);
+    url.searchParams.set("coverUrl", coverUrl);
+    return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
+  }
+
   saveBooks(books: Book[]) {
     return this.request<unknown>("/saveBooks", { method: "POST", body: JSON.stringify(books) });
   }
@@ -250,6 +266,13 @@ export class ReaderApi {
 
   async getChapterList(book: Book, refresh = false) {
     const key = bookCacheKey(this.cacheScope(), book.bookUrl);
+    if (!refresh) {
+      const cached = await getCachedBook(key);
+      const expectedCount = Math.max(0, book.totalChapterNum || 0);
+      if (cached?.chapters.length && (!expectedCount || cached.chapters.length >= expectedCount)) {
+        return cached.chapters;
+      }
+    }
     if (this.offlineMode) {
       const cached = await getCachedBook(key);
       if (cached?.chapters.length) return cached.chapters;
@@ -281,6 +304,11 @@ export class ReaderApi {
         this.chapterMemoryCache.delete(cacheKey);
         this.chapterMemoryCache.set(cacheKey, memoryCached);
         return memoryCached;
+      }
+      const persistedCached = await getCachedChapter(cacheKey);
+      if (persistedCached !== undefined) {
+        this.rememberChapter(cacheKey, persistedCached);
+        return persistedCached;
       }
     }
     if (this.offlineMode) {

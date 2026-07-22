@@ -129,11 +129,12 @@ function coverStyle(book: Book, resolveMissing = false): CSSProperties {
   const sum = Array.from(book.name).reduce((value, char) => value + char.charCodeAt(0), 0);
   const palette = coverPalettes[sum % coverPalettes.length];
   const coverUrl = book.customCoverUrl || book.coverUrl;
+  const revision = encodeURIComponent(coverUrl || "auto");
   return {
     backgroundColor: palette[0],
     color: palette[1],
     ...(coverUrl || resolveMissing ? {
-      backgroundImage: `linear-gradient(180deg, rgba(20, 22, 19, 0.03), rgba(20, 22, 19, 0.28)), url("/reader3/cover?bookUrl=${encodeURIComponent(book.bookUrl)}")`,
+      backgroundImage: `linear-gradient(180deg, rgba(20, 22, 19, 0.03), rgba(20, 22, 19, 0.28)), url("/reader3/cover?bookUrl=${encodeURIComponent(book.bookUrl)}&v=${revision}")`,
       backgroundPosition: "center",
       backgroundSize: "cover",
     } : {}),
@@ -351,7 +352,7 @@ export function ReaderShell() {
   const [chapterQuery, setChapterQuery] = useState("");
   const [preferences, setPreferences] = useState<ReaderPreferences>(defaultPreferences);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
-  const [sourceFilter, setSourceFilter] = useState<"all" | "enabled" | "compatibility" | "invalid">("all");
+  const [sourceFilter, setSourceFilter] = useState<"all" | "enabled" | "compatibility" | "incompatible" | "invalid">("all");
   const [sourceQuery, setSourceQuery] = useState("");
   const [sourceSort, setSourceSort] = useState<"order" | "name" | "latency">("order");
   const [sourceDebugLog, setSourceDebugLog] = useState<string[]>([]);
@@ -380,6 +381,12 @@ export function ReaderShell() {
   const [offlineStatus, setOfflineStatus] = useState<Record<string, OfflineBookStatus>>({});
   const [offlineDownload, setOfflineDownload] = useState<{ bookUrl: string; done: number; total: number } | null>(null);
   const [offlinePickerBook, setOfflinePickerBook] = useState<Book | null>(null);
+  const [coverPickerBook, setCoverPickerBook] = useState<Book | null>(null);
+  const [coverCandidates, setCoverCandidates] = useState<Book[]>([]);
+  const [coverDraft, setCoverDraft] = useState("");
+  const [coverScanning, setCoverScanning] = useState(false);
+  const [coverSaving, setCoverSaving] = useState(false);
+  const [coverPickerError, setCoverPickerError] = useState("");
   const [shelfVisibleCount, setShelfVisibleCount] = useState(48);
   const sourceFileRef = useRef<HTMLInputElement>(null);
   const localBookRef = useRef<HTMLInputElement>(null);
@@ -399,6 +406,8 @@ export function ReaderShell() {
   const offlineDownloadRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const sourceSwitchAbortRef = useRef<AbortController | null>(null);
+  const coverScanAbortRef = useRef<AbortController | null>(null);
+  const coverSavingRef = useRef(false);
   const clientPrefetchAbortRef = useRef<AbortController | null>(null);
   const clientPrefetchTimerRef = useRef<number | null>(null);
   const clientPrefetchedWindowsRef = useRef(new Set<string>());
@@ -413,6 +422,7 @@ export function ReaderShell() {
     let result = sources;
     if (sourceFilter === "enabled") result = result.filter((source) => source.enabled !== false);
     if (sourceFilter === "compatibility") result = result.filter((source) => source.loginUrl || source.enabledCookieJar);
+    if (sourceFilter === "incompatible") result = result.filter((source) => Boolean(source.autoDisabledReason));
     if (sourceFilter === "invalid") result = result.filter((source) => (source.bookSourceGroup || "").split(/[,，]/).includes("失效"));
     const query = sourceQuery.trim().toLowerCase();
     if (query) result = result.filter((source) => `${source.bookSourceName}${source.bookSourceUrl}${source.bookSourceGroup || ""}`.toLowerCase().includes(query));
@@ -424,7 +434,6 @@ export function ReaderShell() {
   }, [sourceFilter, sourceQuery, sourceSort, sources]);
 
   const currentChapter = reader?.chapters[reader.chapterIndex];
-  const readerOfflineStatus = reader ? offlineStatus[reader.book.bookUrl] : undefined;
   const sortedBooks = useMemo(
     () => [...books].sort((left, right) => readTimeMs(right.durChapterTime) - readTimeMs(left.durChapterTime)),
     [books],
@@ -582,7 +591,7 @@ export function ReaderShell() {
       openLayer.removeEventListener("keydown", trapFocus);
       previousFocus?.focus();
     };
-  }, [showCatalog, showChapterSearch, showCommand, showConnect, showReaderSettings, showSourceEditor, showSourceSwitch]);
+  }, [coverPickerBook, showCatalog, showChapterSearch, showCommand, showConnect, showReaderSettings, showSourceEditor, showSourceSwitch]);
 
   useEffect(() => {
     localStorage.setItem("yomu-reader-preferences", JSON.stringify(preferences));
@@ -606,6 +615,7 @@ export function ReaderShell() {
     if (pageSnapTimerRef.current !== null) window.clearTimeout(pageSnapTimerRef.current);
     if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
     clientPrefetchAbortRef.current?.abort();
+    coverScanAbortRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -1201,7 +1211,12 @@ export function ReaderShell() {
 
   async function toggleSource(source: BookSource) {
     if (connection !== "connected") return toast("离线时无法修改书源");
-    const updated = { ...source, enabled: source.enabled === false };
+    const enabling = source.enabled === false;
+    const updated = {
+      ...source,
+      enabled: enabling,
+      ...(enabling ? { autoDisabledReason: undefined, autoDisabledAt: undefined } : {}),
+    };
     try {
       if (api && connection === "connected") await api.saveBookSource(updated);
       setSources((current) => current.map((item) => item.bookSourceUrl === source.bookSourceUrl ? updated : item));
@@ -1491,6 +1506,7 @@ export function ReaderShell() {
     }
     sourceSwitchAbortRef.current?.abort();
     const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 18_000);
     sourceSwitchAbortRef.current = controller;
     setSourceSwitching(true);
     setSourceApplying(false);
@@ -1502,14 +1518,9 @@ export function ReaderShell() {
         reader.book,
         refresh,
         (batch) => {
-          if (batch.length) sourceCandidatesForRef.current = reader.book.bookUrl;
-          const borrowedCover = batch.find((candidate) => !candidate.sourceValidating && candidate.coverUrl)?.coverUrl;
-          if (!reader.book.customCoverUrl && !reader.book.coverUrl && borrowedCover) {
-            const updatedBook = { ...reader.book, coverUrl: borrowedCover };
-            setReader((current) => current ? { ...current, book: updatedBook } : current);
-            setBooks((current) => current.map((book) => book.bookUrl === reader.book.bookUrl ? updatedBook : book));
-            void api.saveBook(updatedBook).catch(() => undefined);
-          }
+          sourceCandidatesForRef.current = batch.some((candidate) => !candidate.sourceValidating)
+            ? reader.book.bookUrl
+            : "";
           setSourceCandidates(() => {
             const merged = new Map<string, Book>();
             for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
@@ -1533,8 +1544,9 @@ export function ReaderShell() {
         toast(detail);
       }
     } finally {
+      window.clearTimeout(timeout);
       if (sourceSwitchAbortRef.current === controller) sourceSwitchAbortRef.current = null;
-      if (!controller.signal.aborted) setSourceSwitching(false);
+      setSourceSwitching(false);
     }
   }
 
@@ -1754,12 +1766,87 @@ export function ReaderShell() {
     }
   }
 
+  function openCoverPicker(book: Book) {
+    coverScanAbortRef.current?.abort();
+    setCoverPickerBook(book);
+    setCoverCandidates([]);
+    setCoverDraft(book.customCoverUrl || book.coverUrl || "");
+    setCoverPickerError("");
+    setCoverScanning(false);
+    setCoverSaving(false);
+  }
+
+  function closeCoverPicker() {
+    coverScanAbortRef.current?.abort();
+    coverScanAbortRef.current = null;
+    setCoverScanning(false);
+    setCoverPickerBook(null);
+  }
+
+  async function scanCoverCandidates(refresh = false) {
+    const book = coverPickerBook;
+    if (!book || connection !== "connected") return;
+    coverScanAbortRef.current?.abort();
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 18_000);
+    const scanned = new Map<string, Book>();
+    let failure = "";
+    coverScanAbortRef.current = controller;
+    setCoverScanning(true);
+    setCoverPickerError("");
+    try {
+      const result = await api.streamAvailableBookSources(book, refresh, (batch) => {
+        for (const candidate of batch) {
+          const coverUrl = candidate.coverUrl?.trim();
+          if (!candidate.sourceValidating && coverUrl) scanned.set(coverUrl, candidate);
+        }
+      }, controller.signal, -1);
+      for (const candidate of result.books) {
+        const coverUrl = candidate.coverUrl?.trim();
+        if (!candidate.sourceValidating && coverUrl) scanned.set(coverUrl, candidate);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        failure = error instanceof Error ? error.message : "封面候选扫描失败";
+        setCoverPickerError(failure);
+      }
+    } finally {
+      window.clearTimeout(timeout);
+      setCoverCandidates([...scanned.values()]);
+      if (!scanned.size && !failure) setCoverPickerError("匹配书源没有返回可用封面，可以粘贴图片地址手动设置。");
+      if (coverScanAbortRef.current === controller) coverScanAbortRef.current = null;
+      setCoverScanning(false);
+    }
+  }
+
+  async function applyBookCover(coverUrl?: string) {
+    const book = coverPickerBook;
+    if (!book || connection !== "connected" || coverSavingRef.current) return;
+    const nextCoverUrl = coverUrl?.trim();
+    coverSavingRef.current = true;
+    setCoverSaving(true);
+    setCoverPickerError("");
+    try {
+      const updated = await api.setBookCover(book.bookUrl, nextCoverUrl);
+      setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? updated : item));
+      setReader((current) => current?.book.bookUrl === book.bookUrl ? { ...current, book: updated } : current);
+      setCoverPickerBook(null);
+      toast(nextCoverUrl ? "封面已更换并缓存到服务器" : "已恢复自动匹配封面");
+    } catch (error) {
+      setCoverPickerError(error instanceof Error ? error.message : "封面更换失败");
+    } finally {
+      coverSavingRef.current = false;
+      setCoverSaving(false);
+    }
+  }
+
   async function removeBook(book: Book) {
     if (connection !== "connected") return toast("离线时无法删除书籍");
     if (!window.confirm(`确定从书架删除《${book.name}》吗？本地书文件也会一并移除。`)) return;
     try {
       if (api && connection === "connected") await api.deleteBook(book.bookUrl);
       setBooks((current) => current.filter((item) => item.bookUrl !== book.bookUrl));
+      if (coverPickerBook?.bookUrl === book.bookUrl) closeCoverPicker();
       toast("书籍已从书架删除");
     } catch (error) {
       toast(error instanceof Error ? error.message : "删除书籍失败");
@@ -2241,6 +2328,7 @@ export function ReaderShell() {
                   <button className={sourceFilter === "all" ? "active" : ""} onClick={() => setSourceFilter("all")}>全部</button>
                   <button className={sourceFilter === "enabled" ? "active" : ""} onClick={() => setSourceFilter("enabled")}>已启用</button>
                   <button className={sourceFilter === "compatibility" ? "active" : ""} onClick={() => setSourceFilter("compatibility")}>兼容模式</button>
+                  <button className={sourceFilter === "incompatible" ? "active" : ""} onClick={() => setSourceFilter("incompatible")}>不兼容</button>
                   <button className={sourceFilter === "invalid" ? "active" : ""} onClick={() => setSourceFilter("invalid")}>失效</button>
                 </div>
                 <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><button onClick={() => batchToggleSources(true)}>全部启用</button><button onClick={() => batchToggleSources(false)}>全部停用</button>{sourceFilter === "invalid" && <button className="danger-text" onClick={deleteInvalidSources}>删除失效</button>}<span>{filteredSources.length} 个结果</span></div>
@@ -2251,7 +2339,7 @@ export function ReaderShell() {
                     <button className={`source-toggle ${source.enabled === false ? "off" : ""}`} onClick={() => toggleSource(source)} aria-label={source.enabled === false ? `启用 ${source.bookSourceName}` : `停用 ${source.bookSourceName}`}><span /></button>
                     <div className="source-main">
                       <strong>{source.bookSourceName}</strong>
-                      <small>{source.bookSourceUrl}</small>
+                      <small className={source.autoDisabledReason ? "source-disabled-reason" : undefined} title={source.autoDisabledReason || source.bookSourceUrl}>{source.autoDisabledReason ? `自动停用：${source.autoDisabledReason}` : source.bookSourceUrl}</small>
                     </div>
                     <span className="source-group">{source.bookSourceGroup || "未分组"}</span>
                     <span className="runtime-badge">
@@ -2305,7 +2393,7 @@ export function ReaderShell() {
                         <span className="tiny-cover" style={coverStyle(book, true)}>{firstLetter(book.name)}</span>
                         <div><strong>{book.name}</strong><small>{book.author} · {book.local || book.origin?.startsWith("local") ? "本地文件" : book.originName || "网络书籍"}</small></div>
                         <select value={book.group || 0} onChange={(event) => moveBookToGroup(book, Number(event.target.value))} aria-label={`移动 ${book.name} 到分组`}><option value="0">未分组</option>{groups.map((group) => <option key={group.groupId} value={group.groupId}>{group.groupName}</option>)}</select>
-                        <div className="row-actions"><button className="text-button" onClick={() => openBook(book)}>阅读</button>{(book.local || book.bookUrl.startsWith("local-")) && <button className="text-button" onClick={() => exportLocalBook(book)}>导出</button>}<button className="text-button danger-text" onClick={() => removeBook(book)}>删除</button></div>
+                        <div className="row-actions"><button className="text-button" onClick={() => openBook(book)}>阅读</button><button className="text-button" onClick={() => openCoverPicker(book)}>换封面</button>{(book.local || book.bookUrl.startsWith("local-")) && <button className="text-button" onClick={() => exportLocalBook(book)}>导出</button>}<button className="text-button danger-text" onClick={() => removeBook(book)}>删除</button></div>
                       </article>
                     ))}
                   </div>
@@ -2440,6 +2528,33 @@ export function ReaderShell() {
         </div>
       )}
 
+      {coverPickerBook && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCoverPicker()}>
+          <section className="modal cover-picker" role="dialog" aria-modal="true" aria-labelledby="cover-picker-title">
+            <button className="modal-close" onClick={closeCoverPicker} aria-label="关闭">×</button>
+            <p className="eyebrow">服务器封面</p>
+            <h2 id="cover-picker-title">更换《{coverPickerBook.name}》封面</h2>
+            <div className="cover-picker-current">
+              <span className="cover-preview-image" role="img" aria-label="当前封面" style={{ backgroundImage: `url("/reader3/cover?bookUrl=${encodeURIComponent(coverPickerBook.bookUrl)}&v=${encodeURIComponent(coverPickerBook.customCoverUrl || coverPickerBook.coverUrl || "auto")}")` }} />
+              <div><strong>当前封面</strong><small>{coverPickerBook.customCoverUrl ? "手动设置" : coverPickerBook.coverUrl ? `来自 ${sourceNameFor(coverPickerBook)}` : "自动匹配中"}</small><button className="text-button" disabled={coverSaving} onClick={() => void applyBookCover()}>恢复自动匹配</button></div>
+            </div>
+            <form className="cover-url-form" onSubmit={(event) => { event.preventDefault(); void applyBookCover(coverDraft); }}>
+              <label>图片地址<input type="url" value={coverDraft} onChange={(event) => setCoverDraft(event.target.value)} placeholder="https://example.com/cover.jpg" required /></label>
+              <button className="primary-button" disabled={coverSaving}>{coverSaving ? "正在保存…" : "使用这个封面"}</button>
+            </form>
+            <div className="cover-picker-divider"><span>或者从精确匹配书源选择</span><button className="quiet-button" disabled={coverScanning || coverSaving} onClick={() => void scanCoverCandidates(Boolean(coverCandidates.length))}>{coverScanning ? "正在扫描…" : coverCandidates.length ? "重新扫描" : "扫描候选封面"}</button></div>
+            {coverPickerError && <p className="cover-picker-error" role="alert">{coverPickerError}</p>}
+            {coverCandidates.length > 0 && <div className="cover-candidate-grid">
+              {coverCandidates.map((candidate) => <button key={`${candidate.origin}-${candidate.bookUrl}-${candidate.coverUrl}`} disabled={coverSaving} onClick={() => void applyBookCover(candidate.coverUrl)}>
+                <i className="cover-candidate-image" role="img" aria-label={`${sourceNameFor(candidate)} 封面候选`} style={{ backgroundImage: `url("${api.getBookCoverCandidateUrl(coverPickerBook.bookUrl, candidate.coverUrl || "")}")` }} />
+                <span><strong>{sourceNameFor(candidate)}</strong><small>{latestChapterFor(candidate) || "目录可用"}</small></span>
+              </button>)}
+            </div>}
+            <p className="drawer-note">候选图与手动地址都由服务器下载、校验并保存；浏览器不会直接连接图片站点。</p>
+          </section>
+        </div>
+      )}
+
       {showConnect && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowConnect(false)}>
           <section className="modal connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title">
@@ -2508,7 +2623,7 @@ export function ReaderShell() {
           <header className="reader-bar">
             <button className="reader-back" onClick={exitReader} aria-label="返回书架">←</button>
             <div className="reader-title"><strong>{currentChapter?.title || reader.book.name}</strong><small><span>{reader.book.name}</span><i>·</i><em>{sourceNameFor(reader.book)}</em></small></div>
-            <div className="reader-actions reader-desktop-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => offlineDownload?.bookUrl === reader.book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(reader.book)}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `${offlineDownload.done}/${offlineDownload.total || "?"}` : readerOfflineStatus?.cachedChapters ? `缓存 ${readerOfflineStatus.cachedChapters}` : "缓存"}</button><button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
+            <div className="reader-actions reader-desktop-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => offlineDownload?.bookUrl === reader.book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(reader.book)}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存"}</button><button onClick={() => openCoverPicker(reader.book)}>封面</button><button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
             <div className="reader-mobile-actions">
               <button onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }} aria-label="目录"><AppIcon name="catalog" /></button>
               <button onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }} aria-label="阅读设置">Aa</button>
@@ -2518,7 +2633,8 @@ export function ReaderShell() {
               <button onClick={() => { setReaderMenuOpen(false); saveCurrentBookmark(); }}>书签</button>
               {readerSourceType === 0 && <button onClick={() => { setReaderMenuOpen(false); toggleSpeech(); }}>{speaking ? "停止朗读" : "朗读"}</button>}
               {readerSourceType !== 1 && <button onClick={() => { setReaderMenuOpen(false); setAutoReading((value) => !value); }}>{autoReading ? "停止自动阅读" : "自动阅读"}</button>}
-              <button onClick={() => { setReaderMenuOpen(false); if (offlineDownload?.bookUrl === reader.book.bookUrl) offlineDownloadRef.current?.abort(); else setOfflinePickerBook(reader.book); }}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `停止缓存 ${offlineDownload.done}/${offlineDownload.total || "?"}` : readerOfflineStatus?.cachedChapters ? `缓存章节 · 已有 ${readerOfflineStatus.cachedChapters}` : "缓存章节"}</button>
+              <button onClick={() => { setReaderMenuOpen(false); if (offlineDownload?.bookUrl === reader.book.bookUrl) offlineDownloadRef.current?.abort(); else setOfflinePickerBook(reader.book); }}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `停止缓存 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button>
+              <button onClick={() => { setReaderMenuOpen(false); openCoverPicker(reader.book); }}>更换封面</button>
               <button onClick={() => { setReaderMenuOpen(false); void loadAvailableSources(false); }}>切换书源</button>
               {readerSourceType === 0 && <button onClick={() => { setReaderMenuOpen(false); setShowChapterSearch(true); }}>查找正文</button>}
             </div>}
@@ -2569,7 +2685,7 @@ export function ReaderShell() {
             <aside className="reader-drawer source-switch-drawer">
               <header><div><p className="eyebrow">换源 · {sourceCandidates.filter((candidate) => !candidate.sourceValidating).length} 个可用来源</p><h2>{reader.book.name}</h2></div><div className="drawer-header-actions">{sourceSwitching ? <button className="stop-scan" onClick={stopSourceScan}>停止</button> : <button disabled={sourceApplying} onClick={() => void loadAvailableSources(true)}>重新扫描</button>}<button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
               <div className="current-source-card"><span>当前书源</span><strong>{sourceNameFor(reader.book)}</strong><small>共 {reader.chapters.length} 章{latestChapterFor(reader.book) ? ` · 最新：${latestChapterFor(reader.book)}` : ""}</small></div>
-              <p className="drawer-note">优先读取上次结果；重新扫描采用 4 路并发，书名和作者匹配后立即显示，只在后台确认目录可用。</p>
+              <p className="drawer-note">优先读取上次结果；重新扫描采用 4 路并发，最多运行 18 秒，书名和作者匹配后只确认目录可用。</p>
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
                   <button disabled={sourceApplying || candidate.sourceValidating} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "正在获取目录"}{latestChapterFor(candidate) ? ` · 最新：${latestChapterFor(candidate)}` : ""}</small></div><i>{sourceApplying ? "切换中" : candidate.sourceValidating ? "查目录" : "切换"}</i></button>
