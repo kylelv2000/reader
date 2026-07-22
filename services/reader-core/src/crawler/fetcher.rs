@@ -41,7 +41,7 @@ impl Default for RequestSpec {
             method: HttpMethod::GET,
             headers: Vec::new(),
             body: None,
-            retry: 2,
+            retry: 0,
             response_type: None,
             charset: None,
             proxy: None,

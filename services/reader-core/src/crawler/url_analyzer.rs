@@ -37,7 +37,11 @@ pub fn analyze_url(
         let mut url = absolute_url(&base_url, url_part.trim());
         let mut method = HttpMethod::GET;
         let mut body = None;
-        let mut retry = 2usize;
+        // Scans already move on to other sources and the reader exposes an
+        // explicit retry. Retrying every dead host two extra times made source
+        // search and cache misses look frozen. Sources can still opt in with
+        // an explicit `retry` URL option.
+        let mut retry = 0usize;
         let mut response_type = None;
         let mut charset = None;
         let mut server_id = None;

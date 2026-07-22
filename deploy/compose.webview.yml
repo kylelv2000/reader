@@ -3,7 +3,7 @@ services:
     environment:
       WEBVIEW_BRIDGE_URL: http://webview-bridge:19090
       WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?set WEBVIEW_BRIDGE_KEY in deploy/.env}
-      REQUEST_TIMEOUT_SECS: 45
+      REQUEST_TIMEOUT_SECS: ${READER_REQUEST_TIMEOUT_SECS:-8}
     depends_on:
       webview-bridge:
         condition: service_healthy

@@ -40,8 +40,8 @@ const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
 const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
 const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
 const AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS: u64 = 8;
-const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 8;
-const SOURCE_SWITCH_CONTENT_TIMEOUT_SECONDS: u64 = 12;
+const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 10;
+const SOURCE_SWITCH_CONTENT_TIMEOUT_SECONDS: u64 = 10;
 const READER_PREFETCH_CHAPTERS: usize = 10;
 const READER_PREFETCH_CONCURRENT: usize = 2;
 const DEFAULT_GLOBAL_EXPLORE_LIMIT: usize = 20;
@@ -1531,24 +1531,37 @@ async fn fetch_chapter_singleflight(
             let source_value = source.clone();
             let chapter_url_value = chapter_url.to_string();
             tokio::spawn(async move {
-                let result = state_value
-                    .book_service
-                    .get_content(
+                let fetch_timeout = state_value
+                    .config
+                    .request_timeout_secs
+                    .saturating_add(2)
+                    .max(5);
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(fetch_timeout),
+                    state_value.book_service.get_content(
                         &user_ns_value,
                         &book_url_value,
                         &source_value,
                         &chapter_url_value,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
+                    ),
+                )
+                .await
+                .map_err(|_| "章节获取超时".to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+                .and_then(|content| {
+                    if content.trim().is_empty() {
+                        Err("章节正文为空".to_string())
+                    } else {
+                        Ok(content)
+                    }
+                });
                 let _ = sender.send(result);
                 state_value.chapter_fetches.lock().await.remove(&task_key);
             });
             receiver
         }
     };
-    let wait_seconds = state.config.request_timeout_secs.saturating_add(5).max(5);
+    let wait_seconds = state.config.request_timeout_secs.saturating_add(5).max(8);
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(wait_seconds),
         receiver.recv(),
@@ -1564,12 +1577,7 @@ async fn fetch_chapter_singleflight(
             return Err(AppError::BadRequest("章节获取超时".to_string()));
         }
     };
-    result.map_err(AppError::NotFound)?;
-    state
-        .book_service
-        .get_cached_content(user_ns, book_url, chapter_url)
-        .await?
-        .ok_or_else(|| AppError::NotFound("章节正文为空".to_string()))
+    result.map_err(AppError::NotFound)
 }
 
 fn spawn_reader_prefetch(
@@ -3319,6 +3327,7 @@ pub async fn search_book_source_sse(
                         .await;
                     return;
                 }
+                prioritize_available_sources(&mut list);
                 list
             }
             _ => {
@@ -3469,13 +3478,14 @@ pub async fn get_available_book_source(
             }
         }
     }
-    let sources = state
+    let mut sources = state
         .book_source_service
         .list(&user_ns)
         .await?
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
+    prioritize_available_sources(&mut sources);
     if sources.is_empty() {
         if paged_request {
             return Ok(Json(ApiResponse::ok(
@@ -3697,13 +3707,14 @@ pub async fn get_available_book_source_sse(
         }
     }
 
-    let sources = state
+    let mut sources = state
         .book_source_service
         .list(&user_ns)
         .await?
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
+    prioritize_available_sources(&mut sources);
     let state_clone = state.clone();
     tokio::spawn(async move {
         if sources.is_empty() {
@@ -4488,6 +4499,40 @@ fn source_supports_available_search(source: &BookSource) -> bool {
             .is_some_and(|url| !url.trim().is_empty())
 }
 
+fn source_search_requires_webview(source: &BookSource) -> bool {
+    let Some(search_url) = source.search_url.as_deref() else {
+        return false;
+    };
+    let compact = search_url
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "\"webview\":true",
+        "'webview':true",
+        "webview:true",
+        "\"webview\":1",
+        "'webview':1",
+        "webview:1",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
+fn prioritize_available_sources(sources: &mut [BookSource]) {
+    // Stable sorting retains the user's existing order for equivalent entries.
+    // A recorded response time of zero/missing means "unknown", not "instant".
+    sources.sort_by_key(|source| {
+        let response_time = source.respond_time.filter(|value| *value > 0);
+        (
+            source_search_requires_webview(source),
+            response_time.is_none(),
+            response_time.unwrap_or(i64::MAX),
+        )
+    });
+}
+
 async fn record_source_incompatibility(
     state: &AppState,
     user_ns: &str,
@@ -4631,7 +4676,8 @@ mod tests {
         build_available_book_source_response, cache_count_for_shelf_display,
         complete_available_source_candidate,
         fallback_available_book, merge_global_explore_books, merge_search_results,
-        select_global_explore_kind, should_use_available_source_cache,
+        prioritize_available_sources, select_global_explore_kind,
+        should_use_available_source_cache,
         should_stop_available_source_scan,
         source_supports_available_search, take_available_source_cached_matches,
         take_available_source_sse_matches, take_search_book_multi_sse_batch,
@@ -4938,6 +4984,41 @@ mod tests {
         assert!(source_supports_available_search(&searchable));
         assert!(!source_supports_available_search(&disabled));
         assert!(!source_supports_available_search(&searchless));
+    }
+
+    #[test]
+    fn available_source_scan_prioritizes_fast_plain_http_sources() {
+        let source = |name: &str, respond_time: Option<i64>, search_url: &str| BookSource {
+            book_source_name: name.to_string(),
+            respond_time,
+            search_url: Some(search_url.to_string()),
+            ..BookSource::default()
+        };
+        let mut sources = vec![
+            source("unknown", None, "https://unknown.test/search?q={{key}}"),
+            source(
+                "webview",
+                Some(100),
+                "https://web.test/search?q={{key}},{\"webView\": true}",
+            ),
+            source("slow", Some(8_000), "https://slow.test/search?q={{key}}"),
+            source("fast", Some(600), "https://fast.test/search?q={{key}}"),
+            source(
+                "explicitly-not-webview",
+                Some(500),
+                "https://plain.test/search?q={{key}},{\"webView\": false}",
+            ),
+        ];
+
+        prioritize_available_sources(&mut sources);
+
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.book_source_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["explicitly-not-webview", "fast", "slow", "unknown", "webview"]
+        );
     }
 
     #[test]

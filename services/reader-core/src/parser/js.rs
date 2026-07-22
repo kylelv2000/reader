@@ -1,6 +1,6 @@
+use crate::crawler::http_client::ensure_public_url_blocking;
 use crate::util::hash::md5_hex;
 use crate::util::text::{apply_regex_replace, strip_whitespace};
-use crate::crawler::http_client::{ensure_public_url_blocking, VerifiedPublicDnsResolver};
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
@@ -16,7 +16,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Mutex;
-use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -30,7 +29,6 @@ static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .pool_max_idle_per_host(2)
         .pool_idle_timeout(Duration::from_secs(30))
         .redirect(Policy::none())
-        .dns_resolver(Arc::new(VerifiedPublicDnsResolver::default()))
         .gzip(true)
         .brotli(true)
         .deflate(true)

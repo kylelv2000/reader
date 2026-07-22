@@ -292,33 +292,47 @@ impl RuleEngine {
 
                 let content_rule = self.process_inline_js(&content_rule, &content_body, base_url);
 
-                let mode = self.detect_mode(&content_rule, &content_body);
+                // Legado content selectors commonly append an inline cleanup
+                // expression, for example `id.content@html##ad.*footer`. The
+                // selector must be evaluated first and the regex applied to
+                // the extracted content. Passing the entire string to the
+                // HTML extractor makes `html##...` look like an attribute and
+                // incorrectly returns an empty chapter.
+                let (pure_content_rule, inline_regex) = split_legado_regex(&content_rule);
+                let mode = self.detect_mode(&pure_content_rule, &content_body);
                 let mut content = match mode {
                     ParseMode::JsonPath => {
                         if let Ok(v) = serde_json::from_str::<Value>(&content_body) {
-                            jsonpath::jsonpath_first_string(
-                                &v,
-                                self.strip_mode_prefix(&content_rule),
-                            )
-                            .unwrap_or_default()
+                            // Chapter APIs commonly return one JSON object per
+                            // paragraph. Content rules such as `$..content`
+                            // mean all matches, not only the first paragraph.
+                            jsonpath::jsonpath_query(&v, self.strip_mode_prefix(&pure_content_rule))
+                                .iter()
+                                .filter_map(jsonpath::value_to_string)
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         } else {
                             String::new()
                         }
                     }
-                    ParseMode::XPath => {
-                        html::select_xpath(&content_body, self.strip_mode_prefix(&content_rule))
+                    ParseMode::XPath => html::select_xpath(
+                        &content_body,
+                        self.strip_mode_prefix(&pure_content_rule),
+                    )
                             .first()
                             .cloned()
-                            .unwrap_or_default()
-                    }
+                    .unwrap_or_default(),
                     _ => {
                         let doc = html::parse_document(&content_body);
                         let result =
-                            html::select_all_text(&doc, self.strip_mode_prefix(&content_rule));
+                            html::select_all_text(&doc, self.strip_mode_prefix(&pure_content_rule));
                         result.unwrap_or_default()
                     }
                 };
 
+                if let Some(regex) = inline_regex {
+                    content = apply_legado_regex(&content, regex);
+                }
                 if let Some(replace) = rule.replace_regex.as_deref() {
                     content = apply_legado_regex(&content, replace);
                 }
@@ -1466,6 +1480,9 @@ fn interpolate_json_templates(
     base_url: &str,
     ctx: &HashMap<String, String>,
 ) -> String {
+    if !rule.contains("{{") {
+        return rule.to_string();
+    }
     let re = regex::Regex::new(r"\{\{(.*?)\}\}").unwrap();
     re.replace_all(rule, |caps: &regex::Captures| {
         let expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
@@ -1510,6 +1527,9 @@ fn interpolate_common_templates(
     base_url: &str,
     ctx: &HashMap<String, String>,
 ) -> String {
+    if !rule.contains("{{") && !rule.contains("@get:{") {
+        return rule.to_string();
+    }
     let get_re = regex::Regex::new(r"@get:\{([^}]+)\}").unwrap();
     let with_get = get_re.replace_all(rule, |caps: &regex::Captures| {
         let key = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
@@ -1790,6 +1810,15 @@ fn eval_field_json_with_ctx(
     }
 
     let interpolated_rule = interpolate_json_templates(rule, v, base_url, ctx);
+    // Legado URL templates also use single-brace JSONPath placeholders, for
+    // example `chapter/{$.bookId}_{$.chapterId}.txt`. Without expanding these
+    // every catalog row produces the same literal URL and is then collapsed by
+    // duplicate removal into a one-chapter catalog.
+    let interpolated_rule = if interpolated_rule.contains("{$") {
+        jsonpath::jsonpath_first_string(v, &interpolated_rule).unwrap_or(interpolated_rule)
+    } else {
+        interpolated_rule
+    };
     let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
     let (pure, js) = extract_js(&pure_rule);
 
@@ -1979,6 +2008,9 @@ fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     let start_idx = if regex_part.starts_with("##") { 1 } else { 0 };
 
     let mut out = text.to_string();
+    if start_idx == 1 && parts.len() == 2 && !parts[1].is_empty() {
+        return apply_regex_replace(&out, parts[1], "");
+    }
     let mut i = start_idx;
     while i + 1 < parts.len() {
         let regex = parts[i];
@@ -2323,7 +2355,7 @@ fn is_truthy(value: String) -> bool {
 mod tests {
     use super::*;
     use crate::model::book_source::BookSource;
-    use crate::model::rule::{BookInfoRule, SearchRule, TocRule};
+    use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
 
     #[test]
     fn test_detect_mode() {
@@ -2349,6 +2381,90 @@ mod tests {
         // Test first match only (###)
         let result = apply_legado_regex(text, "##\\d+##NUM###");
         assert_eq!(result, "Hello World NUM 456");
+
+        // A regex without an explicit replacement removes its matches.
+        let result = apply_legado_regex(text, "##\\d+");
+        assert_eq!(result, "Hello World  ");
+    }
+
+    #[test]
+    fn content_html_rule_applies_inline_regex_after_extracting_node() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("id.content@html##笔趣阁 最新永久.*相互转告，谢谢！".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"
+            <html><body><div id="content">
+                笔趣阁 最新永久地址，请相互转告，谢谢！
+                <p>第一段正文。</p><p>第二段正文。</p>
+            </div></body></html>
+        "#;
+
+        let content = engine.content(&source, body, "https://books.example/chapter/1");
+
+        assert!(!content.is_empty());
+        assert!(content.contains("第一段正文"));
+        assert!(content.contains("第二段正文"));
+        assert!(!content.contains("笔趣阁 最新永久"));
+    }
+
+    #[test]
+    fn chapter_list_expands_single_brace_jsonpath_url_templates() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some("$.[*]".to_string()),
+                chapter_name: Some("$.title".to_string()),
+                chapter_url: Some(
+                    "https://book.test/chapter/{$.bookId}_{$.chapterId}.txt?md5={$.md5}"
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"[
+            {"bookId":"book","chapterId":"1","title":"第一章","md5":"a"},
+            {"bookId":"book","chapterId":"2","title":"第二章","md5":"b"}
+        ]"#;
+
+        let (chapters, _) =
+            engine.chapter_list(&source, body, "https://book.test/catalog/book.txt");
+
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(
+            chapters[0].url,
+            "https://book.test/chapter/book_1.txt?md5=a"
+        );
+        assert_eq!(
+            chapters[1].url,
+            "https://book.test/chapter/book_2.txt?md5=b"
+        );
+    }
+
+    #[test]
+    fn content_jsonpath_joins_all_matching_paragraphs() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("$..content".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"[
+            {"content":"第一段正文。"},
+            {"content":"第二段正文。"},
+            {"content":"第三段正文。"}
+        ]"#;
+
+        let content = engine.content(&source, body, "https://book.test/chapter/1");
+
+        assert_eq!(content, "第一段正文。\n第二段正文。\n第三段正文。");
     }
 
     #[test]

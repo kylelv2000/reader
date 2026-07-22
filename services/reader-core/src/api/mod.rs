@@ -28,5 +28,5 @@ pub struct AppState {
     pub update_service: Arc<UpdateService>,
     pub reader_prefetches: Arc<Mutex<std::collections::HashSet<String>>>,
     pub chapter_fetches:
-        Arc<Mutex<std::collections::HashMap<String, broadcast::Sender<Result<(), String>>>>>,
+        Arc<Mutex<std::collections::HashMap<String, broadcast::Sender<Result<String, String>>>>>,
 }

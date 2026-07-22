@@ -1,4 +1,9 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::Value;
+
+static EMBEDDED_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\{\s*(\$[^}]+)\}").expect("valid embedded JSONPath regex"));
 
 pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
@@ -24,8 +29,20 @@ pub fn jsonpath_first_string(value: &Value, rule: &str) -> Option<String> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return Some(rendered);
     }
+    if let Some(field) = simple_object_field(rule) {
+        return value.get(field).and_then(value_to_string);
+    }
     let res = jsonpath_query(value, rule);
     res.first().and_then(|v| value_to_string(v))
+}
+
+fn simple_object_field(rule: &str) -> Option<&str> {
+    let field = rule.trim().strip_prefix("$.")?;
+    (!field.is_empty()
+        && field
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+    .then_some(field)
 }
 
 pub fn value_to_string(v: &Value) -> Option<String> {
@@ -49,9 +66,8 @@ fn render_embedded_paths(value: &Value, rule: &str) -> Option<String> {
     if !rule.contains("{$") {
         return None;
     }
-    let re = regex::Regex::new(r"\{\s*(\$[^}]+)\}").unwrap();
     let mut replaced_any = false;
-    let rendered = re
+    let rendered = EMBEDDED_PATH_RE
         .replace_all(rule, |captures: &regex::Captures| {
             replaced_any = true;
             let path = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
@@ -62,5 +78,28 @@ fn render_embedded_paths(value: &Value, rule: &str) -> Option<String> {
         Some(rendered)
     } else {
         Some(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_simple_object_fields_without_general_jsonpath_parser() {
+        let value = serde_json::json!({"chapterId": "42", "content_md5": "abc"});
+
+        assert_eq!(
+            jsonpath_first_string(&value, "$.chapterId").as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            jsonpath_first_string(
+                &value,
+                "https://book.test/{$.chapterId}?md5={$.content_md5}"
+            )
+            .as_deref(),
+            Some("https://book.test/42?md5=abc")
+        );
     }
 }

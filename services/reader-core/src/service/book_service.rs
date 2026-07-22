@@ -632,10 +632,10 @@ impl BookService {
 
         tracing::debug!("get_content final content len={}", all_content.len());
         if !all_content.is_empty() {
-            let _ = self
-                .cache
+            self.cache
                 .put(user_ns, &book_key, chapter_url, &all_content)
-                .await;
+                .await
+                .map_err(AppError::Internal)?;
         }
         Ok(all_content)
     }

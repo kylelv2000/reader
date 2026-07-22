@@ -1,110 +1,7 @@
-use once_cell::sync::Lazy;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{redirect::Policy, Client, Proxy};
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::net::lookup_host;
+use std::net::IpAddr;
+use std::time::Duration;
 use url::Url;
-
-const PUBLIC_DNS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Clone)]
-struct PublicDnsCacheEntry {
-    addresses: Vec<IpAddr>,
-    expires_at: Instant,
-}
-
-#[derive(Deserialize)]
-struct DnsGoogleResponse {
-    #[serde(rename = "Status")]
-    status: i32,
-    #[serde(rename = "Answer", default)]
-    answers: Vec<DnsGoogleAnswer>,
-}
-
-#[derive(Deserialize)]
-struct DnsGoogleAnswer {
-    data: String,
-}
-
-static PUBLIC_DNS_CACHE: Lazy<Mutex<HashMap<String, PublicDnsCacheEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-static PUBLIC_DNS_CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        // Pin only the DNS verifier itself. This bypasses Clash fake-IP DNS,
-        // while the actual book request still follows the host's normal route.
-        .resolve("dns.google", "8.8.8.8:443".parse().expect("valid DNS endpoint"))
-        .timeout(Duration::from_secs(6))
-        .connect_timeout(Duration::from_secs(4))
-        .redirect(Policy::none())
-        .build()
-        .expect("public DNS verifier client")
-});
-
-static PUBLIC_DNS_BLOCKING_CLIENT: Lazy<reqwest::blocking::Client> = Lazy::new(|| {
-    reqwest::blocking::Client::builder()
-        .resolve("dns.google", "8.8.8.8:443".parse().expect("valid DNS endpoint"))
-        .timeout(Duration::from_secs(6))
-        .connect_timeout(Duration::from_secs(4))
-        .redirect(Policy::none())
-        .build()
-        .expect("blocking public DNS verifier client")
-});
-
-/// Resolve outbound source hosts to the exact public addresses that passed the
-/// SSRF check. This avoids validating a real address and then letting Clash's
-/// fake-IP DNS choose a different destination for the actual request.
-#[derive(Clone, Default)]
-pub(crate) struct VerifiedPublicDnsResolver {
-    internal_hosts: Arc<HashSet<String>>,
-}
-
-impl VerifiedPublicDnsResolver {
-    fn for_http_client() -> Self {
-        let mut internal_hosts = HashSet::new();
-        if let Ok(value) = std::env::var("WEBVIEW_BRIDGE_URL") {
-            if let Ok(url) = Url::parse(&value) {
-                if let Some(host) = url.host_str() {
-                    internal_hosts.insert(host.trim_end_matches('.').to_ascii_lowercase());
-                }
-            }
-        }
-        Self {
-            internal_hosts: Arc::new(internal_hosts),
-        }
-    }
-}
-
-impl Resolve for VerifiedPublicDnsResolver {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
-        let internal = self.internal_hosts.contains(&host);
-        Box::pin(async move {
-            let addresses = if internal {
-                lookup_host((host.as_str(), 0))
-                    .await
-                    .map(|items| items.map(|item| item.ip()).collect::<Vec<_>>())
-                    .map_err(|error| anyhow::anyhow!(error))?
-            } else if let Ok(address) = host.parse::<IpAddr>() {
-                if is_private_address(address) {
-                    return Err(anyhow::anyhow!("private network targets are blocked").into());
-                }
-                vec![address]
-            } else {
-                resolve_public_dns(&host).await?
-            };
-            let socket_addresses = addresses
-                .into_iter()
-                .map(|address| SocketAddr::new(address, 0))
-                .collect::<Vec<_>>();
-            Ok(Box::new(socket_addresses.into_iter()) as Addrs)
-        })
-    }
-}
 
 #[derive(Clone)]
 pub struct HttpClient {
@@ -120,10 +17,10 @@ impl HttpClient {
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30))
             // Redirects are followed in fetcher.rs only after every target has
-            // passed DNS/IP SSRF validation. A shared cookie jar would also
-            // leak cookies between users that happen to use the same domain.
+            // passed URL validation. Use the host resolver as-is so Clash TUN
+            // and split DNS keep their normal domain-based routing. A shared
+            // cookie jar would leak cookies between users on the same domain.
             .redirect(Policy::none())
-            .dns_resolver(Arc::new(VerifiedPublicDnsResolver::for_http_client()))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         if let Some(p) = proxy {
             builder = builder.proxy(Proxy::all(p)?);
@@ -171,113 +68,8 @@ pub fn is_private_address(address: IpAddr) -> bool {
     }
 }
 
-fn cached_public_dns(host: &str) -> Option<Vec<IpAddr>> {
-    let mut cache = PUBLIC_DNS_CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    cache.retain(|_, entry| entry.expires_at > Instant::now());
-    cache.get(host).map(|entry| entry.addresses.clone())
-}
-
-fn cache_public_dns(host: &str, addresses: &[IpAddr]) {
-    PUBLIC_DNS_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            host.to_string(),
-            PublicDnsCacheEntry {
-                addresses: addresses.to_vec(),
-                expires_at: Instant::now() + PUBLIC_DNS_CACHE_TTL,
-            },
-        );
-}
-
-fn validate_public_dns_addresses(host: &str, addresses: Vec<IpAddr>) -> anyhow::Result<Vec<IpAddr>> {
-    if addresses.is_empty() || addresses.iter().copied().any(is_private_address) {
-        return Err(anyhow::anyhow!(
-            "public DNS confirms that {host} resolves to a blocked network"
-        ));
-    }
-    cache_public_dns(host, &addresses);
-    Ok(addresses)
-}
-
-async fn query_public_dns(host: &str, record_type: &str) -> anyhow::Result<Vec<IpAddr>> {
-    let url = format!(
-        "https://dns.google/resolve?name={}&type={record_type}",
-        urlencoding::encode(host)
-    );
-    let response = PUBLIC_DNS_CLIENT
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<DnsGoogleResponse>()
-        .await?;
-    if response.status != 0 {
-        return Ok(Vec::new());
-    }
-    Ok(response
-        .answers
-        .into_iter()
-        .filter_map(|answer| answer.data.parse::<IpAddr>().ok())
-        .collect())
-}
-
-async fn resolve_public_dns(host: &str) -> anyhow::Result<Vec<IpAddr>> {
-    if let Some(addresses) = cached_public_dns(host) {
-        return Ok(addresses);
-    }
-    let (ipv4, ipv6) = tokio::join!(
-        query_public_dns(host, "A"),
-        query_public_dns(host, "AAAA")
-    );
-    let mut addresses = ipv4.unwrap_or_default();
-    addresses.extend(ipv6.unwrap_or_default());
-    validate_public_dns_addresses(host, addresses)
-}
-
-fn query_public_dns_blocking(host: &str, record_type: &str) -> anyhow::Result<Vec<IpAddr>> {
-    let url = format!(
-        "https://dns.google/resolve?name={}&type={record_type}",
-        urlencoding::encode(host)
-    );
-    let response = PUBLIC_DNS_BLOCKING_CLIENT
-        .get(url)
-        .send()?
-        .error_for_status()?
-        .json::<DnsGoogleResponse>()?;
-    if response.status != 0 {
-        return Ok(Vec::new());
-    }
-    Ok(response
-        .answers
-        .into_iter()
-        .filter_map(|answer| answer.data.parse::<IpAddr>().ok())
-        .collect())
-}
-
-fn resolve_public_dns_blocking(host: &str) -> anyhow::Result<Vec<IpAddr>> {
-    if let Some(addresses) = cached_public_dns(host) {
-        return Ok(addresses);
-    }
-    let mut addresses = query_public_dns_blocking(host, "A").unwrap_or_default();
-    addresses.extend(query_public_dns_blocking(host, "AAAA").unwrap_or_default());
-    validate_public_dns_addresses(host, addresses)
-}
-
 pub async fn ensure_public_url(value: &str) -> anyhow::Result<Url> {
-    let url = validate_public_url_shape(value)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("URL host is required"))?;
-    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-    if let Ok(address) = normalized.parse::<IpAddr>() {
-        if is_private_address(address) {
-            return Err(anyhow::anyhow!("private network targets are blocked"));
-        }
-        return Ok(url);
-    }
-    resolve_public_dns(&normalized).await?;
-    Ok(url)
+    validate_source_url(value)
 }
 
 #[cfg(test)]
@@ -310,33 +102,33 @@ mod tests {
     }
 
     #[test]
-    fn public_dns_confirmation_still_rejects_private_targets() {
-        assert!(validate_public_dns_addresses(
-            "private.example",
-            vec!["192.168.1.2".parse().unwrap()]
-        )
-        .is_err());
-        assert!(validate_public_dns_addresses(
-            "public.example",
-            vec!["203.0.114.8".parse().unwrap()]
-        )
-        .is_ok());
+    fn domain_names_are_left_to_the_system_resolver() {
+        assert!(ensure_public_url_blocking("https://books.example/chapter/1").is_ok());
+        assert!(ensure_public_url_blocking("https://localhost/chapter/1").is_err());
+        assert!(ensure_public_url_blocking("https://reader.local/chapter/1").is_err());
     }
 }
 
 pub fn ensure_public_url_blocking(value: &str) -> anyhow::Result<Url> {
+    validate_source_url(value)
+}
+
+fn validate_source_url(value: &str) -> anyhow::Result<Url> {
     let url = validate_public_url_shape(value)?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("URL host is required"))?;
-    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-    if let Ok(address) = normalized.parse::<IpAddr>() {
-        if is_private_address(address) {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => {
+            if is_private_address(IpAddr::V4(address)) {
             return Err(anyhow::anyhow!("private network targets are blocked"));
         }
-        return Ok(url);
     }
-    resolve_public_dns_blocking(&normalized)?;
+        Some(url::Host::Ipv6(address)) => {
+            if is_private_address(IpAddr::V6(address)) {
+                return Err(anyhow::anyhow!("private network targets are blocked"));
+            }
+        }
+        Some(url::Host::Domain(_)) => {}
+        None => return Err(anyhow::anyhow!("URL host is required")),
+    }
     Ok(url)
 }
 
