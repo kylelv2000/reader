@@ -40,6 +40,7 @@ const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
 const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
 const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
 const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 12;
+const SOURCE_SWITCH_CONTENT_TIMEOUT_SECONDS: u64 = 12;
 const READER_PREFETCH_CHAPTERS: usize = 10;
 const READER_PREFETCH_CONCURRENT: usize = 2;
 const DEFAULT_GLOBAL_EXPLORE_LIMIT: usize = 20;
@@ -2342,6 +2343,37 @@ pub async fn set_book_source(
     );
     updated.dur_chapter_index = Some(probe_index as i32);
     updated.dur_chapter_title = Some(chapters[probe_index].title.clone());
+
+    // Keep the background source scan cheap (metadata + catalog only), but do
+    // not replace a working shelf entry with a source whose body rule is
+    // already broken. This explicit user action is the right point to verify
+    // one aligned chapter. A successful probe is also persisted in the server
+    // content cache, so opening the switched book does not fetch it again.
+    let probe_chapter = &chapters[probe_index];
+    let probe_result = tokio::time::timeout(
+        std::time::Duration::from_secs(SOURCE_SWITCH_CONTENT_TIMEOUT_SECONDS),
+        state.book_service.get_content(
+            &user_ns,
+            &new_book_url,
+            &new_source,
+            &probe_chapter.url,
+        ),
+    )
+    .await;
+    match probe_result {
+        Ok(Ok(content)) if !content.trim().is_empty() => {}
+        Ok(Ok(_)) | Ok(Err(_)) => {
+            return Err(AppError::BadRequest(
+                "这个书源的当前章节暂时无法读取，请选择其他书源".to_string(),
+            ));
+        }
+        Err(_) => {
+            return Err(AppError::BadRequest(
+                "这个书源响应超时，请选择其他书源".to_string(),
+            ));
+        }
+    }
+
     let preserved_cover = if shelf_book.book_url != new_book_url {
         state
             .book_service
