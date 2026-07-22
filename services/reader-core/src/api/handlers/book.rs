@@ -2145,23 +2145,47 @@ pub async fn save_book(
         book.toc_url = Some(repair_encoded_url(toc_url));
     }
 
-    if book.toc_url.is_none() || book.name.trim().is_empty() {
-        if let Some(source) = state
-            .book_source_service
-            .get(&user_ns, &book.origin)
-            .await?
+    let source = state
+        .book_source_service
+        .get(&user_ns, &book.origin)
+        .await?;
+
+    if let Some(ref source) = source {
+        if let Ok(info) = state
+            .book_service
+            .get_book_info(&user_ns, source, &book.book_url)
+            .await
         {
-            if let Ok(info) = state
-                .book_service
-                .get_book_info(&user_ns, &source, &book.book_url)
-                .await
-            {
-                merge_book(&mut book, info);
-            }
+            merge_book(&mut book, info);
         }
     }
 
     let saved = state.book_service.save_book(&user_ns, book).await?;
+
+    // Pre-fetch chapter list and cover in background
+    if let Some(source) = source {
+        let state_bg = state.clone();
+        let user_ns_bg = user_ns.clone();
+        let book_url = saved.book_url.clone();
+        let toc_url = saved
+            .toc_url
+            .clone()
+            .unwrap_or_else(|| book_url.clone());
+        let cover_url = saved.cover_url.clone();
+        tokio::spawn(async move {
+            let _ = state_bg
+                .book_service
+                .get_chapter_list_with_cache(&user_ns_bg, &source, &toc_url, false)
+                .await;
+            if let Some(url) = cover_url {
+                let _ = state_bg
+                    .book_service
+                    .get_or_cache_book_cover(&user_ns_bg, &book_url, &url)
+                    .await;
+            }
+        });
+    }
+
     Ok(Json(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
     )))

@@ -893,11 +893,18 @@ export function ReaderShell() {
     try {
       if (!api || connection !== "connected") throw new Error("离线时无法添加书籍");
       const saved = await api.saveBook({ ...book, durChapterTime: Date.now() });
-      const enriched = { ...book, ...saved, durChapterTime: Date.now() };
+      let enriched = { ...book, ...saved, durChapterTime: Date.now() };
       setBooks((current) =>
         current.some((item) => item.bookUrl === enriched.bookUrl) ? current : [enriched, ...current],
       );
       toast("已加入书架");
+      // Pre-fetch chapter list and cover in background
+      api.getChapterList(enriched).then((chapters) => {
+        if (chapters.length) {
+          enriched = { ...enriched, totalChapterNum: chapters.length };
+          setBooks((current) => current.map((b) => b.bookUrl === enriched.bookUrl ? enriched : b));
+        }
+      }).catch(() => undefined);
     } catch (error) {
       toast(error instanceof Error ? error.message : "加入书架失败");
     }
