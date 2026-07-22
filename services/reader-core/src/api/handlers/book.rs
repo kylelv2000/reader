@@ -3503,32 +3503,34 @@ pub async fn get_available_book_source(
             let name = book.name.clone();
             let author = book.author.clone();
             let user_ns_value = user_ns.clone();
-            tasks.push(tokio::spawn(async move {
+            // Keep these futures owned by the HTTP request. If the caller
+            // closes the request (for example by pressing Stop), dropping the
+            // handler now cancels the outstanding source work instead of
+            // detaching it in the runtime.
+            tasks.push(async move {
                 let res = svc.search_book(&user_ns_value, &source, &name, 1).await;
                 (source_index as i32, source, res, name, author)
-            }));
+            });
         }
 
         let mut batch_results = Vec::new();
-        while let Some(res) = tasks.next().await {
-            if let Ok((source_index, source, search_result, name, author)) = res {
-                let matches = match search_result {
-                    Ok(list) => list
-                        .into_iter()
-                        .filter(|b| available_source_matches_target(b, &name, &author))
-                        .collect::<Vec<_>>(),
-                    Err(err) => {
-                        tracing::debug!(
-                            source_index,
-                            error_class = app_error_class(&err),
-                            "available-source search failed"
-                        );
-                        record_source_incompatibility(&state, &user_ns, &source, &err).await;
-                        Vec::new()
-                    }
-                };
-                batch_results.push((source_index, matches));
-            }
+        while let Some((source_index, source, search_result, name, author)) = tasks.next().await {
+            let matches = match search_result {
+                Ok(list) => list
+                    .into_iter()
+                    .filter(|b| available_source_matches_target(b, &name, &author))
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    tracing::debug!(
+                        source_index,
+                        error_class = app_error_class(&err),
+                        "available-source search failed"
+                    );
+                    record_source_incompatibility(&state, &user_ns, &source, &err).await;
+                    Vec::new()
+                }
+            };
+            batch_results.push((source_index, matches));
         }
 
         batch_results.sort_by_key(|(source_index, _)| *source_index);
