@@ -1,5 +1,4 @@
 import { createServer } from "node:http";
-import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { chromium } from "playwright-core";
 
@@ -88,18 +87,6 @@ function isPrivateAddress(host) {
   return false;
 }
 
-async function isSafeResolvedUrl(value) {
-  if (!isSafePublicUrl(value)) return false;
-  const host = new URL(value).hostname.replace(/^\[|\]$/g, "");
-  if (isIP(host)) return true;
-  try {
-    const addresses = await lookup(host, { all: true, verbatim: true });
-    return addresses.length > 0 && addresses.every(({ address }) => !isPrivateAddress(address));
-  } catch {
-    return false;
-  }
-}
-
 function json(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(payload));
@@ -133,7 +120,7 @@ function parseCookieHeader(rawCookie, url) {
 }
 
 export async function runWebViewJob(payload, browser = undefined) {
-  if (!await isSafeResolvedUrl(payload.url)) throw new Error("unsafe or invalid target URL");
+  if (!isSafePublicUrl(payload.url)) throw new Error("unsafe or invalid target URL");
   const method = String(payload.method || "GET").toUpperCase();
   if (!['GET', 'POST'].includes(method)) throw new Error("unsupported HTTP method");
   const delayMs = Math.min(15_000, Math.max(0, Number(payload.delayMs || 0)));
@@ -161,7 +148,7 @@ export async function runWebViewJob(payload, browser = undefined) {
     await page.route("**/*", async (route) => {
       const request = route.request();
       if (["image", "media", "font"].includes(request.resourceType())) return route.abort();
-      if (!await isSafeResolvedUrl(request.url())) return route.abort("blockedbyclient");
+      if (!isSafePublicUrl(request.url())) return route.abort("blockedbyclient");
       return route.continue();
     });
     if (method === "POST") {
@@ -189,7 +176,7 @@ export async function runWebViewJob(payload, browser = undefined) {
     if (browserCookies.length) headers.push(["set-cookie", browserCookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ")]);
     const body = await page.content();
     if (Buffer.byteLength(body) > maxResponseBytes) throw new Error("rendered page is too large");
-    if (!await isSafeResolvedUrl(page.url())) throw new Error("navigation ended at an unsafe URL");
+    if (!isSafePublicUrl(page.url())) throw new Error("navigation ended at an unsafe URL");
     return {
       url: page.url(),
       status: response?.status() || 200,
