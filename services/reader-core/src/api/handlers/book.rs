@@ -724,17 +724,10 @@ fn take_search_book_multi_sse_batch(
     query: &str,
     books: Vec<SearchBook>,
     seen: &mut std::collections::HashSet<String>,
-) -> Vec<SearchBook> {
-    let ranked_books = filter_strong_search_results(query, books);
-    let mut batch = Vec::new();
-
-    for book in ranked_books {
-        if seen.insert(book.merge_key()) {
-            batch.push(book);
-        }
-    }
-
-    batch
+) -> (Vec<SearchBook>, usize) {
+    let batch = filter_strong_search_results(query, books);
+    let new_unique = batch.iter().filter(|b| seen.insert(b.merge_key())).count();
+    (batch, new_unique)
 }
 
 pub async fn explore_book(
@@ -3242,14 +3235,11 @@ pub async fn search_book_multi_sse(
 
             if let Some(res) = tasks.next().await {
                 match res {
-                    Ok((cur_idx, _source, Ok(mut list))) => {
+                    Ok((cur_idx, _source, Ok(list))) => {
                         last_idx = cur_idx;
-                        let remaining = search_size.saturating_sub(total);
-                        list.truncate(remaining.saturating_mul(2).max(1));
-                        let mut batch = take_search_book_multi_sse_batch(&key, list, &mut result_map);
-                        batch.truncate(remaining);
+                        let (batch, new_unique) = take_search_book_multi_sse_batch(&key, list, &mut result_map);
                         if !batch.is_empty() {
-                            total += batch.len();
+                            total += new_unique;
                             let payload = serde_json::json!({"lastIndex": cur_idx, "data": batch});
                             if tx
                                 .send(Event::default().data(payload.to_string()))
@@ -4839,12 +4829,14 @@ mod tests {
         ];
         let mut seen = HashSet::new();
 
-        let batch = take_search_book_multi_sse_batch("没钱修什么仙", books.clone(), &mut seen);
-        let duplicate_batch = take_search_book_multi_sse_batch("没钱修什么仙", books, &mut seen);
+        let (batch, new_unique) = take_search_book_multi_sse_batch("没钱修什么仙", books.clone(), &mut seen);
+        let (dup_batch, dup_unique) = take_search_book_multi_sse_batch("没钱修什么仙", books, &mut seen);
         let names: Vec<String> = batch.into_iter().map(|book| book.name).collect();
 
         assert_eq!(names, vec!["没钱修什么仙", "我在异界没钱修什么仙"]);
-        assert!(duplicate_batch.is_empty());
+        assert_eq!(new_unique, 2);
+        assert_eq!(dup_batch.len(), 2);
+        assert_eq!(dup_unique, 0);
         assert_eq!(seen.len(), 2);
     }
 
@@ -4868,9 +4860,10 @@ mod tests {
         ];
         let mut seen = HashSet::new();
 
-        let batch = take_search_book_multi_sse_batch("不存在的冷门书名", books, &mut seen);
+        let (batch, new_unique) = take_search_book_multi_sse_batch("不存在的冷门书名", books, &mut seen);
 
         assert!(batch.is_empty());
+        assert_eq!(new_unique, 0);
         assert!(seen.is_empty());
     }
 
