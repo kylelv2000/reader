@@ -37,7 +37,7 @@ const MAX_AVAILABLE_RESULT_LIMIT: usize = 100;
 const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 4;
 const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
 const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
-const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
+const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 4;
 const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
 const AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS: u64 = 8;
 const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 10;
@@ -3670,34 +3670,19 @@ pub async fn get_available_book_source_sse(
                     &book.author,
                     AVAILABLE_SOURCE_SSE_RESULT_LIMIT,
                 );
-                // Older cores could write raw search rows into this file even
-                // though no catalog had been validated. Only trust candidates
-                // whose corresponding server-side catalog still exists.
-                let mut cached_with_catalog = Vec::new();
-                for candidate in cached {
-                    let toc_url = candidate
-                        .toc_url
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or(candidate.book_url.as_str());
-                    if state
-                        .book_service
-                        .load_chapter_list_cache(&user_ns, toc_url)
-                        .await?
-                        .is_some_and(|chapters| !chapters.is_empty())
-                    {
-                        cached_with_catalog.push(candidate);
-                    }
-                }
-                if cached_with_catalog.is_empty() {
-                    // An interrupted or fully failed scan must not make future
-                    // drawer opens look like a successful empty cache hit.
+                // Validated candidates always have total_chapter_num set.
+                // Only discard legacy unvalidated entries (missing chapter count).
+                let validated: Vec<_> = cached
+                    .into_iter()
+                    .filter(|c| c.total_chapter_num.is_some_and(|n| n > 0))
+                    .collect();
+                if validated.is_empty() {
                     let _ = state
                         .book_service
                         .delete_book_sources_cache(&user_ns, url)
                         .await;
                 } else {
-                    let cached = cached_with_catalog;
+                    let cached = validated;
                     let _ = state
                         .book_service
                         .save_book_sources_cache(&user_ns, url, &cached)
