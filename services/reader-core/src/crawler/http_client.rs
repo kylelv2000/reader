@@ -1,10 +1,10 @@
 use once_cell::sync::Lazy;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{redirect::Policy, Client, Proxy};
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::net::ToSocketAddrs;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use url::Url;
@@ -55,6 +55,57 @@ static PUBLIC_DNS_BLOCKING_CLIENT: Lazy<reqwest::blocking::Client> = Lazy::new(|
         .expect("blocking public DNS verifier client")
 });
 
+/// Resolve outbound source hosts to the exact public addresses that passed the
+/// SSRF check. This avoids validating a real address and then letting Clash's
+/// fake-IP DNS choose a different destination for the actual request.
+#[derive(Clone, Default)]
+pub(crate) struct VerifiedPublicDnsResolver {
+    internal_hosts: Arc<HashSet<String>>,
+}
+
+impl VerifiedPublicDnsResolver {
+    fn for_http_client() -> Self {
+        let mut internal_hosts = HashSet::new();
+        if let Ok(value) = std::env::var("WEBVIEW_BRIDGE_URL") {
+            if let Ok(url) = Url::parse(&value) {
+                if let Some(host) = url.host_str() {
+                    internal_hosts.insert(host.trim_end_matches('.').to_ascii_lowercase());
+                }
+            }
+        }
+        Self {
+            internal_hosts: Arc::new(internal_hosts),
+        }
+    }
+}
+
+impl Resolve for VerifiedPublicDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        let internal = self.internal_hosts.contains(&host);
+        Box::pin(async move {
+            let addresses = if internal {
+                lookup_host((host.as_str(), 0))
+                    .await
+                    .map(|items| items.map(|item| item.ip()).collect::<Vec<_>>())
+                    .map_err(|error| anyhow::anyhow!(error))?
+            } else if let Ok(address) = host.parse::<IpAddr>() {
+                if is_private_address(address) {
+                    return Err(anyhow::anyhow!("private network targets are blocked").into());
+                }
+                vec![address]
+            } else {
+                resolve_public_dns(&host).await?
+            };
+            let socket_addresses = addresses
+                .into_iter()
+                .map(|address| SocketAddr::new(address, 0))
+                .collect::<Vec<_>>();
+            Ok(Box::new(socket_addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpClient {
     client: Client,
@@ -72,6 +123,7 @@ impl HttpClient {
             // passed DNS/IP SSRF validation. A shared cookie jar would also
             // leak cookies between users that happen to use the same domain.
             .redirect(Policy::none())
+            .dns_resolver(Arc::new(VerifiedPublicDnsResolver::for_http_client()))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         if let Some(p) = proxy {
             builder = builder.proxy(Proxy::all(p)?);
@@ -117,22 +169,6 @@ pub fn is_private_address(address: IpAddr) -> bool {
                 || (first & 0xffc0) == 0xfec0
         }
     }
-}
-
-fn is_clash_fake_ip(address: IpAddr) -> bool {
-    matches!(address, IpAddr::V4(ip) if {
-        let [a, b, _, _] = ip.octets();
-        a == 198 && (b == 18 || b == 19)
-    })
-}
-
-fn requires_public_dns_verification(addresses: &[IpAddr]) -> bool {
-    let blocked = addresses
-        .iter()
-        .copied()
-        .filter(|address| is_private_address(*address))
-        .collect::<Vec<_>>();
-    !blocked.is_empty() && blocked.iter().copied().all(is_clash_fake_ip)
 }
 
 fn cached_public_dns(host: &str) -> Option<Vec<IpAddr>> {
@@ -240,18 +276,7 @@ pub async fn ensure_public_url(value: &str) -> anyhow::Result<Url> {
         }
         return Ok(url);
     }
-    let port = url.port_or_known_default().ok_or_else(|| anyhow::anyhow!("URL port is invalid"))?;
-    let addresses = lookup_host((normalized.as_str(), port)).await?;
-    let resolved = addresses.map(|entry| entry.ip()).collect::<Vec<_>>();
-    if resolved.is_empty() {
-        return Err(anyhow::anyhow!("URL resolves to a blocked network"));
-    }
-    if resolved.iter().copied().any(is_private_address) {
-        if !requires_public_dns_verification(&resolved) {
-            return Err(anyhow::anyhow!("URL resolves to a blocked network"));
-        }
-        resolve_public_dns(&normalized).await?;
-    }
+    resolve_public_dns(&normalized).await?;
     Ok(url)
 }
 
@@ -280,15 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn clash_fake_ip_requires_public_dns_confirmation() {
-        let fake: IpAddr = "198.18.7.9".parse().unwrap();
-        let public: IpAddr = "1.1.1.1".parse().unwrap();
-        let private: IpAddr = "10.0.0.1".parse().unwrap();
-
-        assert!(is_clash_fake_ip(fake));
-        assert!(requires_public_dns_verification(&[fake]));
-        assert!(requires_public_dns_verification(&[fake, public]));
-        assert!(!requires_public_dns_verification(&[fake, private]));
+    fn clash_fake_ip_literal_is_never_accepted_as_a_public_target() {
         assert!(ensure_public_url_blocking("http://198.18.7.9/").is_err());
     }
 
@@ -319,22 +336,7 @@ pub fn ensure_public_url_blocking(value: &str) -> anyhow::Result<Url> {
         }
         return Ok(url);
     }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| anyhow::anyhow!("URL port is invalid"))?;
-    let resolved = (normalized.as_str(), port)
-        .to_socket_addrs()?
-        .map(|entry| entry.ip())
-        .collect::<Vec<_>>();
-    if resolved.is_empty() {
-        return Err(anyhow::anyhow!("URL resolves to a blocked network"));
-    }
-    if resolved.iter().copied().any(is_private_address) {
-        if !requires_public_dns_verification(&resolved) {
-            return Err(anyhow::anyhow!("URL resolves to a blocked network"));
-        }
-        resolve_public_dns_blocking(&normalized)?;
-    }
+    resolve_public_dns_blocking(&normalized)?;
     Ok(url)
 }
 
