@@ -55,7 +55,6 @@ impl<T> ApiResponse<T> {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        println!("ERROR: {:?}", self);
         let (status, message) = match &self {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
@@ -69,6 +68,14 @@ impl IntoResponse for AppError {
                 "internal error".to_string(),
             ),
         };
+        match &self {
+            AppError::NotFound(_) | AppError::BadRequest(_) => {
+                tracing::debug!(status = status.as_u16(), "request rejected");
+            }
+            AppError::Db(_) => tracing::error!("database request failed"),
+            AppError::Http(_) => tracing::warn!("upstream HTTP request failed"),
+            AppError::Internal(_) => tracing::error!("internal request failed"),
+        }
         let body = Json(ApiResponse::<serde_json::Value>::err(message));
         (status, body).into_response()
     }

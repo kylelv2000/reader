@@ -38,6 +38,8 @@ const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 4;
 const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
 const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
 const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
+const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
+const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 12;
 const READER_PREFETCH_CHAPTERS: usize = 10;
 const READER_PREFETCH_CONCURRENT: usize = 2;
 const DEFAULT_GLOBAL_EXPLORE_LIMIT: usize = 20;
@@ -330,7 +332,11 @@ pub async fn search_book(
     {
         Ok(books) => books,
         Err(error) => {
-            tracing::error!("search_book failed: {:?}", error);
+            tracing::warn!(
+                source = %source.book_source_name,
+                error_class = app_error_class(&error),
+                "book source search failed"
+            );
             record_source_incompatibility(&state, &user_ns, &source, &error).await;
             return Err(error);
         }
@@ -1391,11 +1397,10 @@ pub async fn get_book_content(
             if idx >= chapters.len() {
                 // If index is out of range, it's possible our cache was partial (first page only).
                 // Try a forced refresh to get the full list synchronously.
-                tracing::info!(
-                    "Index {} out of range (len={}). Attempting forced refresh for {}",
-                    idx,
-                    chapters.len(),
-                    toc_url
+                tracing::debug!(
+                    chapter_index = idx,
+                    catalog_len = chapters.len(),
+                    "chapter index out of range; refreshing catalog"
                 );
                 chapters = state
                     .book_service
@@ -1858,7 +1863,11 @@ pub async fn refresh_bookshelf(
                     (index, book, true, false)
                 }
                 Err(error) => {
-                    tracing::warn!("bookshelf refresh failed for {}: {:?}", book.book_url, error);
+                    tracing::debug!(
+                        source = %source.book_source_name,
+                        error_class = app_error_class(&error),
+                        "bookshelf refresh failed"
+                    );
                     (index, book, false, true)
                 }
             }
@@ -3175,7 +3184,11 @@ pub async fn search_book_multi_sse(
                     }
                     Ok((cur_idx, source, Err(e))) => {
                         last_idx = cur_idx;
-                        tracing::error!("search_book error from {}: {:?}", source.book_source_name, e);
+                        tracing::warn!(
+                            source = %source.book_source_name,
+                            error_class = app_error_class(&e),
+                            "book source search failed"
+                        );
                         record_source_incompatibility(&state_clone, &user_ns, &source, &e).await;
                     }
                     Err(e) => {
@@ -3474,9 +3487,9 @@ pub async fn get_available_book_source(
                         .collect::<Vec<_>>(),
                     Err(err) => {
                         tracing::debug!(
-                            "getAvailableBookSource search failed at source index {}: {:?}",
                             source_index,
-                            err
+                            error_class = app_error_class(&err),
+                            "available-source search failed"
                         );
                         record_source_incompatibility(&state, &user_ns, &source, &err).await;
                         Vec::new()
@@ -3663,6 +3676,12 @@ pub async fn get_available_book_source_sse(
         let mut validation_queue: VecDeque<(i32, BookSource, SearchBook)> = VecDeque::new();
 
         'scan: loop {
+            if should_stop_available_source_scan(refresh, all_results.len()) {
+                search_tasks.abort_all();
+                validation_tasks.abort_all();
+                validation_queue.clear();
+                break;
+            }
             while search_tasks.len() < concurrent_count && next_index < sources.len() {
                 let source_index = next_index;
                 let source = sources[source_index].clone();
@@ -3688,13 +3707,20 @@ pub async fn get_available_book_source_sse(
                 let candidate_origin = candidate.origin.clone();
                 let candidate_url = candidate.book_url.clone();
                 validation_tasks.spawn(async move {
-                    let validated = validate_available_source_candidate(
-                        &state_value,
-                        &user_ns_value,
-                        &source,
-                        candidate,
+                    let validated = tokio::time::timeout(
+                        std::time::Duration::from_secs(
+                            AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS,
+                        ),
+                        validate_available_source_candidate(
+                            &state_value,
+                            &user_ns_value,
+                            &source,
+                            candidate,
+                        ),
                     )
-                    .await;
+                    .await
+                    .ok()
+                    .flatten();
                     (source_index, candidate_origin, candidate_url, validated)
                 });
             }
@@ -3747,9 +3773,9 @@ pub async fn get_available_book_source_sse(
                                 }
                                 Err(err) => {
                                     tracing::debug!(
-                                        "getAvailableBookSourceSSE search failed at source index {}: {:?}",
                                         source_index,
-                                        err
+                                        error_class = app_error_class(&err),
+                                        "available-source SSE search failed"
                                     );
                                     record_source_incompatibility(&state_clone, &user_ns, &source, &err).await;
                                 }
@@ -3847,7 +3873,31 @@ async fn validate_available_source_candidate(
     source: &BookSource,
     mut candidate: SearchBook,
 ) -> Option<SearchBook> {
-    let mut toc_url = candidate.book_url.clone();
+    let direct_toc_url = candidate
+        .toc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(candidate.book_url.as_str())
+        .to_string();
+    if let Ok(chapters) = state
+        .book_service
+        .get_chapter_list_with_cache(user_ns, source, &direct_toc_url, false)
+        .await
+    {
+        if !chapters.is_empty() {
+            return Some(complete_available_source_candidate(
+                candidate,
+                direct_toc_url,
+                &chapters,
+            ));
+        }
+    }
+
+    // Some legacy rules expose only a detail URL in their search result. In
+    // that case resolve tocUrl once, then validate only the catalog; no chapter
+    // body is fetched as part of source switching.
+    let mut toc_url = direct_toc_url.clone();
     if let Ok(info) = state
         .book_service
         .get_book_info(user_ns, source, &candidate.book_url)
@@ -3861,7 +3911,9 @@ async fn validate_available_source_candidate(
         candidate.kind = info.kind.or(candidate.kind);
         candidate.last_chapter = info.latest_chapter_title.or(candidate.last_chapter);
     }
-    candidate.toc_url = Some(toc_url.clone());
+    if toc_url == direct_toc_url {
+        return None;
+    }
     let chapters = state
         .book_service
         .get_chapter_list_with_cache(user_ns, source, &toc_url, false)
@@ -3870,11 +3922,36 @@ async fn validate_available_source_candidate(
     if chapters.is_empty() {
         return None;
     }
+    Some(complete_available_source_candidate(
+        candidate, toc_url, &chapters,
+    ))
+}
+
+fn complete_available_source_candidate(
+    mut candidate: SearchBook,
+    toc_url: String,
+    chapters: &[BookChapter],
+) -> SearchBook {
+    candidate.toc_url = Some(toc_url);
     candidate.total_chapter_num = Some(chapters.len() as i32);
     if let Some(last) = chapters.last() {
         candidate.last_chapter = Some(last.title.clone());
     }
-    Some(candidate)
+    candidate
+}
+
+fn should_stop_available_source_scan(refresh: bool, validated_count: usize) -> bool {
+    !refresh && validated_count >= AVAILABLE_SOURCE_AUTOMATIC_TARGET
+}
+
+fn app_error_class(error: &AppError) -> &'static str {
+    match error {
+        AppError::NotFound(_) => "not_found",
+        AppError::BadRequest(_) => "bad_request",
+        AppError::Internal(_) => "internal",
+        AppError::Db(_) => "database",
+        AppError::Http(_) => "http",
+    }
 }
 
 async fn cache_borrowed_shelf_cover(
@@ -4213,52 +4290,40 @@ async fn find_matching_books(
 async fn cleanup_local_txt_book_files(state: &AppState, user_ns: &str, books: &[Book]) {
     for book in books {
         if is_local_txt_origin(&book.origin) || is_local_txt_url(&book.book_url) {
-            if let Err(err) = state
+            if state
                 .local_txt_book_service
                 .delete_book_files(user_ns, &book.book_url)
                 .await
+                .is_err()
             {
-                tracing::warn!(
-                    "failed to delete local txt book files for {}: {:?}",
-                    book.book_url,
-                    err
-                );
+                tracing::warn!(book_format = "txt", "failed to delete local book files");
             }
         } else if is_local_epub_origin(&book.origin) || is_local_epub_url(&book.book_url) {
-            if let Err(err) = state
+            if state
                 .local_epub_book_service
                 .delete_book_files(user_ns, &book.book_url)
                 .await
+                .is_err()
             {
-                tracing::warn!(
-                    "failed to delete local epub book files for {}: {:?}",
-                    book.book_url,
-                    err
-                );
+                tracing::warn!(book_format = "epub", "failed to delete local book files");
             }
         } else if is_local_pdf_origin(&book.origin) || is_local_pdf_url(&book.book_url) {
-            if let Err(err) = state
+            if state
                 .local_pdf_book_service
                 .delete_book_files(user_ns, &book.book_url)
                 .await
+                .is_err()
             {
-                tracing::warn!(
-                    "failed to delete local pdf book files for {}: {:?}",
-                    book.book_url,
-                    err
-                );
+                tracing::warn!(book_format = "pdf", "failed to delete local book files");
             }
         } else if is_local_mobi_origin(&book.origin) || is_local_mobi_url(&book.book_url) {
-            if let Err(err) = state
+            if state
                 .local_mobi_book_service
                 .delete_book_files(user_ns, &book.book_url)
                 .await
+                .is_err()
             {
-                tracing::warn!(
-                    "failed to delete local mobi book files for {}: {:?}",
-                    book.book_url,
-                    err
-                );
+                tracing::warn!(book_format = "mobi", "failed to delete local book files");
             }
         }
     }
@@ -4378,9 +4443,8 @@ async fn record_source_incompatibility(
         .await
     {
         Ok(true) => tracing::warn!(
-            "auto-disabled incompatible book source {} ({})",
-            source.book_source_name,
-            source.book_source_url
+            source = %source.book_source_name,
+            "auto-disabled incompatible book source"
         ),
         Ok(false) => {}
         Err(save_error) => tracing::warn!(
@@ -4508,8 +4572,10 @@ mod tests {
     use super::{
         aligned_chapter_index, book_matches_delete_target,
         build_available_book_source_response, cache_count_for_shelf_display,
+        complete_available_source_candidate,
         fallback_available_book, merge_global_explore_books, merge_search_results,
         select_global_explore_kind, should_use_available_source_cache,
+        should_stop_available_source_scan,
         source_supports_available_search, take_available_source_cached_matches,
         take_available_source_sse_matches, take_search_book_multi_sse_batch,
         GetAvailableBookSourceRequest, GlobalExploreBookHit,
@@ -4815,6 +4881,49 @@ mod tests {
         assert!(source_supports_available_search(&searchable));
         assert!(!source_supports_available_search(&disabled));
         assert!(!source_supports_available_search(&searchless));
+    }
+
+    #[test]
+    fn automatic_available_source_scan_stops_at_shortlist_but_refresh_scans_all() {
+        assert!(!should_stop_available_source_scan(false, 11));
+        assert!(should_stop_available_source_scan(false, 12));
+        assert!(!should_stop_available_source_scan(true, 12));
+        assert!(!should_stop_available_source_scan(true, 100));
+    }
+
+    #[test]
+    fn completed_available_source_keeps_toc_and_latest_catalog_metadata() {
+        let candidate = SearchBook {
+            name: "大王饶命".to_string(),
+            author: "会说话的肘子".to_string(),
+            book_url: "https://source.test/book/1".to_string(),
+            origin: "https://source.test".to_string(),
+            last_chapter: Some("旧章节".to_string()),
+            ..SearchBook::default()
+        };
+        let chapters = vec![
+            BookChapter {
+                title: "第一章".to_string(),
+                ..BookChapter::default()
+            },
+            BookChapter {
+                title: "第二章".to_string(),
+                ..BookChapter::default()
+            },
+        ];
+
+        let completed = complete_available_source_candidate(
+            candidate,
+            "https://source.test/book/1/catalog".to_string(),
+            &chapters,
+        );
+
+        assert_eq!(
+            completed.toc_url.as_deref(),
+            Some("https://source.test/book/1/catalog")
+        );
+        assert_eq!(completed.total_chapter_num, Some(2));
+        assert_eq!(completed.last_chapter.as_deref(), Some("第二章"));
     }
 
     #[test]

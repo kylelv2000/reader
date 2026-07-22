@@ -529,19 +529,31 @@ pub struct BookSourceClientLogParam {
     source: Option<String>,
     lineno: Option<i64>,
     colno: Option<i64>,
-    stack: Option<String>,
 }
 
 pub async fn book_source_client_log(
     Query(q): Query<BookSourceClientLogParam>,
 ) -> Json<ApiResponse<serde_json::Value>> {
+    let source_host = q
+        .source
+        .as_deref()
+        .and_then(|source| Url::parse(source).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let message = q
+        .message
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '\t'))
+        .take(200)
+        .collect::<String>();
     tracing::warn!(
-        "bookSourceProxy client error: source={} line={} col={} message={} stack={}",
-        q.source.as_deref().unwrap_or_default(),
-        q.lineno.unwrap_or_default(),
-        q.colno.unwrap_or_default(),
-        q.message.as_deref().unwrap_or_default(),
-        q.stack.as_deref().unwrap_or_default()
+        source_host = %source_host,
+        line = q.lineno.unwrap_or_default(),
+        column = q.colno.unwrap_or_default(),
+        message = %message,
+        "book source proxy client error"
     );
     Json(ApiResponse::ok(serde_json::json!({ "logged": true })))
 }
@@ -657,12 +669,14 @@ async fn forward_book_source_request(
         builder = builder.body(body.clone());
     }
 
-    tracing::info!(
-        "bookSourceProxy upstream request: method={} target={} referer={} body_len={}",
-        method,
-        target_url,
-        referer_value,
-        body.len()
+    tracing::debug!(
+        method = %method,
+        target_host = Url::parse(target_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "invalid".to_string()),
+        body_len = body.len(),
+        "book source proxy request"
     );
     let upstream = match builder.send().await {
         Ok(response) => response,
@@ -698,12 +712,18 @@ async fn forward_book_source_request(
         }
         bytes.extend_from_slice(&chunk);
     }
-    tracing::info!(
-        "bookSourceProxy upstream response: method={} target={} status={} final_url={}",
-        method,
-        target_url,
-        status,
-        final_url
+    tracing::debug!(
+        method = %method,
+        status = status.as_u16(),
+        target_host = Url::parse(target_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "invalid".to_string()),
+        final_host = Url::parse(&final_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "invalid".to_string()),
+        "book source proxy response"
     );
     let mut response_headers = HeaderMap::new();
     if let Some(ct) = content_type.as_deref() {

@@ -254,31 +254,26 @@ impl BookService {
             .search_url
             .clone()
             .ok_or_else(|| AppError::BadRequest("missing search_url".to_string()))?;
-        tracing::info!(
-            "searching book from {}: key={}, page={}, url={}",
-            source.book_source_name,
-            key,
+        tracing::debug!(
+            source = %source.book_source_name,
             page,
-            search_url
+            "searching book"
         );
-        let mut spec = analyze_url(&search_url, key, page, &source.book_source_url, source)
-            .map_err(|e| {
-                tracing::error!("analyze_url failed: {:?}", e);
-                e
-            })?;
+        let mut spec = analyze_url(&search_url, key, page, &source.book_source_url, source)?;
 
         self.apply_source_cookie(user_ns, source, &mut spec.headers)
             .await;
 
-        tracing::debug!("search_book fetched spec: {:?}", spec);
-        let res = self.fetch_with_rate(source, spec).await.map_err(|e| {
-            tracing::error!("fetch failed: {:?}", e);
-            e
-        })?;
+        // Request rules can contain cookies, tokens and POST bodies. Never log
+        // the expanded request specification, even at debug level.
+        let res = self.fetch_with_rate(source, spec).await?;
         let res = apply_login_check_js(source, res);
-        tracing::debug!("fetch success, body length: {}", res.body.len());
         let books = self.parser.search_books(source, &res.body, &res.url);
-        tracing::info!("found {} books", books.len());
+        tracing::debug!(
+            source = %source.book_source_name,
+            count = books.len(),
+            "book search completed"
+        );
         Ok(books)
     }
 
@@ -581,9 +576,9 @@ impl BookService {
     ) -> Result<String, AppError> {
         let book_key = md5_hex(book_url);
         tracing::debug!(
-            "get_content called, chapter_url={}, book_key={}",
-            chapter_url,
-            book_key
+            chapter_key = %md5_hex(chapter_url),
+            book_key = %book_key,
+            "get content"
         );
         if let Some(cached) = self
             .get_cached_content(user_ns, book_url, chapter_url)
@@ -1633,10 +1628,8 @@ impl BookService {
                 let recovered = recover_bookshelf_entries(&data)
                     .ok_or_else(|| AppError::BadRequest(primary_err.to_string()))?;
                 tracing::warn!(
-                    "recovered malformed bookshelf for user_ns={}, path={}, entries={}",
-                    user_ns,
-                    path.display(),
-                    recovered.len()
+                    entries = recovered.len(),
+                    "recovered malformed bookshelf"
                 );
                 self.write_bookshelf(user_ns, &recovered).await?;
                 recovered
@@ -1858,11 +1851,10 @@ fn apply_login_check_js(source: &BookSource, res: FetchResponse) -> FetchRespons
                 }
             }
             Ok(_) => res,
-            Err(err) => {
+            Err(_) => {
                 tracing::warn!(
-                    "loginCheckJs failed for {}: {:?}",
-                    source.book_source_name,
-                    err
+                    source = %source.book_source_name,
+                    "book source login check failed"
                 );
                 res
             }

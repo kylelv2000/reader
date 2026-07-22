@@ -740,7 +740,12 @@ export class ReaderApi {
         onBatch([...results.values()]);
       }
     }
-    return { books: [...results.values()], lastIndex: nextLastIndex, hasMore };
+    // A server-side early stop or a browser abort may leave transient
+    // "validating" rows in the stream. They are progress indicators, not
+    // usable source candidates and must never survive the scan.
+    const books = [...results.values()].filter((candidate) => !candidate.sourceValidating);
+    onBatch(books);
+    return { books, lastIndex: nextLastIndex, hasMore };
   }
 
   setBookSource(book: Book, candidate: Book) {
