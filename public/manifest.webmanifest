@@ -1,6 +1,6 @@
 {
-  "name": "Yomu 轻阅读",
-  "short_name": "Yomu",
+  "name": "轻阅读",
+  "short_name": "轻阅读",
   "description": "现代、轻量、可自托管的 Reader 3 兼容阅读器",
   "start_url": "/",
   "display": "standalone",

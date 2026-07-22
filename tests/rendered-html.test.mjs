@@ -10,13 +10,13 @@ async function render() {
   return worker.fetch(request, undefined, { waitUntil() {}, passThroughOnException() {} });
 }
 
-test("server-renders the private Yomu login gate", async () => {
+test("server-renders the private 轻阅读 login gate", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>Yomu 轻阅读(?: · Yomu)?<\/title>/i);
+  assert.match(html, /<title>轻阅读<\/title>/i);
   assert.match(html, /<h1>正在连接<\/h1>/);
   assert.match(html, /无账号请联系管理员/);
   assert.match(html, /\/_app\/[^"']+\.js/);
@@ -29,5 +29,5 @@ test("ships installable PWA metadata", async () => {
   const html = await response.text();
   assert.match(html, /manifest\.webmanifest/);
   assert.match(html, /lang="zh-CN"/);
-  assert.match(html, /Yomu/);
+  assert.match(html, /轻阅读/);
 });

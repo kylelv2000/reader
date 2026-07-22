@@ -13,16 +13,19 @@ for (const size of sizes) {
 
 const ogBackground = Buffer.from(`
   <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-    <rect width="1200" height="630" fill="#202722"/>
-    <circle cx="1040" cy="80" r="290" fill="#6F8275" opacity=".19"/>
-    <circle cx="120" cy="660" r="330" fill="#AD5A3D" opacity=".18"/>
-    <path d="M520 132h540" stroke="#E4D7B8" stroke-opacity=".18"/>
-    <text x="520" y="278" fill="#F4EFE2" font-family="Georgia, serif" font-size="104" font-weight="600" letter-spacing="2">Yomu</text>
-    <text x="526" y="344" fill="#CDBD9B" font-family="Arial, sans-serif" font-size="24" letter-spacing="8">LIGHT READING</text>
-    <text x="526" y="422" fill="#B7C0B9" font-family="Arial, sans-serif" font-size="26">Read anywhere · Continue everywhere</text>
+    <defs>
+      <linearGradient id="ogbg" x1="92" y1="44" x2="1100" y2="610" gradientUnits="userSpaceOnUse">
+        <stop stop-color="#F6FAFF"/>
+        <stop offset="1" stop-color="#DDEAFF"/>
+      </linearGradient>
+    </defs>
+    <rect width="1200" height="630" fill="url(#ogbg)"/>
+    <circle cx="1040" cy="70" r="310" fill="#3A78EB" opacity=".12"/>
+    <circle cx="110" cy="650" r="340" fill="#FFD166" opacity=".18"/>
+    <path d="M410 160c-116-30-220-15-310 45v285c92-46 197-53 310-20M790 160c116-30 220-15 310 45v285c-92-46-197-53-310-20" fill="none" stroke="#2F6FED" stroke-width="3" opacity=".1"/>
   </svg>`);
-const ogIcon = await sharp(source).resize(300, 300).png().toBuffer();
+const ogIcon = await sharp(source).resize(330, 330).png().toBuffer();
 await sharp(ogBackground)
-  .composite([{ input: ogIcon, left: 142, top: 165 }])
+  .composite([{ input: ogIcon, left: 435, top: 150 }])
   .png({ compressionLevel: 9 })
   .toFile(fileURLToPath(new URL("../public/og.png", import.meta.url)));

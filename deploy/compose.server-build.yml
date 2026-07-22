@@ -1,0 +1,6 @@
+services:
+  yomu-app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: light-reader-app:server

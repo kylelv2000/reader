@@ -11,11 +11,11 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     metadataBase: new URL(origin),
     title: {
-      default: "Yomu 阅读器",
-      template: "%s · Yomu",
+      default: "轻阅读",
+      template: "%s · 轻阅读",
     },
     description: "书架、搜书与跨端同步。",
-    applicationName: "Yomu 阅读器",
+    applicationName: "轻阅读",
     manifest: "/manifest.webmanifest",
     icons: {
       icon: [
@@ -26,22 +26,22 @@ export async function generateMetadata(): Promise<Metadata> {
     },
     appleWebApp: {
       capable: true,
-      title: "Yomu",
+      title: "轻阅读",
       statusBarStyle: "black-translucent",
     },
     formatDetection: { telephone: false },
     openGraph: {
       type: "website",
-      title: "Yomu 阅读器",
+      title: "轻阅读",
       description: "书架、搜书与跨端同步。",
-      siteName: "Yomu 阅读器",
+      siteName: "轻阅读",
       url: origin,
       locale: "zh_CN",
-      images: [{ url: "/og.png", width: 1200, height: 630, alt: "Yomu 轻阅读" }],
+      images: [{ url: "/og.png", width: 1200, height: 630, alt: "轻阅读" }],
     },
     twitter: {
       card: "summary_large_image",
-      title: "Yomu 阅读器",
+      title: "轻阅读",
       description: "书架、搜书与跨端同步。",
       images: ["/og.png"],
     },

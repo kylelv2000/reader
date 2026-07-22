@@ -1,4 +1,4 @@
-const CACHE_NAME = "yomu-shell-v4";
+const CACHE_NAME = "light-reader-shell-v5";
 const APP_SHELL = ["/manifest.webmanifest"];
 
 async function cacheAppShell() {
