@@ -782,6 +782,11 @@ textarea:focus-visible {
   letter-spacing: 0.16em;
 }
 
+.continue-cover.has-cover span,
+.continue-cover.has-cover small {
+  visibility: hidden;
+}
+
 .continue-copy {
   position: relative;
   z-index: 1;
@@ -795,8 +800,17 @@ textarea:focus-visible {
 }
 
 .continue-author {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin: 5px 0 24px;
   color: #777367;
+}
+
+.progress-pct {
+  color: #9a9b94;
+  font-size: 12px;
+  font-style: normal;
 }
 
 .continue-chapter {
@@ -805,37 +819,6 @@ textarea:focus-visible {
   font-weight: 600;
 }
 
-.progress-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  max-width: 360px;
-}
-
-.progress-track,
-.mini-progress {
-  overflow: hidden;
-  background: rgba(71, 69, 61, 0.13);
-  border-radius: 999px;
-}
-
-.progress-track {
-  width: 100%;
-  height: 4px;
-}
-
-.progress-track span,
-.mini-progress span,
-.reader-progress span {
-  display: block;
-  height: 100%;
-  background: var(--accent);
-}
-
-.progress-row small {
-  color: #777367;
-  font-size: 11px;
-}
 
 .read-button {
   display: flex;
@@ -1010,11 +993,6 @@ textarea:focus-visible {
   margin-top: 8px;
   color: #9a9b94;
   font-size: 10px;
-}
-
-.mini-progress {
-  height: 2px;
-  margin-top: 9px;
 }
 
 .book-card-actions {
@@ -2414,10 +2392,6 @@ textarea:focus-visible {
   transform: translateY(-100%);
 }
 
-.reader-overlay.chrome-hidden .reader-progress {
-  opacity: 0;
-}
-
 .reader-bar > button,
 .reader-actions button,
 .reader-actions a {
@@ -2647,16 +2621,6 @@ textarea:focus-visible {
 .chapter-footer span {
   opacity: 0.45;
   font-size: 10px;
-}
-
-.reader-progress {
-  position: fixed;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 6;
-  height: 3px;
-  background: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .reader-cache-progress {
@@ -3392,8 +3356,7 @@ textarea:focus-visible {
     margin-bottom: 14px;
   }
 
-  .continue-chapter,
-  .progress-row {
+  .continue-chapter {
     display: none;
   }
 
@@ -3416,8 +3379,7 @@ textarea:focus-visible {
   }
 
   .book-cover small,
-  .book-meta small,
-  .mini-progress {
+  .book-meta small {
     display: none;
   }
 

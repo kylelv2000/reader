@@ -2223,19 +2223,15 @@ export function ReaderShell() {
               </section>
 
               {primaryBook ? <section className="continue-card">
-                <div className="continue-cover" style={coverStyle(primaryBook, true)}>
+                <div className={primaryBook.customCoverUrl || primaryBook.coverUrl ? "continue-cover has-cover" : "continue-cover"} style={coverStyle(primaryBook, true)}>
                   <span>{firstLetter(primaryBook.name)}</span>
                   <small>{primaryBook.author}</small>
                 </div>
                 <div className="continue-copy">
                   <p className="eyebrow">继续阅读</p>
                   <h2>{primaryBook.name}</h2>
-                  <p className="continue-author">{primaryBook.author}</p>
+                  <p className="continue-author">{primaryBook.author}<span className="progress-pct">{progressFor(primaryBook)}%</span></p>
                   <p className="continue-chapter">{primaryBook.durChapterTitle || "从第一章开始"}</p>
-                  <div className="progress-row">
-                    <div className="progress-track"><span style={{ width: `${progressFor(primaryBook)}%` }} /></div>
-                    <small>{progressFor(primaryBook)}%</small>
-                  </div>
                   <button className="read-button" onClick={() => openBook(primaryBook)}>继续阅读 <span>→</span></button>
                 </div>
                 <blockquote>“真正的阅读，是让一段文字在你身上多停留一会儿。”</blockquote>
@@ -2265,10 +2261,9 @@ export function ReaderShell() {
                       </button>
                       <button className="book-meta" onClick={() => openBook(book)}>
                         <strong>{book.name}</strong>
-                        <span>{book.author}</span>
+                        <span>{book.author} <em className="progress-pct">{progressFor(book)}%</em></span>
                         <small>{book.durChapterTitle || latestChapterFor(book) || "尚未开始"}</small>
                       </button>
-                      <div className="mini-progress"><span style={{ width: `${progressFor(book)}%` }} /></div>
                     </article>
                   ))}
                 </div>
@@ -2671,7 +2666,6 @@ export function ReaderShell() {
               <button onClick={() => changePageOrChapter(1)} disabled={reader.chapterIndex === reader.chapters.length - 1}>下一章 →</button>
             </footer>
           </article>
-          <div className="reader-progress"><span style={{ width: `${reader.chapters.length ? ((reader.chapterIndex + 1) / reader.chapters.length) * 100 : 0}%` }} /></div>
           {offlineDownload?.bookUrl === reader.book.bookUrl && (
             <div className="reader-cache-progress" role="status" aria-live="polite">
               <strong>正在缓存章节</strong>
