@@ -224,12 +224,6 @@ function latestChapterFor(book: Book) {
   return book.latestChapterTitle || book.lastChapter || "";
 }
 
-function cleanKind(raw?: string): string {
-  if (!raw) return "";
-  // Filter out unparsed rule syntax like "$.category&&9.2分"
-  if (/^\$[.[]|&&|\|\|/.test(raw)) return "";
-  return raw.replace(/\s+/g, " ").trim();
-}
 
 function mediaUrls(content: string) {
   const matches = content.match(/https?:\/\/[^\s"'<>]+/gi) || [];
@@ -2294,23 +2288,33 @@ export function ReaderShell() {
                   <span aria-hidden="true">⌕</span>
                   <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入书名或作者，例如：三体" aria-label="跨书源搜索" />
                   {searching
-                    ? <button type="button" onClick={() => { searchAbortRef.current?.abort(); searchAbortRef.current = null; setSearching(false); }}>停止</button>
+                    ? <button type="button" onClick={() => searchAbortRef.current?.abort()}>停止</button>
                     : <button>搜索</button>}
                 </form>
                 {!searchResults.length && !searching && <div className="empty-state compact"><span>输入书名或作者开始搜索</span></div>}
               </> : <div className="explore-categories">{[["mixed", "综合"], ["rank", "排行"], ["new", "新书"], ["finished", "完本"], ["fantasy", "玄幻"], ["urban", "都市"], ["history", "历史"], ["sci-fi", "科幻"], ["suspense", "悬疑"]].map(([key, label]) => <button key={key} className={exploreCategory === key ? "active" : ""} onClick={() => exploreBooks(key)}>{label}</button>)}</div>}
               <section className="search-results">
-                {(discoverMode === "explore" ? exploreResults : searchResults).map((book) => {
+                {(discoverMode === "explore" ? exploreResults : searchResults
+                  .filter((book) => latestChapterFor(book) || book.totalChapterNum)
+                  .sort((a, b) => {
+                    const q = query.trim();
+                    const aExact = a.name.trim() === q ? 1 : 0;
+                    const bExact = b.name.trim() === q ? 1 : 0;
+                    if (aExact !== bExact) return bExact - aExact;
+                    const aContains = a.name.includes(q) ? 1 : 0;
+                    const bContains = b.name.includes(q) ? 1 : 0;
+                    if (aContains !== bContains) return bContains - aContains;
+                    return (b.bookSourceUrls?.length || 1) - (a.bookSourceUrls?.length || 1);
+                  })
+                ).map((book) => {
                   const onShelf = books.some((b) => b.name.trim() === book.name.trim() && b.author.trim() === book.author.trim());
-                  const kind = cleanKind(book.kind);
                   const sourceCount = book.bookSourceUrls?.length || 1;
                   return (
                     <article className="result-card" key={`result-${book.bookUrl}`}>
                       <div className="result-cover" style={coverStyle(book)}>{firstLetter(book.name)}</div>
                       <div>
-                        <span className="source-chip">{sourceCount > 1 ? `${sourceCount} 个书源` : book.originName || "聚合结果"}</span>
                         <h2>{book.name}</h2>
-                        <p>{book.author}{kind ? ` · ${kind}` : ""}</p>
+                        <p>{book.author}{sourceCount > 1 ? ` · ${sourceCount} 个书源` : ""}</p>
                         <small>{latestChapterFor(book) || (book.totalChapterNum ? `共 ${book.totalChapterNum} 章` : "")}</small>
                       </div>
                       {onShelf ? <span className="quiet-button on-shelf">已在书架</span> : <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>}
