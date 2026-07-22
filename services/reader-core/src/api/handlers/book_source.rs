@@ -12,7 +12,7 @@ use axum::{
     extract::{Query, State},
     http::{
         header::{self, HeaderMap, HeaderValue},
-        Method,
+        Method, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -409,6 +409,8 @@ pub async fn delete_invalid_book_sources(
 pub struct BookSourceProxyParam {
     #[serde(rename = "bookSourceUrl")]
     book_source_url: Option<String>,
+    #[serde(rename = "bookUrl")]
+    book_url: Option<String>,
     url: Option<String>,
 }
 
@@ -450,6 +452,58 @@ pub async fn book_source_proxy(
     ensure_public_url(&target_url)
         .await
         .map_err(|_| AppError::BadRequest("unsafe proxy target".to_string()))?;
+    let resource_book_url = if method == Method::GET {
+        if let Some(book_url) = q.book_url.as_deref().filter(|value| !value.trim().is_empty()) {
+            let shelf_book = state
+                .book_service
+                .get_shelf_book(&user_ns, book_url)
+                .await?
+                .ok_or_else(|| AppError::BadRequest("book resource is not on shelf".to_string()))?;
+            if normalize_source_url(&shelf_book.origin)
+                != normalize_source_url(&source.book_source_url)
+            {
+                return Err(AppError::BadRequest(
+                    "book resource source does not match shelf".to_string(),
+                ));
+            }
+            if !state.book_service.is_book_resource_allowed(
+                &user_ns,
+                &shelf_book.book_url,
+                &target_url,
+            ) {
+                return Err(AppError::BadRequest(
+                    "book resource was not referenced by cached content".to_string(),
+                ));
+            }
+            if let Some((bytes, content_type)) = state
+                .book_service
+                .load_cached_book_resource(&user_ns, &shelf_book.book_url, &target_url)
+                .await?
+            {
+                let mut response = Response::new(axum::body::Body::from(bytes));
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    response.headers_mut().insert(header::CONTENT_TYPE, value);
+                }
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("private, max-age=86400"),
+                );
+                return Ok(response);
+            }
+            if state
+                .book_service
+                .book_resource_retry_blocked(&user_ns, &shelf_book.book_url, &target_url)
+                .await
+            {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
+            Some(shelf_book.book_url)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let upstream_referer = extract_upstream_referer(&headers);
     let response = forward_book_source_request(
         &state,
@@ -460,6 +514,9 @@ pub async fn book_source_proxy(
         &target_url,
         upstream_referer.as_deref(),
         body,
+        resource_book_url
+            .as_deref()
+            .map(|book_url| (user_ns.as_str(), book_url)),
     )
     .await?;
 
@@ -540,6 +597,7 @@ async fn forward_book_source_request(
     target_url: &str,
     upstream_referer: Option<&str>,
     body: Bytes,
+    resource_cache: Option<(&str, &str)>,
 ) -> Result<Response, AppError> {
     let client = state.book_service.http_client();
     let req_method = match *method {
@@ -606,7 +664,18 @@ async fn forward_book_source_request(
         referer_value,
         body.len()
     );
-    let upstream = builder.send().await.map_err(AppError::Http)?;
+    let upstream = match builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some((user_ns, book_url)) = resource_cache {
+                state
+                    .book_service
+                    .mark_book_resource_failure(user_ns, book_url, target_url)
+                    .await;
+            }
+            return Err(AppError::Http(error));
+        }
+    };
     let status = upstream.status();
     let final_url = upstream.url().to_string();
     let content_type = upstream
@@ -649,9 +718,36 @@ async fn forward_book_source_request(
             }
         }
     }
-    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let html_response = is_html_response(content_type.as_deref(), &bytes);
+    if let Some((user_ns, book_url)) = resource_cache {
+        if status.is_success() && !html_response {
+            let _ = state
+                .book_service
+                .store_book_resource(
+                    user_ns,
+                    book_url,
+                    target_url,
+                    &bytes,
+                    content_type.as_deref().unwrap_or("application/octet-stream"),
+                )
+                .await;
+        } else if !status.is_success() {
+            state
+                .book_service
+                .mark_book_resource_failure(user_ns, book_url, target_url)
+                .await;
+        }
+    }
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        if resource_cache.is_some() && status.is_success() && !html_response {
+            HeaderValue::from_static("private, max-age=86400")
+        } else {
+            HeaderValue::from_static("no-store")
+        },
+    );
 
-    let body = if is_html_response(content_type.as_deref(), &bytes) {
+    let body = if html_response {
         let text = String::from_utf8_lossy(&bytes).to_string();
         // Yomu's same-origin security gateway authenticates proxy requests with an
         // HttpOnly session. Never embed the underlying Reader token into login HTML.

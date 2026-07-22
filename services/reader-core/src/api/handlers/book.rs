@@ -186,7 +186,8 @@ pub struct GetShelfBookRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CoverQuery {
-    path: Option<String>,
+    #[serde(rename = "bookUrl")]
+    book_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1406,6 +1407,10 @@ pub async fn get_book_content(
             .get_cached_content(&user_ns, &book_url, &chapter_url)
             .await?
         {
+            let _ = state
+                .book_service
+                .register_book_resources(&user_ns, &book_url, &content)
+                .await;
             spawn_reader_prefetch(
                 state.clone(),
                 user_ns.clone(),
@@ -1430,7 +1435,7 @@ pub async fn get_book_content(
     if do_refresh {
         let _ = state
             .book_service
-            .delete_book_cache(&user_ns, &book_url)
+            .delete_chapter_cache(&user_ns, &book_url, &chapter_url)
             .await;
     }
 
@@ -1438,6 +1443,10 @@ pub async fn get_book_content(
         .book_service
         .get_content(&user_ns, &book_url, &source, &chapter_url)
         .await?;
+    let _ = state
+        .book_service
+        .register_book_resources(&user_ns, &book_url, &content)
+        .await;
     spawn_reader_prefetch(
         state,
         user_ns,
@@ -2240,6 +2249,26 @@ pub async fn set_book_source(
         .book_service
         .save_book_sources_cache(&user_ns, &saved.book_url, &known_sources)
         .await;
+    if shelf_book.book_url != saved.book_url {
+        let _ = state
+            .book_service
+            .delete_book_cache(&user_ns, &shelf_book.book_url)
+            .await;
+        let _ = state
+            .book_service
+            .delete_book_sources_cache(&user_ns, &shelf_book.book_url)
+            .await;
+        let _ = state
+            .book_service
+            .delete_chapter_list_cache(&user_ns, &shelf_book.book_url)
+            .await;
+        if let Some(old_toc_url) = shelf_book.toc_url.as_deref() {
+            let _ = state
+                .book_service
+                .delete_chapter_list_cache(&user_ns, old_toc_url)
+                .await;
+        }
+    }
 
     Ok(Json(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
@@ -2524,19 +2553,84 @@ pub async fn get_book_cover(
         .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
         .await
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
-    let url = match q.path {
-        Some(u) if !u.trim().is_empty() => u,
+    let book_url = match q.book_url {
+        Some(value) if !value.trim().is_empty() => value,
         _ => return Ok(StatusCode::NOT_FOUND.into_response()),
     };
-    let result = if let Some(hash) = url.strip_prefix("local-epub-cover:") {
-        state
-            .local_epub_book_service
-            .get_cover(&user_ns, &format!("local-epub:{hash}"))
-            .await
-            .map(|bytes| (bytes, "image/jpeg".to_string()))
-    } else {
-        state.book_service.get_cover(&user_ns, &url).await
+    let Some(book) = state
+        .book_service
+        .get_shelf_book(&user_ns, &book_url)
+        .await?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    let mut result = if let Some(cached) = state
+        .book_service
+        .load_cached_book_cover(&user_ns, &book.book_url)
+        .await?
+    {
+        Ok(cached)
+    } else if let Some(source_url) = book
+        .custom_cover_url
+        .as_deref()
+        .or(book.cover_url.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(hash) = source_url.strip_prefix("local-epub-cover:") {
+            match state
+                .local_epub_book_service
+                .get_cover(&user_ns, &format!("local-epub:{hash}"))
+                .await
+            {
+                Ok(bytes) => {
+                    let content_type = "image/jpeg".to_string();
+                    let _ = state
+                        .book_service
+                        .store_book_cover(
+                            &user_ns,
+                            &book.book_url,
+                            &crate::util::hash::md5_hex(source_url),
+                            &bytes,
+                            &content_type,
+                        )
+                        .await;
+                    Ok((bytes, content_type))
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            state
+                .book_service
+                .get_or_cache_book_cover(&user_ns, &book.book_url, source_url)
+                .await
+        }
+    } else {
+        Err(AppError::NotFound("cover not found".to_string()))
+    };
+    if result.is_err() {
+        if let Some(candidates) = state
+            .book_service
+            .load_book_sources_cache(&user_ns, &book.book_url)
+            .await?
+        {
+            cache_borrowed_shelf_cover(&state, &user_ns, &book, &candidates).await;
+            if let Some(cached) = state
+                .book_service
+                .load_cached_book_cover(&user_ns, &book.book_url)
+                .await?
+            {
+                result = Ok(cached);
+            }
+        }
+    }
+    if result.is_err()
+        && !state
+            .book_service
+            .cover_discovery_retry_blocked(&user_ns, &book.book_url)
+            .await
+    {
+        spawn_cover_discovery(state.clone(), user_ns.clone(), book.clone()).await;
+    }
     match result {
         Ok((bytes, content_type)) => {
             let mut resp = Response::new(Body::from(bytes));
@@ -2552,6 +2646,88 @@ pub async fn get_book_cover(
         }
         Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
+}
+
+async fn spawn_cover_discovery(state: AppState, user_ns: String, book: Book) {
+    let task_key = format!("cover\u{0}{}\u{0}{}", user_ns, book.book_url);
+    {
+        let mut active = state.reader_prefetches.lock().await;
+        if !active.insert(task_key.clone()) {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        discover_and_cache_book_cover(&state, &user_ns, &book).await;
+        state.reader_prefetches.lock().await.remove(&task_key);
+    });
+}
+
+async fn discover_and_cache_book_cover(state: &AppState, user_ns: &str, book: &Book) {
+    let Ok(sources) = state.book_source_service.list(user_ns).await else {
+        state
+            .book_service
+            .mark_cover_discovery_failure(user_ns, &book.book_url)
+            .await;
+        return;
+    };
+    let mut searches = stream::iter(
+        sources
+            .into_iter()
+            .filter(source_supports_available_search)
+            .map(|source| {
+                let service = state.book_service.clone();
+                let user_ns = user_ns.to_string();
+                let name = book.name.clone();
+                async move {
+                    let result = service.search_book(&user_ns, &source, &name, 1).await;
+                    (source, result)
+                }
+            }),
+    )
+    .buffer_unordered(DEFAULT_AVAILABLE_CONCURRENT_COUNT);
+    while let Some((source, result)) = searches.next().await {
+        let Ok(matches) = result else {
+            continue;
+        };
+        for mut candidate in matches
+            .into_iter()
+            .filter(|candidate| available_source_matches_target(candidate, &book.name, &book.author))
+        {
+            if candidate.cover_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                if let Ok(info) = state
+                    .book_service
+                    .get_book_info(user_ns, &source, &candidate.book_url)
+                    .await
+                {
+                    candidate.cover_url = info.cover_url;
+                }
+            }
+            let Some(cover_url) = candidate
+                .cover_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if state
+                .book_service
+                .get_or_cache_book_cover(user_ns, &book.book_url, cover_url)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut updated = book.clone();
+            updated.cover_url = Some(cover_url.to_string());
+            let _ = state.book_service.save_book(user_ns, updated).await;
+            return;
+        }
+    }
+    state
+        .book_service
+        .mark_cover_discovery_failure(user_ns, &book.book_url)
+        .await;
 }
 
 pub async fn get_invalid_book_sources(
@@ -3302,6 +3478,19 @@ pub async fn get_available_book_source_sse(
                         .delete_book_sources_cache(&user_ns, url)
                         .await;
                 } else {
+                    let cover_state = state.clone();
+                    let cover_user_ns = user_ns.clone();
+                    let cover_book = book.clone();
+                    let cover_candidates = cached.clone();
+                    tokio::spawn(async move {
+                        cache_borrowed_shelf_cover(
+                            &cover_state,
+                            &cover_user_ns,
+                            &cover_book,
+                            &cover_candidates,
+                        )
+                        .await;
+                    });
                     tokio::spawn(async move {
                         let mut last_index = -1;
                         for book in cached {
@@ -3526,6 +3715,18 @@ pub async fn get_available_book_source_sse(
                 serde_json::json!({"lastIndex": final_last_idx, "hasMore": has_more}).to_string(),
             ))
             .await;
+        let cover_state = state_clone.clone();
+        let cover_user_ns = user_ns.clone();
+        let cover_book = book.clone();
+        tokio::spawn(async move {
+            cache_borrowed_shelf_cover(
+                &cover_state,
+                &cover_user_ns,
+                &cover_book,
+                &all_results,
+            )
+            .await;
+        });
     });
 
     Ok(Sse::new(ReceiverStream::new(rx).map(Ok)))
@@ -3564,6 +3765,63 @@ async fn validate_available_source_candidate(
         candidate.last_chapter = Some(last.title.clone());
     }
     Some(candidate)
+}
+
+async fn cache_borrowed_shelf_cover(
+    state: &AppState,
+    user_ns: &str,
+    shelf_book: &Book,
+    candidates: &[SearchBook],
+) {
+    if shelf_book
+        .custom_cover_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+    if let Some(current) = shelf_book
+        .cover_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if state
+            .book_service
+            .get_or_cache_book_cover(user_ns, &shelf_book.book_url, current)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let mut attempted = std::collections::HashSet::new();
+    for candidate in candidates {
+        let Some(cover_url) = candidate
+            .cover_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if !attempted.insert(cover_url.to_string()) {
+            continue;
+        }
+        if state
+            .book_service
+            .get_or_cache_book_cover(user_ns, &shelf_book.book_url, cover_url)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let mut updated = shelf_book.clone();
+        updated.cover_url = Some(cover_url.to_string());
+        if let Err(error) = state.book_service.save_book(user_ns, updated).await {
+            tracing::debug!("failed to persist borrowed cover: {:?}", error);
+        }
+        return;
+    }
 }
 
 pub async fn book_source_debug_sse(

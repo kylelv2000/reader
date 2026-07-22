@@ -125,15 +125,15 @@ function readTimeMs(value?: number) {
   return value < 100_000_000_000 ? value * 1000 : value;
 }
 
-function coverStyle(book: Book): CSSProperties {
+function coverStyle(book: Book, resolveMissing = false): CSSProperties {
   const sum = Array.from(book.name).reduce((value, char) => value + char.charCodeAt(0), 0);
   const palette = coverPalettes[sum % coverPalettes.length];
   const coverUrl = book.customCoverUrl || book.coverUrl;
   return {
     backgroundColor: palette[0],
     color: palette[1],
-    ...(coverUrl ? {
-      backgroundImage: `linear-gradient(180deg, rgba(20, 22, 19, 0.03), rgba(20, 22, 19, 0.28)), url("/reader3/cover?path=${encodeURIComponent(coverUrl)}")`,
+    ...(coverUrl || resolveMissing ? {
+      backgroundImage: `linear-gradient(180deg, rgba(20, 22, 19, 0.03), rgba(20, 22, 19, 0.28)), url("/reader3/cover?bookUrl=${encodeURIComponent(book.bookUrl)}")`,
       backgroundPosition: "center",
       backgroundSize: "cover",
     } : {}),
@@ -391,11 +391,17 @@ export function ReaderShell() {
   const readerOverlayRef = useRef<HTMLElement>(null);
   const readingPaperRef = useRef<HTMLElement>(null);
   const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
-  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number } | null>(null);
+  const readerTouchActiveRef = useRef(false);
+  const pageSnapTimerRef = useRef<number | null>(null);
+  const pageWheelLockUntilRef = useRef(0);
   const autoTurnRef = useRef(false);
   const offlineDownloadRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const sourceSwitchAbortRef = useRef<AbortController | null>(null);
+  const clientPrefetchAbortRef = useRef<AbortController | null>(null);
+  const clientPrefetchTimerRef = useRef<number | null>(null);
+  const clientPrefetchedWindowsRef = useRef(new Set<string>());
   const sourceCandidatesForRef = useRef("");
   const sourceSwitchBusyRef = useRef(false);
   const readerHistoryActiveRef = useRef(false);
@@ -436,7 +442,7 @@ export function ReaderShell() {
   const hasExploreSources = sources.some((source) => source.enabled !== false && source.enabledExplore !== false && Boolean(source.exploreUrl));
   const exploreAvailable = exploreEnabled && hasExploreSources;
   const resolvedAppTheme = appTheme === "system" ? (systemDark ? "dark" : "light") : appTheme;
-  const resolvedReaderTheme = preferences.theme === "system" ? (systemDark ? "night" : "paper") : preferences.theme;
+  const resolvedReaderTheme = preferences.theme === "system" ? (resolvedAppTheme === "dark" ? "night" : "paper") : preferences.theme;
 
   const renderedContent = useMemo(() => {
     if (!reader) return "";
@@ -532,6 +538,8 @@ export function ReaderShell() {
       setShowReaderSettings(false);
       setShowSourceSwitch(false);
       setShowChapterSearch(false);
+      if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
+      clientPrefetchAbortRef.current?.abort();
       setReader(null);
     };
     window.addEventListener("popstate", handleReaderBack);
@@ -593,6 +601,22 @@ export function ReaderShell() {
     document.documentElement.dataset.theme = resolvedAppTheme;
     document.documentElement.style.colorScheme = resolvedAppTheme;
   }, [appTheme, resolvedAppTheme]);
+
+  useEffect(() => () => {
+    if (pageSnapTimerRef.current !== null) window.clearTimeout(pageSnapTimerRef.current);
+    if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
+    clientPrefetchAbortRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    const stopBackgroundPrefetch = () => {
+      if (document.visibilityState === "visible") return;
+      if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
+      clientPrefetchAbortRef.current?.abort();
+    };
+    document.addEventListener("visibilitychange", stopBackgroundPrefetch);
+    return () => document.removeEventListener("visibilitychange", stopBackgroundPrefetch);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("yomu-explore-enabled", String(exploreEnabled));
@@ -877,6 +901,7 @@ export function ReaderShell() {
 
   function exitReader() {
     window.speechSynthesis?.cancel();
+    clientPrefetchAbortRef.current?.abort();
     setSpeaking(false);
     setAutoReading(false);
     setReaderMenuOpen(false);
@@ -886,6 +911,30 @@ export function ReaderShell() {
     }
     readerHistoryActiveRef.current = false;
     setReader(null);
+  }
+
+  function prefetchFollowingChapters(book: Book, chapters: Chapter[], chapterIndex: number) {
+    clientPrefetchAbortRef.current?.abort();
+    if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
+    if (connection !== "connected" || chapterIndex >= chapters.length - 1) return;
+    const connectionInfo = (navigator as Navigator & {
+      connection?: { saveData?: boolean };
+    }).connection;
+    if (document.visibilityState !== "visible" || !navigator.onLine || connectionInfo?.saveData) return;
+    const windowKey = `${book.bookUrl}\u0000${chapterIndex + 1}`;
+    if (clientPrefetchedWindowsRef.current.has(windowKey)) return;
+    const controller = new AbortController();
+    clientPrefetchAbortRef.current = controller;
+    clientPrefetchTimerRef.current = window.setTimeout(() => {
+      clientPrefetchTimerRef.current = null;
+      if (controller.signal.aborted || document.visibilityState !== "visible" || !navigator.onLine) return;
+      if (clientPrefetchedWindowsRef.current.size >= 128) {
+        const oldest = clientPrefetchedWindowsRef.current.values().next().value;
+        if (oldest !== undefined) clientPrefetchedWindowsRef.current.delete(oldest);
+      }
+      clientPrefetchedWindowsRef.current.add(windowKey);
+      void api.prefetchBookChapters(book, chapters, chapterIndex + 1, 3, controller.signal);
+    }, 750);
   }
 
   function updateReaderPreference(patch: Partial<ReaderPreferences>) {
@@ -908,6 +957,8 @@ export function ReaderShell() {
   }
 
   async function openBook(book: Book, preferredChapter?: { title?: string; progress?: number }) {
+    clientPrefetchAbortRef.current?.abort();
+    if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
     const fallbackIndex = Math.max(0, book.durChapterIndex || 0);
     const openedAt = Date.now();
     const openingBook = { ...book, durChapterTime: openedAt };
@@ -947,6 +998,7 @@ export function ReaderShell() {
       setReader({ book: openedBook, chapters, chapterIndex, content, loading: false });
       setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? openedBook : item));
       void api.saveOfflineProgress(openedBook, chapters, chapterIndex);
+      prefetchFollowingChapters(openedBook, chapters, chapterIndex);
       if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
       window.setTimeout(() => readerTopRef.current?.scrollIntoView(), 10);
     } catch (error) {
@@ -987,6 +1039,7 @@ export function ReaderShell() {
         ),
       );
       void api.saveOfflineProgress(reader.book, reader.chapters, index);
+      prefetchFollowingChapters(reader.book, reader.chapters, index);
       if (api && connection === "connected") void api.saveProgress(reader.book.bookUrl, index);
       readerOverlayRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
@@ -1006,11 +1059,15 @@ export function ReaderShell() {
     if (preferences.pageMode === "paged") {
       const paper = readingPaperRef.current;
       if (paper) {
+        const step = Math.max(1, paper.clientWidth);
         const maxScrollLeft = Math.max(0, paper.scrollWidth - paper.clientWidth);
-        const next = Math.min(maxScrollLeft, Math.max(0, paper.scrollLeft + offset * paper.clientWidth));
-        const canMove = offset > 0 ? paper.scrollLeft < maxScrollLeft - 4 : paper.scrollLeft > 4;
-        if (canMove) {
-          paper.scrollTo({ left: next, behavior: "smooth" });
+        const lastPage = Math.max(0, Math.ceil(maxScrollLeft / step));
+        const currentPage = maxScrollLeft - paper.scrollLeft <= 2
+          ? lastPage
+          : Math.min(lastPage, Math.max(0, Math.round(paper.scrollLeft / step)));
+        const targetPage = currentPage + offset;
+        if (targetPage >= 0 && targetPage <= lastPage) {
+          paper.scrollTo({ left: targetPage === lastPage ? maxScrollLeft : targetPage * step, behavior: "auto" });
           return;
         }
       }
@@ -1020,19 +1077,93 @@ export function ReaderShell() {
 
   function handleReaderTouchStart(event: React.TouchEvent) {
     const touch = event.changedTouches[0];
-    touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+    readerTouchActiveRef.current = true;
+    if (pageSnapTimerRef.current !== null) {
+      window.clearTimeout(pageSnapTimerRef.current);
+      pageSnapTimerRef.current = null;
+    }
+    touchStartRef.current = {
+      x: touch.clientX,
+      y: touch.clientY,
+      scrollLeft: readingPaperRef.current?.scrollLeft || 0,
+    };
   }
 
   function handleReaderTouchEnd(event: React.TouchEvent) {
     const start = touchStartRef.current;
     const touch = event.changedTouches[0];
     touchStartRef.current = null;
+    readerTouchActiveRef.current = false;
     if (!start) return;
     const dx = touch.clientX - start.x;
     const dy = touch.clientY - start.y;
-    if (Math.abs(dx) > 58 && Math.abs(dx) > Math.abs(dy) * 1.3) {
-      void changePageOrChapter(dx < 0 ? 1 : -1);
+    if (preferences.pageMode === "paged") {
+      const paper = readingPaperRef.current;
+      if (!paper) return;
+      const step = Math.max(1, paper.clientWidth);
+      const maxScrollLeft = Math.max(0, paper.scrollWidth - paper.clientWidth);
+      const lastPage = Math.max(0, Math.ceil(maxScrollLeft / step));
+      const startPage = maxScrollLeft - start.scrollLeft <= 2
+        ? lastPage
+        : Math.min(lastPage, Math.max(0, Math.round(start.scrollLeft / step)));
+      if (Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy) * 1.15) {
+        const direction = dx < 0 ? 1 : -1;
+        const targetPage = startPage + direction;
+        if (targetPage < 0 || targetPage > lastPage) {
+          void changeChapter(direction);
+        } else {
+          paper.scrollTo({ left: targetPage === lastPage ? maxScrollLeft : targetPage * step, behavior: "auto" });
+        }
+      } else {
+        const regularTarget = Math.min(maxScrollLeft, Math.max(0, Math.round(paper.scrollLeft / step) * step));
+        const target = Math.abs(maxScrollLeft - paper.scrollLeft) < Math.abs(regularTarget - paper.scrollLeft)
+          ? maxScrollLeft
+          : regularTarget;
+        paper.scrollTo({ left: target, behavior: "auto" });
+      }
+      return;
     }
+    if (Math.abs(dx) > 58 && Math.abs(dx) > Math.abs(dy) * 1.3) {
+      void changeChapter(dx < 0 ? 1 : -1);
+    }
+  }
+
+  function handleReaderTouchCancel() {
+    touchStartRef.current = null;
+    readerTouchActiveRef.current = false;
+    handlePagedScroll();
+  }
+
+  function handlePagedScroll() {
+    if (preferences.pageMode !== "paged" || readerTouchActiveRef.current) return;
+    if (pageSnapTimerRef.current !== null) window.clearTimeout(pageSnapTimerRef.current);
+    pageSnapTimerRef.current = window.setTimeout(() => {
+      pageSnapTimerRef.current = null;
+      const paper = readingPaperRef.current;
+      if (!paper) return;
+      const step = Math.max(1, paper.clientWidth);
+      const maxScrollLeft = Math.max(0, paper.scrollWidth - paper.clientWidth);
+      const regularTarget = Math.min(maxScrollLeft, Math.max(0, Math.round(paper.scrollLeft / step) * step));
+      const target = Math.abs(maxScrollLeft - paper.scrollLeft) < Math.abs(regularTarget - paper.scrollLeft)
+        ? maxScrollLeft
+        : regularTarget;
+      if (Math.abs(paper.scrollLeft - target) > 1) paper.scrollTo({ left: target, behavior: "auto" });
+    }, 120);
+  }
+
+  function handlePagedWheel(event: React.WheelEvent<HTMLElement>) {
+    if (preferences.pageMode !== "paged") return;
+    const horizontalDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) * 0.7
+      ? event.deltaX
+      : event.shiftKey
+        ? event.deltaY
+        : 0;
+    if (Math.abs(horizontalDelta) < 12) return;
+    event.preventDefault();
+    const now = Date.now();
+    if (now < pageWheelLockUntilRef.current) return;
+    pageWheelLockUntilRef.current = now + 420;
+    void changePageOrChapter(horizontalDelta > 0 ? 1 : -1);
   }
 
   function handleReaderTap(event: React.MouseEvent<HTMLElement>) {
@@ -1372,6 +1503,13 @@ export function ReaderShell() {
         refresh,
         (batch) => {
           if (batch.length) sourceCandidatesForRef.current = reader.book.bookUrl;
+          const borrowedCover = batch.find((candidate) => !candidate.sourceValidating && candidate.coverUrl)?.coverUrl;
+          if (!reader.book.customCoverUrl && !reader.book.coverUrl && borrowedCover) {
+            const updatedBook = { ...reader.book, coverUrl: borrowedCover };
+            setReader((current) => current ? { ...current, book: updatedBook } : current);
+            setBooks((current) => current.map((book) => book.bookUrl === reader.book.bookUrl ? updatedBook : book));
+            void api.saveBook(updatedBook).catch(() => undefined);
+          }
           setSourceCandidates(() => {
             const merged = new Map<string, Book>();
             for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
@@ -1855,8 +1993,22 @@ export function ReaderShell() {
     setInstallPrompt(null);
   }
 
+  function applyAppTheme(next: AppTheme) {
+    setAppTheme(next);
+    setPreferences((current) => ({
+      ...current,
+      theme: next === "system" ? "system" : next === "dark" ? "night" : "paper",
+    }));
+  }
+
+  function applyReaderTheme(next: ReaderPreferences["theme"]) {
+    setPreferences((current) => ({ ...current, theme: next }));
+    setAppTheme(next === "system" ? "system" : next === "night" ? "dark" : "light");
+  }
+
   function toggleAppTheme() {
-    setAppTheme(resolvedAppTheme === "dark" ? "light" : "dark");
+    const next = appTheme === "system" ? "light" : appTheme === "light" ? "dark" : "system";
+    applyAppTheme(next);
   }
 
   function changeView(next: ViewName) {
@@ -1877,9 +2029,9 @@ export function ReaderShell() {
     return (
       <main className="auth-shell">
         <div className="auth-theme-switch" aria-label="外观模式">
-          <button className={appTheme === "system" ? "active" : ""} onClick={() => setAppTheme("system")}>自动</button>
-          <button className={appTheme === "light" ? "active" : ""} onClick={() => setAppTheme("light")}>浅色</button>
-          <button className={appTheme === "dark" ? "active" : ""} onClick={() => setAppTheme("dark")}>深色</button>
+          <button className={appTheme === "system" ? "active" : ""} onClick={() => applyAppTheme("system")}>自动</button>
+          <button className={appTheme === "light" ? "active" : ""} onClick={() => applyAppTheme("light")}>浅色</button>
+          <button className={appTheme === "dark" ? "active" : ""} onClick={() => applyAppTheme("dark")}>深色</button>
         </div>
         <section className="auth-panel">
           <div className="auth-card">
@@ -1916,15 +2068,15 @@ export function ReaderShell() {
           {navigation.map((item) => (
             <button
               key={item.id}
-              className={view === item.id ? "nav-item active" : "nav-item"}
+              className={view === item.id && !(item.id === "library" && libraryTab === "admin") ? "nav-item active" : "nav-item"}
               onClick={() => changeView(item.id)}
-              aria-current={view === item.id ? "page" : undefined}
+              aria-current={view === item.id && !(item.id === "library" && libraryTab === "admin") ? "page" : undefined}
             >
               <span className="nav-icon" aria-hidden="true"><AppIcon name={item.icon} /></span>
               <span>{item.label}</span>
             </button>
           ))}
-          {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "nav-item active" : "nav-item"} onClick={openAdmin}><span className="nav-icon" aria-hidden="true"><AppIcon name="admin" /></span><span>后台</span></button>}
+          {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "nav-item active" : "nav-item"} aria-current={view === "library" && libraryTab === "admin" ? "page" : undefined} onClick={openAdmin}><span className="nav-icon" aria-hidden="true"><AppIcon name="admin" /></span><span>后台</span></button>}
         </nav>
 
         <div className="sidebar-bottom">
@@ -1960,7 +2112,7 @@ export function ReaderShell() {
             <kbd>⌘ K</kbd>
           </form>
           <div className="topbar-actions">
-            <button className="icon-button" onClick={toggleAppTheme} aria-label={resolvedAppTheme === "dark" ? "切换浅色模式" : "切换深色模式"}>{resolvedAppTheme === "dark" ? "☀" : "☾"}</button>
+            <button className="icon-button theme-cycle-button" onClick={toggleAppTheme} aria-label={`当前${appTheme === "system" ? "自动" : appTheme === "light" ? "浅色" : "深色"}模式，点击切换`} title="外观：自动 → 浅色 → 深色"><span aria-hidden="true">{appTheme === "system" ? "◐" : appTheme === "light" ? "☀" : "☾"}</span></button>
             <button className="icon-button" onClick={() => setShowConnect(true)} aria-label="账户设置"><AppIcon name="user" /></button>
             <button className="primary-button" onClick={() => setView("discover")}>＋ 添加书籍</button>
           </div>
@@ -1979,7 +2131,7 @@ export function ReaderShell() {
               </section>
 
               {primaryBook ? <section className="continue-card">
-                <div className="continue-cover" style={coverStyle(primaryBook)}>
+                <div className="continue-cover" style={coverStyle(primaryBook, true)}>
                   <span>{firstLetter(primaryBook.name)}</span>
                   <small>{primaryBook.author}</small>
                 </div>
@@ -2014,7 +2166,7 @@ export function ReaderShell() {
                 <div className="book-grid">
                   {shownBooks.map((book, index) => (
                     <article className="book-card" key={book.bookUrl}>
-                      <button className={book.customCoverUrl || book.coverUrl ? "book-cover has-cover" : "book-cover"} style={coverStyle(book)} onClick={() => openBook(book)} aria-label={`阅读 ${book.name}`}>
+                      <button className={book.customCoverUrl || book.coverUrl ? "book-cover has-cover" : "book-cover"} style={coverStyle(book, true)} onClick={() => openBook(book)} aria-label={`阅读 ${book.name}`}>
                         <span className="cover-index">{String(index + 1).padStart(2, "0")}</span>
                         <strong>{book.name}</strong>
                         <small>{book.author}</small>
@@ -2150,7 +2302,7 @@ export function ReaderShell() {
                   <div className="library-list">
                     {books.map((book) => (
                       <article className="library-row" key={`library-${book.bookUrl}`}>
-                        <span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span>
+                        <span className="tiny-cover" style={coverStyle(book, true)}>{firstLetter(book.name)}</span>
                         <div><strong>{book.name}</strong><small>{book.author} · {book.local || book.origin?.startsWith("local") ? "本地文件" : book.originName || "网络书籍"}</small></div>
                         <select value={book.group || 0} onChange={(event) => moveBookToGroup(book, Number(event.target.value))} aria-label={`移动 ${book.name} 到分组`}><option value="0">未分组</option>{groups.map((group) => <option key={group.groupId} value={group.groupId}>{group.groupName}</option>)}</select>
                         <div className="row-actions"><button className="text-button" onClick={() => openBook(book)}>阅读</button>{(book.local || book.bookUrl.startsWith("local-")) && <button className="text-button" onClick={() => exportLocalBook(book)}>导出</button>}<button className="text-button danger-text" onClick={() => removeBook(book)}>删除</button></div>
@@ -2240,7 +2392,7 @@ export function ReaderShell() {
                     {books.map((book) => {
                       const status = offlineStatus[book.bookUrl];
                       const downloading = offlineDownload?.bookUrl === book.bookUrl;
-                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `当前设备已缓存 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "当前设备尚未缓存"}</small></div><div className="cache-actions"><button onClick={() => downloading ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button></div></article>;
+                      return <article className="cache-book-row" key={`cache-${book.bookUrl}`}><span className="tiny-cover" style={coverStyle(book, true)}>{firstLetter(book.name)}</span><div><strong>{book.name}</strong><small>{status?.cachedChapters ? `当前设备已缓存 ${status.cachedChapters}/${status.totalChapters || "?"} 章` : "当前设备尚未缓存"}</small></div><div className="cache-actions"><button onClick={() => downloading ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(book)}>{downloading ? `停止 ${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存章节"}</button></div></article>;
                     })}
                   </div>
                 </section>
@@ -2266,11 +2418,11 @@ export function ReaderShell() {
 
       <nav className={adminAuthorized ? "mobile-nav has-admin" : "mobile-nav"} aria-label="移动端导航">
         {navigation.map((item) => (
-          <button key={`mobile-${item.id}`} className={view === item.id ? "active" : ""} onClick={() => changeView(item.id)}>
+          <button key={`mobile-${item.id}`} className={view === item.id && !(item.id === "library" && libraryTab === "admin") ? "active" : ""} onClick={() => changeView(item.id)}>
             <span><AppIcon name={item.icon} /></span><small>{item.label}</small>
           </button>
         ))}
-        {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "active" : ""} onClick={openAdmin}><span><AppIcon name="admin" /></span><small>后台</small></button>}
+        {adminAuthorized && <button className={view === "library" && libraryTab === "admin" ? "active" : ""} aria-current={view === "library" && libraryTab === "admin" ? "page" : undefined} onClick={openAdmin}><span><AppIcon name="admin" /></span><small>后台</small></button>}
       </nav>
 
       {offlinePickerBook && (
@@ -2293,7 +2445,7 @@ export function ReaderShell() {
           <section className="modal connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title">
             <button className="modal-close" onClick={() => setShowConnect(false)} aria-label="关闭">×</button>
             <h2 id="connect-title">{profile.username || "我的阅读"}</h2>
-            <div className="account-setting"><span>外观</span><div className="segmented"><button className={appTheme === "system" ? "active" : ""} onClick={() => setAppTheme("system")}>自动</button><button className={appTheme === "light" ? "active" : ""} onClick={() => setAppTheme("light")}>浅色</button><button className={appTheme === "dark" ? "active" : ""} onClick={() => setAppTheme("dark")}>深色</button></div></div>
+            <div className="account-setting"><span>外观</span><div className="segmented"><button className={appTheme === "system" ? "active" : ""} onClick={() => applyAppTheme("system")}>自动</button><button className={appTheme === "light" ? "active" : ""} onClick={() => applyAppTheme("light")}>浅色</button><button className={appTheme === "dark" ? "active" : ""} onClick={() => applyAppTheme("dark")}>深色</button></div></div>
             <div className="account-setting"><span>分类发现</span><div className="segmented"><button className={!exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(false)}>关闭</button><button className={exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(true)} disabled={!hasExploreSources}>开启</button></div></div>
             <button className="quiet-button full-button" onClick={installApp}>安装到设备</button>
             <button className="quiet-button full-button" onClick={() => { setShowConnect(false); setView("library"); setLibraryTab("admin"); }}>修改密码与账户设置</button>
@@ -2351,7 +2503,7 @@ export function ReaderShell() {
       )}
 
       {reader && (
-        <section ref={readerOverlayRef} className={`reader-overlay reader-mode-${preferences.pageMode} reader-theme-${resolvedReaderTheme} ${readerChrome ? "" : "chrome-hidden"}`} onTouchStart={handleReaderTouchStart} onTouchEnd={handleReaderTouchEnd} style={{ "--reader-font-size": `${preferences.fontSize}px`, "--reader-line-height": preferences.lineHeight, "--reader-width": `${preferences.contentWidth}px` } as CSSProperties}>
+        <section ref={readerOverlayRef} className={`reader-overlay reader-mode-${preferences.pageMode} reader-theme-${resolvedReaderTheme} ${readerChrome ? "" : "chrome-hidden"}`} onTouchStart={handleReaderTouchStart} onTouchEnd={handleReaderTouchEnd} onTouchCancel={handleReaderTouchCancel} style={{ "--reader-font-size": `${preferences.fontSize}px`, "--reader-line-height": preferences.lineHeight, "--reader-width": `${preferences.contentWidth}px` } as CSSProperties}>
           <div ref={readerTopRef} />
           <header className="reader-bar">
             <button className="reader-back" onClick={exitReader} aria-label="返回书架">←</button>
@@ -2371,7 +2523,7 @@ export function ReaderShell() {
               {readerSourceType === 0 && <button onClick={() => { setReaderMenuOpen(false); setShowChapterSearch(true); }}>查找正文</button>}
             </div>}
           </header>
-          <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap}>
+          <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap} onScroll={handlePagedScroll} onWheel={handlePagedWheel}>
             <p className="chapter-kicker">第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</p>
             <h1>{currentChapter?.title}</h1>
             <p className="chapter-book">{reader.book.name} · {reader.book.author}</p>
@@ -2410,7 +2562,7 @@ export function ReaderShell() {
               <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "system" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "system" })}>系统</button><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "serif" })}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "sans" })}>黑体</button></div></div>
               <div className="setting-group"><span>翻页</span><div className="segmented"><button className={preferences.pageMode === "scroll" ? "active" : ""} onClick={() => updateReaderPreference({ pageMode: "scroll" })}>上下滚动</button><button className={preferences.pageMode === "paged" ? "active" : ""} onClick={() => updateReaderPreference({ pageMode: "paged" })}>左右翻页</button></div></div>
               <div className="setting-group"><span>文字</span><div className="segmented"><button className={preferences.chineseMode === "original" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "original" }))}>原文</button><button className={preferences.chineseMode === "simplified" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "simplified" }))}>简体</button><button className={preferences.chineseMode === "traditional" ? "active" : ""} onClick={() => setPreferences((current) => ({ ...current, chineseMode: "traditional" }))}>繁体</button></div></div>
-              <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => setPreferences((current) => ({ ...current, theme: "system" }))}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => setPreferences((current) => ({ ...current, theme: "paper" }))}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => setPreferences((current) => ({ ...current, theme: "green" }))}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => setPreferences((current) => ({ ...current, theme: "night" }))}>夜间</button></div></div>
+              <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => applyReaderTheme("system")}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => applyReaderTheme("paper")}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => applyReaderTheme("green")}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => applyReaderTheme("night")}>夜间</button></div></div>
             </aside>
           )}
           {showSourceSwitch && (
@@ -2434,7 +2586,7 @@ export function ReaderShell() {
 
       {articleSession && (
         <section className={`reader-overlay article-overlay reader-theme-${resolvedReaderTheme}`} style={{ "--reader-font-size": `${preferences.fontSize}px`, "--reader-line-height": preferences.lineHeight, "--reader-width": `${preferences.contentWidth}px` } as CSSProperties}>
-          <header className="reader-bar"><button onClick={() => setArticleSession(null)} aria-label="退出文章阅读">←</button><div><strong>{selectedRssSource?.sourceName || "RSS 阅读"}</strong><small>{articleSession.article.pubDate || articleSession.article.origin}</small></div><div className="reader-actions"><a href={articleSession.article.link} target="_blank" rel="noreferrer">原文</a><button onClick={() => setShowReaderSettings(true)}>Aa</button></div></header>
+          <header className="reader-bar"><button onClick={() => setArticleSession(null)} aria-label="退出文章阅读">←</button><div><strong>{selectedRssSource?.sourceName || "RSS 阅读"}</strong><small>{articleSession.article.pubDate || articleSession.article.origin}</small></div><div className="reader-actions"><button onClick={() => setShowReaderSettings(true)}>Aa</button></div></header>
           <article className={`reading-paper font-${preferences.fontFamily}`}><p className="chapter-kicker">RSS · {selectedRssSource?.sourceName}</p><h1>{articleSession.article.title}</h1>{articleSession.loading ? <div className="reader-loading"><span /><span /><span /><p>正在整理文章…</p></div> : articleSession.content.split(/\n{2,}/).map((paragraph, index) => <p key={`article-${index}`}>{paragraph}</p>)}</article>
           {showReaderSettings && (
             <aside className="reader-drawer settings-drawer">
@@ -2442,7 +2594,7 @@ export function ReaderShell() {
               <label>字号 <output>{preferences.fontSize}px</output><input type="range" min="12" max="32" value={preferences.fontSize} onChange={(event) => updateReaderPreference({ fontSize: Number(event.target.value) })} /></label>
               <label>行高 <output>{preferences.lineHeight.toFixed(1)}</output><input type="range" min="1.4" max="2.4" step="0.1" value={preferences.lineHeight} onChange={(event) => updateReaderPreference({ lineHeight: Number(event.target.value) })} /></label>
               <div className="setting-group"><span>字体</span><div className="segmented"><button className={preferences.fontFamily === "system" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "system" })}>系统</button><button className={preferences.fontFamily === "serif" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "serif" })}>宋体</button><button className={preferences.fontFamily === "sans" ? "active" : ""} onClick={() => updateReaderPreference({ fontFamily: "sans" })}>黑体</button></div></div>
-              <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => setPreferences((current) => ({ ...current, theme: "system" }))}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => setPreferences((current) => ({ ...current, theme: "paper" }))}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => setPreferences((current) => ({ ...current, theme: "green" }))}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => setPreferences((current) => ({ ...current, theme: "night" }))}>夜间</button></div></div>
+              <div className="setting-group"><span>主题</span><div className="theme-picks"><button className={preferences.theme === "system" ? "active system" : "system"} onClick={() => applyReaderTheme("system")}>自动</button><button className={preferences.theme === "paper" ? "active paper" : "paper"} onClick={() => applyReaderTheme("paper")}>纸张</button><button className={preferences.theme === "green" ? "active green" : "green"} onClick={() => applyReaderTheme("green")}>护眼</button><button className={preferences.theme === "night" ? "active night" : "night"} onClick={() => applyReaderTheme("night")}>夜间</button></div></div>
             </aside>
           )}
           {showReaderSettings && <button className="drawer-scrim" aria-label="关闭文章设置" onClick={() => setShowReaderSettings(false)} />}

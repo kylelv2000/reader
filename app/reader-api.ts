@@ -63,13 +63,16 @@ export class ReaderApi {
   readonly baseUrl: string;
   private cacheNamespace = "anonymous";
   private offlineMode = false;
+  private chapterMemoryCache = new Map<string, string>();
 
   constructor(baseUrl = "") {
     this.baseUrl = normalizeBaseUrl(baseUrl);
   }
 
   setCacheNamespace(username: string) {
-    this.cacheNamespace = username.trim().toLowerCase() || "anonymous";
+    const nextNamespace = username.trim().toLowerCase() || "anonymous";
+    if (nextNamespace !== this.cacheNamespace) this.chapterMemoryCache.clear();
+    this.cacheNamespace = nextNamespace;
   }
 
   setOfflineMode(value: boolean) {
@@ -272,9 +275,20 @@ export class ReaderApi {
 
   async getBookContent(book: Book, chapter: Chapter, index: number, refresh = false, signal?: AbortSignal) {
     const cacheKey = chapterCacheKey(this.cacheScope(), book.bookUrl, index);
+    if (!refresh) {
+      const memoryCached = this.chapterMemoryCache.get(cacheKey);
+      if (memoryCached !== undefined) {
+        this.chapterMemoryCache.delete(cacheKey);
+        this.chapterMemoryCache.set(cacheKey, memoryCached);
+        return memoryCached;
+      }
+    }
     if (this.offlineMode) {
       const cached = await getCachedChapter(cacheKey);
-      if (cached !== undefined) return cached;
+      if (cached !== undefined) {
+        this.rememberChapter(cacheKey, cached);
+        return cached;
+      }
       throw new ReaderApiError("这一章尚未下载到本机");
     }
     try {
@@ -289,12 +303,44 @@ export class ReaderApi {
         }),
         signal,
       });
+      this.rememberChapter(cacheKey, content);
       void putCachedChapter(cacheKey, content);
       return content;
     } catch (error) {
       const cached = await getCachedChapter(cacheKey);
-      if (cached !== undefined) return cached;
+      if (cached !== undefined) {
+        this.rememberChapter(cacheKey, cached);
+        return cached;
+      }
       throw error;
+    }
+  }
+
+  async prefetchBookChapters(
+    book: Book,
+    chapters: Chapter[],
+    startIndex: number,
+    count = 3,
+    signal?: AbortSignal,
+  ) {
+    const endIndex = Math.min(chapters.length, Math.max(0, startIndex) + Math.max(0, count));
+    let nextIndex = Math.max(0, startIndex);
+    const worker = async () => {
+      while (nextIndex < endIndex && !signal?.aborted) {
+        const index = nextIndex++;
+        await this.getBookContent(book, chapters[index], index, false, signal).catch(() => undefined);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, Math.max(0, endIndex - startIndex)) }, worker));
+  }
+
+  private rememberChapter(key: string, content: string) {
+    this.chapterMemoryCache.delete(key);
+    this.chapterMemoryCache.set(key, content);
+    while (this.chapterMemoryCache.size > 12) {
+      const oldest = this.chapterMemoryCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.chapterMemoryCache.delete(oldest);
     }
   }
 
@@ -418,6 +464,7 @@ export class ReaderApi {
     const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
     const url = new URL(`${this.baseUrl}/bookSourceProxy`, isAbsolute ? undefined : origin);
     url.searchParams.set("bookSourceUrl", book.origin);
+    url.searchParams.set("bookUrl", book.bookUrl);
     url.searchParams.set("url", resourceUrl);
     return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
   }

@@ -17,7 +17,7 @@ use crate::util::hash::md5_hex;
 use crate::util::text::{normalize_source_url, repair_encoded_url};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{RwLock, Semaphore};
@@ -39,6 +39,22 @@ struct RateState {
     in_flight: bool,
     last_start: Option<Instant>,
     window_starts: Vec<Instant>,
+}
+
+const COVER_FAILURE_RETRY_SECONDS: i64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BookCoverCacheMeta {
+    content_type: String,
+    source_hash: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BookCoverFailure {
+    source_hash: String,
+    retry_after: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -663,6 +679,19 @@ impl BookService {
             .map_err(|e| AppError::Internal(e.into()))
     }
 
+    pub async fn delete_chapter_cache(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        chapter_url: &str,
+    ) -> Result<(), AppError> {
+        let book_key = md5_hex(book_url);
+        self.cache
+            .remove(user_ns, &book_key, chapter_url)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))
+    }
+
     /// Check if a specific chapter is cached
     pub async fn is_chapter_cached(
         &self,
@@ -968,30 +997,144 @@ impl BookService {
         Ok(())
     }
 
-    pub async fn get_cover(&self, user_ns: &str, url: &str) -> Result<(Vec<u8>, String), AppError> {
+    pub async fn get_or_cache_book_cover(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        source_url: &str,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        if let Some(cached) = self.load_cached_book_cover(user_ns, book_url).await? {
+            return Ok(cached);
+        }
+        let source_hash = md5_hex(source_url);
+        let failure_path = self.book_cover_failure_path(user_ns, book_url);
+        if failure_path.is_file() {
+            if let Ok(data) = fs::read_to_string(&failure_path).await {
+                if let Ok(failure) = serde_json::from_str::<BookCoverFailure>(&data) {
+                    if failure.source_hash == source_hash
+                        && failure.retry_after > chrono::Utc::now().timestamp()
+                    {
+                        return Err(AppError::NotFound(
+                            "cover retry is temporarily paused".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        match self.fetch_cover_source(user_ns, source_url).await {
+            Ok((bytes, content_type)) => {
+                self.store_book_cover(user_ns, book_url, &source_hash, &bytes, &content_type)
+                    .await?;
+                Ok((bytes, content_type))
+            }
+            Err(error) => {
+                let failure = BookCoverFailure {
+                    source_hash,
+                    retry_after: chrono::Utc::now().timestamp() + COVER_FAILURE_RETRY_SECONDS,
+                };
+                if let Some(parent) = failure_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                if let Ok(data) = serde_json::to_vec(&failure) {
+                    let _ = fs::write(failure_path, data).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn load_cached_book_cover(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
+        let data_path = self.book_cover_data_path(user_ns, book_url);
+        let meta_path = self.book_cover_meta_path(user_ns, book_url);
+        if !data_path.is_file() || !meta_path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(data_path)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = fs::read_to_string(meta_path)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = serde_json::from_str::<BookCoverCacheMeta>(&metadata)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        Ok(Some((bytes, metadata.content_type)))
+    }
+
+    pub async fn store_book_cover(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        source_hash: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), AppError> {
+        if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+            return Err(AppError::BadRequest("invalid cover file".to_string()));
+        }
+        let data_path = self.book_cover_data_path(user_ns, book_url);
+        let meta_path = self.book_cover_meta_path(user_ns, book_url);
+        if let Some(parent) = data_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+        }
+        fs::write(&data_path, bytes)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = serde_json::to_vec(&BookCoverCacheMeta {
+            content_type: content_type.to_string(),
+            source_hash: source_hash.to_string(),
+        })
+        .map_err(|error| AppError::Internal(error.into()))?;
+        fs::write(meta_path, metadata)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let failure_path = self.book_cover_failure_path(user_ns, book_url);
+        if failure_path.exists() {
+            let _ = fs::remove_file(failure_path).await;
+        }
+        Ok(())
+    }
+
+    async fn fetch_cover_source(
+        &self,
+        user_ns: &str,
+        url: &str,
+    ) -> Result<(Vec<u8>, String), AppError> {
+        if let Some(relative_path) = legacy_asset_cover_relative_path(user_ns, url) {
+            let asset_root = fs::canonicalize(self.storage_dir.join("assets"))
+                .await
+                .map_err(|_| AppError::NotFound("cover not found".to_string()))?;
+            let path = fs::canonicalize(asset_root.join(relative_path))
+                .await
+                .map_err(|_| AppError::NotFound("cover not found".to_string()))?;
+            if !path.starts_with(&asset_root) {
+                return Err(AppError::BadRequest("unsafe cover path".to_string()));
+            }
+            let metadata = fs::metadata(&path)
+                .await
+                .map_err(|_| AppError::NotFound("cover not found".to_string()))?;
+            if !metadata.is_file() || metadata.len() > 10 * 1024 * 1024 {
+                return Err(AppError::BadRequest("invalid cover file".to_string()));
+            }
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let data = fs::read(&path)
+                .await
+                .map_err(|_| AppError::NotFound("cover not found".to_string()))?;
+            return Ok((data, content_type_from_ext(&ext)));
+        }
         crate::crawler::http_client::ensure_public_url(url)
             .await
             .map_err(|_| AppError::BadRequest("unsafe cover URL".to_string()))?;
         let ext = file_ext_from_url(url).unwrap_or_else(|| "png".to_string());
-        let name = md5_hex(url);
-        let path = self
-            .storage_dir
-            .join("cache")
-            .join(user_ns)
-            .join("cover")
-            .join(format!("{}.{}", name, ext));
-        if path.exists() {
-            let data = fs::read(&path)
-                .await
-                .map_err(|e| AppError::Internal(e.into()))?;
-            let content_type = content_type_from_ext(&ext);
-            return Ok((data, content_type));
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AppError::Internal(e.into()))?;
-        }
 
         // Extract referer from URL for anti-hotlinking bypass
         let referer = url::Url::parse(url).ok().and_then(|u| {
@@ -1000,6 +1143,11 @@ impl BookService {
             Some(format!("{}://{}", scheme, host))
         });
 
+        let _permit = self
+            .outbound_slots
+            .acquire()
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("cover limiter closed")))?;
         let mut req = self.http.client().get(url);
 
         // Add necessary headers to bypass anti-hotlinking
@@ -1032,8 +1180,230 @@ impl BookService {
         if bytes.len() > 10 * 1024 * 1024 {
             return Err(AppError::BadRequest("cover is too large".to_string()));
         }
-        let _ = fs::write(&path, &bytes).await;
+        if !safe_cover_payload(&content_type, &bytes) {
+            return Err(AppError::BadRequest("cover response is not an image".to_string()));
+        }
         Ok((bytes, content_type))
+    }
+
+    fn book_cover_cache_dir(&self, user_ns: &str, book_url: &str) -> PathBuf {
+        self.storage_dir
+            .join("cache")
+            .join(user_ns)
+            .join(md5_hex(book_url))
+    }
+
+    fn book_cover_data_path(&self, user_ns: &str, book_url: &str) -> PathBuf {
+        self.book_cover_cache_dir(user_ns, book_url).join("cover.bin")
+    }
+
+    fn book_cover_meta_path(&self, user_ns: &str, book_url: &str) -> PathBuf {
+        self.book_cover_cache_dir(user_ns, book_url).join("cover.json")
+    }
+
+    fn book_cover_failure_path(&self, user_ns: &str, book_url: &str) -> PathBuf {
+        self.book_cover_cache_dir(user_ns, book_url)
+            .join("cover-miss.json")
+    }
+
+    pub async fn cover_discovery_retry_blocked(&self, user_ns: &str, book_url: &str) -> bool {
+        let path = self
+            .book_cover_cache_dir(user_ns, book_url)
+            .join("cover-discovery-miss.json");
+        let Ok(data) = fs::read_to_string(path).await else {
+            return false;
+        };
+        serde_json::from_str::<BookCoverFailure>(&data)
+            .is_ok_and(|failure| failure.retry_after > chrono::Utc::now().timestamp())
+    }
+
+    pub async fn mark_cover_discovery_failure(&self, user_ns: &str, book_url: &str) {
+        let path = self
+            .book_cover_cache_dir(user_ns, book_url)
+            .join("cover-discovery-miss.json");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        let failure = BookCoverFailure {
+            source_hash: "discovery".to_string(),
+            retry_after: chrono::Utc::now().timestamp() + 24 * 60 * 60,
+        };
+        if let Ok(data) = serde_json::to_vec(&failure) {
+            let _ = fs::write(path, data).await;
+        }
+    }
+
+    pub async fn load_cached_book_resource(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, AppError> {
+        let data_path = self.book_resource_data_path(user_ns, book_url, resource_url);
+        let meta_path = self.book_resource_meta_path(user_ns, book_url, resource_url);
+        if !data_path.is_file() || !meta_path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(data_path)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = fs::read_to_string(meta_path)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = serde_json::from_str::<BookCoverCacheMeta>(&metadata)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        Ok(Some((bytes, metadata.content_type)))
+    }
+
+    pub async fn book_resource_retry_blocked(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> bool {
+        let path = self.book_resource_failure_path(user_ns, book_url, resource_url);
+        let Ok(data) = fs::read_to_string(path).await else {
+            return false;
+        };
+        serde_json::from_str::<BookCoverFailure>(&data)
+            .is_ok_and(|failure| failure.retry_after > chrono::Utc::now().timestamp())
+    }
+
+    pub async fn store_book_resource(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), AppError> {
+        if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
+            return Err(AppError::BadRequest("invalid book resource".to_string()));
+        }
+        let data_path = self.book_resource_data_path(user_ns, book_url, resource_url);
+        let meta_path = self.book_resource_meta_path(user_ns, book_url, resource_url);
+        if let Some(parent) = data_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+        }
+        fs::write(data_path, bytes)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let metadata = serde_json::to_vec(&BookCoverCacheMeta {
+            content_type: content_type.to_string(),
+            source_hash: md5_hex(resource_url),
+        })
+        .map_err(|error| AppError::Internal(error.into()))?;
+        fs::write(meta_path, metadata)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let failure_path = self.book_resource_failure_path(user_ns, book_url, resource_url);
+        if failure_path.exists() {
+            let _ = fs::remove_file(failure_path).await;
+        }
+        Ok(())
+    }
+
+    pub async fn mark_book_resource_failure(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) {
+        let path = self.book_resource_failure_path(user_ns, book_url, resource_url);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        let failure = BookCoverFailure {
+            source_hash: md5_hex(resource_url),
+            retry_after: chrono::Utc::now().timestamp() + COVER_FAILURE_RETRY_SECONDS,
+        };
+        if let Ok(data) = serde_json::to_vec(&failure) {
+            let _ = fs::write(path, data).await;
+        }
+    }
+
+    pub async fn register_book_resources(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let matcher = regex::Regex::new(r#"https?://[^\s\"'<>]+"#)
+            .map_err(|error| AppError::Internal(error.into()))?;
+        let mut seen = HashSet::new();
+        for matched in matcher.find_iter(content).take(512) {
+            let resource_url = matched
+                .as_str()
+                .trim_end_matches(|character| matches!(character, ')' | ']' | ',' | '，' | '。'));
+            if resource_url.is_empty() || !seen.insert(resource_url) {
+                continue;
+            }
+            let path = self.book_resource_allow_path(user_ns, book_url, resource_url);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+            }
+            if !path.exists() {
+                fs::write(path, &[])
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_book_resource_allowed(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> bool {
+        self.book_resource_allow_path(user_ns, book_url, resource_url)
+            .is_file()
+    }
+
+    fn book_resource_cache_base(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> PathBuf {
+        self.book_cover_cache_dir(user_ns, book_url)
+            .join("resources")
+            .join(md5_hex(resource_url))
+    }
+
+    fn book_resource_data_path(&self, user_ns: &str, book_url: &str, resource_url: &str) -> PathBuf {
+        self.book_resource_cache_base(user_ns, book_url, resource_url)
+            .with_extension("bin")
+    }
+
+    fn book_resource_meta_path(&self, user_ns: &str, book_url: &str, resource_url: &str) -> PathBuf {
+        self.book_resource_cache_base(user_ns, book_url, resource_url)
+            .with_extension("json")
+    }
+
+    fn book_resource_failure_path(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> PathBuf {
+        self.book_resource_cache_base(user_ns, book_url, resource_url)
+            .with_extension("miss.json")
+    }
+
+    fn book_resource_allow_path(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        resource_url: &str,
+    ) -> PathBuf {
+        self.book_resource_cache_base(user_ns, book_url, resource_url)
+            .with_extension("allow")
     }
 
     pub async fn load_book_sources_cache(
@@ -2032,6 +2402,54 @@ fn content_type_from_ext(ext: &str) -> String {
     .to_string()
 }
 
+fn legacy_asset_cover_relative_path(user_ns: &str, url: &str) -> Option<PathBuf> {
+    let raw = url.strip_prefix("/assets/")?;
+    let parts = Path::new(raw)
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if parts.len() < 2 {
+        return None;
+    }
+    let is_user_cover = parts.first().is_some_and(|part| part == user_ns)
+        && parts.get(1).is_some_and(|part| part == "covers");
+    let is_legacy_global_cover = parts.first().is_some_and(|part| part == "covers");
+    if !is_user_cover && !is_legacy_global_cover {
+        return None;
+    }
+    let extension = Path::new(parts.last()?)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp") {
+        return None;
+    }
+    Some(parts.into_iter().collect())
+}
+
+fn safe_cover_payload(content_type: &str, bytes: &[u8]) -> bool {
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if content_type == "image/svg+xml" {
+        return false;
+    }
+    if content_type.starts_with("image/") {
+        return true;
+    }
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2063,6 +2481,122 @@ mod tests {
             dur_chapter_title: Some(format!("第{}章", chapter_index + 1)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn legacy_asset_cover_path_is_scoped_and_rejects_traversal() {
+        assert_eq!(
+            legacy_asset_cover_relative_path("admin", "/assets/admin/covers/cover.jpg"),
+            Some(PathBuf::from("admin/covers/cover.jpg")),
+        );
+        assert_eq!(
+            legacy_asset_cover_relative_path("admin", "/assets/covers/legacy.webp"),
+            Some(PathBuf::from("covers/legacy.webp")),
+        );
+        assert_eq!(legacy_asset_cover_relative_path("reader", "/assets/admin/covers/cover.jpg"), None);
+        assert_eq!(legacy_asset_cover_relative_path("admin", "/assets/admin/covers/../secret.jpg"), None);
+        assert_eq!(legacy_asset_cover_relative_path("admin", "/assets/admin/covers/cover.txt"), None);
+    }
+
+    #[tokio::test]
+    async fn book_cover_imports_migrated_asset_into_book_cache_and_deletes_with_book() {
+        let (service, storage_dir) = test_book_service("legacy-local-cover");
+        let cover_dir = storage_dir.join("assets/admin/covers");
+        tokio::fs::create_dir_all(&cover_dir).await.unwrap();
+        tokio::fs::write(cover_dir.join("cover.jpg"), b"jpeg-bytes").await.unwrap();
+        let book_url = "https://book.example/cover";
+
+        let (bytes, content_type) = service
+            .get_or_cache_book_cover(
+                "admin",
+                book_url,
+                "/assets/admin/covers/cover.jpg",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"jpeg-bytes");
+        assert_eq!(content_type, "image/jpeg");
+        assert!(service
+            .book_cover_data_path("admin", book_url)
+            .is_file());
+        service.delete_book_cache("admin", book_url).await.unwrap();
+        assert!(!service.book_cover_cache_dir("admin", book_url).exists());
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+    }
+
+    #[tokio::test]
+    async fn failed_book_cover_uses_negative_cache() {
+        let (service, storage_dir) = test_book_service("cover-negative-cache");
+        let book_url = "https://book.example/missing-cover";
+        let source_url = "/assets/admin/covers/missing.jpg";
+
+        assert!(service
+            .get_or_cache_book_cover("admin", book_url, source_url)
+            .await
+            .is_err());
+        assert!(service
+            .book_cover_failure_path("admin", book_url)
+            .is_file());
+        let second = service
+            .get_or_cache_book_cover("admin", book_url, source_url)
+            .await
+            .unwrap_err();
+
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+        assert!(format!("{second:?}").contains("temporarily paused"));
+    }
+
+    #[tokio::test]
+    async fn book_resource_cache_is_scoped_to_book_and_removed_with_it() {
+        let (service, storage_dir) = test_book_service("book-resource-cache");
+        let book_url = "https://book.example/comic";
+        let resource_url = "https://cdn.example/page-1.webp";
+
+        service
+            .register_book_resources(
+                "reader",
+                book_url,
+                &format!("本章图片：{resource_url}"),
+            )
+            .await
+            .unwrap();
+        assert!(service.is_book_resource_allowed("reader", book_url, resource_url));
+        assert!(!service.is_book_resource_allowed(
+            "reader",
+            book_url,
+            "https://evil.example/not-in-content.webp",
+        ));
+        service
+            .store_book_resource(
+                "reader",
+                book_url,
+                resource_url,
+                b"image-bytes",
+                "image/webp",
+            )
+            .await
+            .unwrap();
+        let cached = service
+            .load_cached_book_resource("reader", book_url, resource_url)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cached.0, b"image-bytes");
+        assert_eq!(cached.1, "image/webp");
+        assert!(service
+            .load_cached_book_resource("other-reader", book_url, resource_url)
+            .await
+            .unwrap()
+            .is_none());
+        service.delete_book_cache("reader", book_url).await.unwrap();
+        assert!(service
+            .load_cached_book_resource("reader", book_url, resource_url)
+            .await
+            .unwrap()
+            .is_none());
+        let _ = tokio::fs::remove_dir_all(&storage_dir).await;
     }
 
     #[tokio::test]

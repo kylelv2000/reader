@@ -8,7 +8,10 @@ use serde_json::Value;
 
 use crate::error::error::{ApiResponse, AppError};
 use crate::model::rss::{RssArticle, RssSource};
+use crate::util::hash::md5_hex;
 use crate::util::time::now_ts;
+use std::path::PathBuf;
+use tokio::fs;
 
 #[derive(Debug, Deserialize)]
 pub struct RemoteRssSourceParam {
@@ -111,6 +114,7 @@ pub async fn delete_rss_source(
     let mut list = read_list::<RssSource>(&state, &user_ns, "rssSources.json").await?;
     list.retain(|s| s.source_url != source.source_url);
     write_list(&state, &user_ns, "rssSources.json", &list).await?;
+    clear_rss_cache(&state, &user_ns).await;
     Ok(Json(ApiResponse::ok(Value::String("".to_string()))))
 }
 
@@ -129,6 +133,7 @@ pub async fn delete_rss_sources(
     let mut list = read_list::<RssSource>(&state, &user_ns, "rssSources.json").await?;
     let deleted = remove_rss_sources_by_url(&mut list, &sources);
     write_list(&state, &user_ns, "rssSources.json", &list).await?;
+    clear_rss_cache(&state, &user_ns).await;
     Ok(Json(ApiResponse::ok(
         serde_json::json!({ "deleted": deleted }),
     )))
@@ -242,18 +247,10 @@ pub async fn get_rss_articles(
         .into_iter()
         .find(|s| s.source_url == source_url)
         .ok_or_else(|| AppError::BadRequest("RSS源不存在".to_string()))?;
-
-    let res = state
-        .book_service
-        .http_client()
-        .get(&sort_url)
-        .send()
+    ensure_public_url(&sort_url)
         .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+        .map_err(|_| AppError::BadRequest("unsafe RSS feed URL".to_string()))?;
+    let bytes = cached_rss_bytes(&state, &user_ns, "feeds", &sort_url, 10 * 60, 30 * 60, 4 * 1024 * 1024).await?;
     let feed =
         feed_rs::parser::parse(&bytes[..]).map_err(|e| AppError::BadRequest(e.to_string()))?;
 
@@ -345,15 +342,123 @@ pub async fn get_rss_content(
         .find(|s| s.source_url == source_url)
         .ok_or_else(|| AppError::BadRequest("RSS源不存在".to_string()))?;
 
-    let res = state
-        .book_service
-        .http_client()
-        .get(&link)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(e.into()))?;
-    let body = res.text().await.map_err(|e| AppError::Internal(e.into()))?;
+    let bytes = cached_rss_bytes(
+        &state,
+        &user_ns,
+        "articles",
+        &link,
+        24 * 60 * 60,
+        60 * 60,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    let body = String::from_utf8_lossy(&bytes).to_string();
     Ok(Json(ApiResponse::ok(Value::String(body))))
+}
+
+fn rss_cache_path(state: &AppState, user_ns: &str, kind: &str, url: &str) -> PathBuf {
+    PathBuf::from(&state.config.storage_dir)
+        .join("cache")
+        .join(user_ns)
+        .join("rss")
+        .join(kind)
+        .join(md5_hex(url))
+}
+
+async fn cached_rss_bytes(
+    state: &AppState,
+    user_ns: &str,
+    kind: &str,
+    url: &str,
+    fresh_seconds: u64,
+    retry_seconds: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    let path = rss_cache_path(state, user_ns, kind, url).with_extension("bin");
+    let miss_path = rss_cache_path(state, user_ns, kind, url).with_extension("miss");
+    if file_is_fresh(&path, fresh_seconds).await {
+        return fs::read(path)
+            .await
+            .map_err(|error| AppError::Internal(error.into()));
+    }
+    if file_is_fresh(&miss_path, retry_seconds).await {
+        if path.is_file() {
+            return fs::read(path)
+                .await
+                .map_err(|error| AppError::Internal(error.into()));
+        }
+        return Err(AppError::NotFound(
+            "RSS remote retry is temporarily paused".to_string(),
+        ));
+    }
+    let response = state.book_service.http_client().get(url).send().await;
+    let result = match response {
+        Ok(response) if response.status().is_success() => {
+            if response
+                .content_length()
+                .is_some_and(|size| size > max_bytes as u64)
+            {
+                Err(AppError::BadRequest("RSS response is too large".to_string()))
+            } else {
+                match response.bytes().await {
+                    Ok(bytes) if bytes.len() <= max_bytes => Ok(bytes.to_vec()),
+                    Ok(_) => Err(AppError::BadRequest("RSS response is too large".to_string())),
+                    Err(error) => Err(AppError::Internal(error.into())),
+                }
+            }
+        }
+        Ok(_) => Err(AppError::NotFound("RSS remote content not found".to_string())),
+        Err(error) => Err(AppError::Internal(error.into())),
+    };
+    match result {
+        Ok(bytes) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?;
+            }
+            fs::write(&path, &bytes)
+                .await
+                .map_err(|error| AppError::Internal(error.into()))?;
+            if miss_path.exists() {
+                let _ = fs::remove_file(miss_path).await;
+            }
+            Ok(bytes)
+        }
+        Err(error) => {
+            if let Some(parent) = miss_path.parent() {
+                let _ = fs::create_dir_all(parent).await;
+            }
+            let _ = fs::write(&miss_path, &[]).await;
+            if path.is_file() {
+                fs::read(path)
+                    .await
+                    .map_err(|read_error| AppError::Internal(read_error.into()))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn file_is_fresh(path: &std::path::Path, max_age_seconds: u64) -> bool {
+    let Ok(metadata) = fs::metadata(path).await else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified.elapsed().is_ok_and(|age| age.as_secs() <= max_age_seconds)
+}
+
+async fn clear_rss_cache(state: &AppState, user_ns: &str) {
+    let path = PathBuf::from(&state.config.storage_dir)
+        .join("cache")
+        .join(user_ns)
+        .join("rss");
+    if path.exists() {
+        let _ = fs::remove_dir_all(path).await;
+    }
 }
 
 async fn resolve_user_ns(

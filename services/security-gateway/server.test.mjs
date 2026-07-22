@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isAllowedOrigin, openSession, parseCookies, redactSensitive, sanitizeProxyUrl, sealSession } from "./server.mjs";
+import { applySecurityHeaders, isAllowedOrigin, openSession, parseCookies, redactSensitive, sanitizeProxyUrl, sealSession } from "./server.mjs";
 
 const secret = "test-secret-that-is-longer-than-thirty-two-characters";
 
@@ -39,4 +39,14 @@ test("removes credentials recursively from account responses", () => {
     userInfo: { username: "alice" },
     users: [{ username: "bob", enableWebdav: false }],
   });
+});
+
+test("browser policy blocks direct source images and media", () => {
+  const headers = new Map();
+  applySecurityHeaders({ setHeader: (name, value) => headers.set(name, value) }, true);
+  const policy = headers.get("content-security-policy");
+  assert.match(policy, /img-src 'self' data:/);
+  assert.match(policy, /media-src 'self' data: blob:/);
+  assert.doesNotMatch(policy, /img-src[^;]*https:/);
+  assert.match(policy, /connect-src 'self'/);
 });

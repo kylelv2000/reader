@@ -2383,6 +2383,7 @@ textarea:focus-visible {
   column-fill: auto;
   column-gap: calc(100vw - var(--reader-page-width));
   column-width: var(--reader-page-width);
+  scroll-snap-type: x mandatory;
   scrollbar-width: none;
 }
 

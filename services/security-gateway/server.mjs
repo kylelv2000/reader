@@ -15,7 +15,7 @@ const sessionCookieName = "yomu_session";
 const csrfCookieName = "yomu_csrf";
 const loginAttempts = new Map();
 
-function applySecurityHeaders(response, appShell = false) {
+export function applySecurityHeaders(response, appShell = false) {
   response.setHeader("x-content-type-options", "nosniff");
   response.setHeader("referrer-policy", "no-referrer");
   response.setHeader("permissions-policy", "camera=(), microphone=(), geolocation=()");
@@ -24,7 +24,7 @@ function applySecurityHeaders(response, appShell = false) {
   response.setHeader("x-frame-options", "DENY");
   if (secureCookies) response.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
   if (appShell) {
-    response.setHeader("content-security-policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'");
+    response.setHeader("content-security-policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'");
   }
 }
 
