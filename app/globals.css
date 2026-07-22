@@ -1169,6 +1169,12 @@ textarea:focus-visible {
   color: #9a9b94;
 }
 
+.on-shelf {
+  opacity: 0.6;
+  pointer-events: none;
+  font-size: 12px;
+}
+
 .split-intro {
   max-width: none;
 }

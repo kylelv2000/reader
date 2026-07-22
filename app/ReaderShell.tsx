@@ -224,6 +224,13 @@ function latestChapterFor(book: Book) {
   return book.latestChapterTitle || book.lastChapter || "";
 }
 
+function cleanKind(raw?: string): string {
+  if (!raw) return "";
+  // Filter out unparsed rule syntax like "$.category&&9.2分"
+  if (/^\$[.[]|&&|\|\|/.test(raw)) return "";
+  return raw.replace(/\s+/g, " ").trim();
+}
+
 function mediaUrls(content: string) {
   const matches = content.match(/https?:\/\/[^\s"'<>]+/gi) || [];
   return [...new Set(matches.map((url) => url.replace(/[),，。]+$/, "")))];
@@ -383,7 +390,6 @@ export function ReaderShell() {
   const [offlinePickerBook, setOfflinePickerBook] = useState<Book | null>(null);
   const [coverPickerBook, setCoverPickerBook] = useState<Book | null>(null);
   const [coverCandidates, setCoverCandidates] = useState<Book[]>([]);
-  const [coverDraft, setCoverDraft] = useState("");
   const [coverScanning, setCoverScanning] = useState(false);
   const [coverSaving, setCoverSaving] = useState(false);
   const [coverPickerError, setCoverPickerError] = useState("");
@@ -1776,7 +1782,6 @@ export function ReaderShell() {
     coverScanAbortRef.current?.abort();
     setCoverPickerBook(book);
     setCoverCandidates([]);
-    setCoverDraft(book.customCoverUrl || book.coverUrl || "");
     setCoverPickerError("");
     setCoverScanning(false);
     setCoverSaving(false);
@@ -2288,23 +2293,30 @@ export function ReaderShell() {
                 <form className="hero-search" onSubmit={searchBooks}>
                   <span aria-hidden="true">⌕</span>
                   <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入书名或作者，例如：三体" aria-label="跨书源搜索" />
-                  <button disabled={searching}>{searching ? "搜索中…" : "搜索"}</button>
+                  {searching
+                    ? <button type="button" onClick={() => { searchAbortRef.current?.abort(); searchAbortRef.current = null; setSearching(false); }}>停止</button>
+                    : <button>搜索</button>}
                 </form>
                 {!searchResults.length && !searching && <div className="empty-state compact"><span>输入书名或作者开始搜索</span></div>}
               </> : <div className="explore-categories">{[["mixed", "综合"], ["rank", "排行"], ["new", "新书"], ["finished", "完本"], ["fantasy", "玄幻"], ["urban", "都市"], ["history", "历史"], ["sci-fi", "科幻"], ["suspense", "悬疑"]].map(([key, label]) => <button key={key} className={exploreCategory === key ? "active" : ""} onClick={() => exploreBooks(key)}>{label}</button>)}</div>}
               <section className="search-results">
-                {(discoverMode === "explore" ? exploreResults : searchResults).map((book) => (
-                  <article className="result-card" key={`result-${book.bookUrl}`}>
-                    <div className="result-cover" style={coverStyle(book)}>{firstLetter(book.name)}</div>
-                    <div>
-                      <span className="source-chip">{book.originName || "聚合结果"}</span>
-                      <h2>{book.name}</h2>
-                      <p>{book.author} · {book.kind || "网络文学"}</p>
-                      <small>{latestChapterFor(book) || "目录可用"}</small>
-                    </div>
-                    <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>
-                  </article>
-                ))}
+                {(discoverMode === "explore" ? exploreResults : searchResults).map((book) => {
+                  const onShelf = books.some((b) => b.name.trim() === book.name.trim() && b.author.trim() === book.author.trim());
+                  const kind = cleanKind(book.kind);
+                  const sourceCount = book.bookSourceUrls?.length || 1;
+                  return (
+                    <article className="result-card" key={`result-${book.bookUrl}`}>
+                      <div className="result-cover" style={coverStyle(book)}>{firstLetter(book.name)}</div>
+                      <div>
+                        <span className="source-chip">{sourceCount > 1 ? `${sourceCount} 个书源` : book.originName || "聚合结果"}</span>
+                        <h2>{book.name}</h2>
+                        <p>{book.author}{kind ? ` · ${kind}` : ""}</p>
+                        <small>{latestChapterFor(book) || (book.totalChapterNum ? `共 ${book.totalChapterNum} 章` : "")}</small>
+                      </div>
+                      {onShelf ? <span className="quiet-button on-shelf">已在书架</span> : <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>}
+                    </article>
+                  );
+                })}
               </section>
               {discoverMode === "explore" && exploreHasMore && <button className="load-more" disabled={searching} onClick={() => exploreBooks(exploreCategory, true)}>{searching ? "正在加载…" : "继续探索"}</button>}
             </div>
@@ -2538,25 +2550,20 @@ export function ReaderShell() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCoverPicker()}>
           <section className="modal cover-picker" role="dialog" aria-modal="true" aria-labelledby="cover-picker-title">
             <button className="modal-close" onClick={closeCoverPicker} aria-label="关闭">×</button>
-            <p className="eyebrow">服务器封面</p>
             <h2 id="cover-picker-title">更换《{coverPickerBook.name}》封面</h2>
             <div className="cover-picker-current">
               <span className="cover-preview-image" role="img" aria-label="当前封面" style={{ backgroundImage: `url("/reader3/cover?bookUrl=${encodeURIComponent(coverPickerBook.bookUrl)}&v=${encodeURIComponent(coverPickerBook.customCoverUrl || coverPickerBook.coverUrl || "auto")}")` }} />
-              <div><strong>当前封面</strong><small>{coverPickerBook.customCoverUrl ? "手动设置" : coverPickerBook.coverUrl ? `来自 ${sourceNameFor(coverPickerBook)}` : "自动匹配中"}</small><button className="text-button" disabled={coverSaving} onClick={() => void applyBookCover()}>恢复自动匹配</button></div>
+              <div><strong>当前封面</strong><small>{coverPickerBook.customCoverUrl ? "手动设置" : `来自 ${sourceNameFor(coverPickerBook)}`}</small></div>
             </div>
-            <form className="cover-url-form" onSubmit={(event) => { event.preventDefault(); void applyBookCover(coverDraft); }}>
-              <label>图片地址<input type="url" value={coverDraft} onChange={(event) => setCoverDraft(event.target.value)} placeholder="https://example.com/cover.jpg" required /></label>
-              <button className="primary-button" disabled={coverSaving}>{coverSaving ? "正在保存…" : "使用这个封面"}</button>
-            </form>
-            <div className="cover-picker-divider"><span>或者从精确匹配书源选择</span><button className="quiet-button" disabled={coverScanning || coverSaving} onClick={() => void scanCoverCandidates(Boolean(coverCandidates.length))}>{coverScanning ? "正在扫描…" : coverCandidates.length ? "重新扫描" : "扫描候选封面"}</button></div>
+            <div className="cover-picker-divider"><span>从匹配书源选择新封面</span>{coverScanning ? <button className="quiet-button" onClick={() => { coverScanAbortRef.current?.abort(); setCoverScanning(false); }}>停止</button> : <button className="quiet-button" disabled={coverSaving} onClick={() => void scanCoverCandidates(Boolean(coverCandidates.length))}>{coverCandidates.length ? "重新扫描" : "扫描候选封面"}</button>}</div>
             {coverPickerError && <p className="cover-picker-error" role="alert">{coverPickerError}</p>}
             {coverCandidates.length > 0 && <div className="cover-candidate-grid">
               {coverCandidates.map((candidate) => <button key={`${candidate.origin}-${candidate.bookUrl}-${candidate.coverUrl}`} disabled={coverSaving} onClick={() => void applyBookCover(candidate.coverUrl)}>
                 <i className="cover-candidate-image" role="img" aria-label={`${sourceNameFor(candidate)} 封面候选`} style={{ backgroundImage: `url("${api.getBookCoverCandidateUrl(coverPickerBook.bookUrl, candidate.coverUrl || "")}")` }} />
-                <span><strong>{sourceNameFor(candidate)}</strong><small>{latestChapterFor(candidate) || "目录可用"}</small></span>
+                <span><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `${candidate.totalChapterNum} 章` : ""}</small></span>
               </button>)}
             </div>}
-            <p className="drawer-note">候选图与手动地址都由服务器下载、校验并保存；浏览器不会直接连接图片站点。</p>
+            <p className="drawer-note">封面由服务器下载并缓存，浏览器不直接连接图片站点。</p>
           </section>
         </div>
       )}

@@ -20,6 +20,7 @@ export interface Book {
   durChapterPos?: number;
   durChapterTime?: number;
   totalChapterNum?: number;
+  bookSourceUrls?: string[];
   group?: number;
   type?: number;
   local?: boolean;

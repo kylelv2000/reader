@@ -215,7 +215,16 @@ export class ReaderApi {
         const payload = JSON.parse(data) as { data?: Book[]; errorMsg?: string };
         if (payload.errorMsg) throw new ReaderApiError(payload.errorMsg);
         for (const book of payload.data || []) {
-          books.set(`${book.name.trim()}\u0000${book.author.trim()}`, book);
+          const key = `${book.name.trim()}\u0000${book.author.trim()}`;
+          const existing = books.get(key);
+          if (existing) {
+            existing.bookSourceUrls = existing.bookSourceUrls || [existing.origin];
+            if (book.origin && !existing.bookSourceUrls.includes(book.origin)) {
+              existing.bookSourceUrls.push(book.origin);
+            }
+          } else {
+            books.set(key, { ...book, bookSourceUrls: [book.origin] });
+          }
         }
         if (payload.data?.length) onBatch?.([...books.values()]);
       }
