@@ -39,7 +39,8 @@ const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
 const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
 const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
 const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
-const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 12;
+const AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS: u64 = 8;
+const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 8;
 const SOURCE_SWITCH_CONTENT_TIMEOUT_SECONDS: u64 = 12;
 const READER_PREFETCH_CHAPTERS: usize = 10;
 const READER_PREFETCH_CONCURRENT: usize = 2;
@@ -3554,13 +3555,6 @@ pub async fn get_available_book_source(
     }
 
     let has_more = (last_index + 1).max(0) < sources.len() as i32;
-    if !has_more && req.last_index.unwrap_or(-1) < 0 {
-        let _ = state
-            .book_service
-            .save_book_sources_cache(&user_ns, &book.book_url, &result)
-            .await;
-    }
-
     if paged_request {
         let response =
             build_available_book_source_response(result, last_index, has_more, req.result_limit);
@@ -3625,7 +3619,26 @@ pub async fn get_available_book_source_sse(
                     &book.author,
                     AVAILABLE_SOURCE_SSE_RESULT_LIMIT,
                 );
-                if cached.is_empty() {
+                // Older cores could write raw search rows into this file even
+                // though no catalog had been validated. Only trust candidates
+                // whose corresponding server-side catalog still exists.
+                let mut cached_with_catalog = Vec::new();
+                for candidate in cached {
+                    let toc_url = candidate
+                        .toc_url
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(candidate.book_url.as_str());
+                    if state
+                        .book_service
+                        .load_chapter_list_cache(&user_ns, toc_url)
+                        .await?
+                        .is_some_and(|chapters| !chapters.is_empty())
+                    {
+                        cached_with_catalog.push(candidate);
+                    }
+                }
+                if cached_with_catalog.is_empty() {
                     // An interrupted or fully failed scan must not make future
                     // drawer opens look like a successful empty cache hit.
                     let _ = state
@@ -3633,6 +3646,11 @@ pub async fn get_available_book_source_sse(
                         .delete_book_sources_cache(&user_ns, url)
                         .await;
                 } else {
+                    let cached = cached_with_catalog;
+                    let _ = state
+                        .book_service
+                        .save_book_sources_cache(&user_ns, url, &cached)
+                        .await;
                     let cover_state = state.clone();
                     let cover_user_ns = user_ns.clone();
                     let cover_book = book.clone();
@@ -3724,9 +3742,14 @@ pub async fn get_available_book_source_sse(
                 let target_author = book.author.clone();
                 let user_ns_value = user_ns.clone();
                 search_tasks.spawn(async move {
-                    let res = svc
-                        .search_book(&user_ns_value, &source, &target_name, 1)
-                        .await;
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS),
+                        svc.search_book(&user_ns_value, &source, &target_name, 1),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AppError::Internal(anyhow::anyhow!("source search timed out")))
+                    });
                     (source_index as i32, source, res, target_name, target_author)
                 });
                 next_index += 1;
