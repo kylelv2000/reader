@@ -4,3 +4,8 @@ services:
       context: ..
       dockerfile: Dockerfile
     image: light-reader-app:server
+  reader-core:
+    build:
+      context: ../services/reader-core
+      dockerfile: Dockerfile
+    image: light-reader-core:server

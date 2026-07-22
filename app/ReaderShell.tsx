@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import { ReaderApi, ReaderApiError } from "./reader-api";
+import { normalizeReaderText } from "./reader-text.mjs";
 import type {
   Book,
   BookGroup,
@@ -196,18 +197,7 @@ function getStoredExploreEnabled() {
 }
 
 function plainText(html: string) {
-  const withBreaks = html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|blockquote|h[1-6])>/gi, "\n\n");
-  const text = typeof window === "undefined"
-    ? withBreaks.replace(/<[^>]+>/g, " ")
-    : new DOMParser().parseFromString(withBreaks, "text/html").body.textContent || "";
-  return text
-    .replace(/\r\n?/g, "\n")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return normalizeReaderText(html);
 }
 
 function readerParagraphs(content: string, chapterTitle = "") {
@@ -227,6 +217,10 @@ function readerParagraphs(content: string, chapterTitle = "") {
       }
       return true;
     });
+}
+
+function latestChapterFor(book: Book) {
+  return book.latestChapterTitle || book.lastChapter || "";
 }
 
 function mediaUrls(content: string) {
@@ -462,13 +456,17 @@ export function ReaderShell() {
       }, reader.content);
   }, [reader, replaceRules]);
 
-  const readingContent = preferences.chineseMode === "original" ? renderedContent : convertedContent || renderedContent;
+  const readerSourceType = reader?.book.type ?? sources.find((source) => source.bookSourceUrl === reader?.book.origin)?.bookSourceType ?? 0;
+  const normalizedRenderedContent = useMemo(
+    () => readerSourceType === 0 ? normalizeReaderText(renderedContent) : renderedContent,
+    [readerSourceType, renderedContent],
+  );
+  const readingContent = preferences.chineseMode === "original" ? normalizedRenderedContent : convertedContent || normalizedRenderedContent;
   const chapterMatchCount = useMemo(() => {
     const needle = chapterQuery.trim().toLowerCase();
     if (!needle) return 0;
     return readingContent.toLowerCase().split(needle).length - 1;
   }, [chapterQuery, readingContent]);
-  const readerSourceType = reader?.book.type ?? sources.find((source) => source.bookSourceUrl === reader?.book.origin)?.bookSourceType ?? 0;
   const readerMediaUrls = useMemo(() => readerSourceType === 1 || readerSourceType === 2 ? mediaUrls(readingContent) : [], [readerSourceType, readingContent]);
 
   useEffect(() => {
@@ -672,12 +670,12 @@ export function ReaderShell() {
           ? { from: "tw", to: "cn" }
           : { from: "cn", to: "tw" },
       );
-      if (!cancelled) setConvertedContent(converter(renderedContent));
+      if (!cancelled) setConvertedContent(converter(normalizedRenderedContent));
     }).catch(() => {
-      if (!cancelled) setConvertedContent(renderedContent);
+      if (!cancelled) setConvertedContent(normalizedRenderedContent);
     });
     return () => { cancelled = true; };
-  }, [preferences.chineseMode, renderedContent]);
+  }, [preferences.chineseMode, normalizedRenderedContent]);
 
   function toast(text: string) {
     setMessage(text);
@@ -1404,11 +1402,13 @@ export function ReaderShell() {
 
   function stopSourceScan() {
     if (!sourceSwitching) return;
-    sourceCandidatesForRef.current = sourceCandidates.length ? reader?.book.bookUrl || sourceCandidatesForRef.current : "";
+    const validatedCandidates = sourceCandidates.filter((candidate) => !candidate.sourceValidating);
+    sourceCandidatesForRef.current = validatedCandidates.length ? reader?.book.bookUrl || sourceCandidatesForRef.current : "";
     sourceSwitchAbortRef.current?.abort();
     sourceSwitchAbortRef.current = null;
+    setSourceCandidates(validatedCandidates);
     setSourceSwitching(false);
-    toast(sourceCandidates.length ? `已停止，保留 ${sourceCandidates.length} 个可用书源` : "已停止扫描");
+    toast(validatedCandidates.length ? `已停止，保留 ${validatedCandidates.length} 个可用书源` : "已停止扫描");
   }
 
   async function switchBookSource(candidate: Book) {
@@ -2022,7 +2022,7 @@ export function ReaderShell() {
                       <button className="book-meta" onClick={() => openBook(book)}>
                         <strong>{book.name}</strong>
                         <span>{book.author}</span>
-                        <small>{book.durChapterTitle || book.latestChapterTitle || "尚未开始"}</small>
+                        <small>{book.durChapterTitle || latestChapterFor(book) || "尚未开始"}</small>
                       </button>
                       <div className="mini-progress"><span style={{ width: `${progressFor(book)}%` }} /></div>
                     </article>
@@ -2055,7 +2055,7 @@ export function ReaderShell() {
                       <span className="source-chip">{book.originName || "聚合结果"}</span>
                       <h2>{book.name}</h2>
                       <p>{book.author} · {book.kind || "网络文学"}</p>
-                      <small>{book.latestChapterTitle || "目录可用"}</small>
+                      <small>{latestChapterFor(book) || "目录可用"}</small>
                     </div>
                     <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>
                   </article>
@@ -2415,13 +2415,13 @@ export function ReaderShell() {
           )}
           {showSourceSwitch && (
             <aside className="reader-drawer source-switch-drawer">
-              <header><div><p className="eyebrow">换源 · {sourceCandidates.length} 个可用来源</p><h2>{reader.book.name}</h2></div><div className="drawer-header-actions">{sourceSwitching ? <button className="stop-scan" onClick={stopSourceScan}>停止</button> : <button disabled={sourceApplying} onClick={() => void loadAvailableSources(true)}>重新扫描</button>}<button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
-              <div className="current-source-card"><span>当前书源</span><strong>{sourceNameFor(reader.book)}</strong><small>共 {reader.chapters.length} 章{reader.book.latestChapterTitle ? ` · 最新：${reader.book.latestChapterTitle}` : ""}</small></div>
-              <p className="drawer-note">优先读取上次结果；重新扫描时采用 4 路并发。候选通过目录和正文探测后才会显示，找到足够的来源即可停止。</p>
+              <header><div><p className="eyebrow">换源 · {sourceCandidates.filter((candidate) => !candidate.sourceValidating).length} 个可用来源</p><h2>{reader.book.name}</h2></div><div className="drawer-header-actions">{sourceSwitching ? <button className="stop-scan" onClick={stopSourceScan}>停止</button> : <button disabled={sourceApplying} onClick={() => void loadAvailableSources(true)}>重新扫描</button>}<button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
+              <div className="current-source-card"><span>当前书源</span><strong>{sourceNameFor(reader.book)}</strong><small>共 {reader.chapters.length} 章{latestChapterFor(reader.book) ? ` · 最新：${latestChapterFor(reader.book)}` : ""}</small></div>
+              <p className="drawer-note">优先读取上次结果；重新扫描采用 4 路并发，书名和作者匹配后立即显示，只在后台确认目录可用。</p>
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
-                  <button disabled={sourceApplying} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "章节数待更新"}{candidate.latestChapterTitle ? ` · 最新：${candidate.latestChapterTitle}` : ""}</small></div><i>{sourceApplying ? "切换中" : "切换"}</i></button>
-                )) : sourceSwitching ? <div className="empty-state"><strong>正在检测可读书源…</strong><span>搜索、目录和正文校验可能需要几十秒，找到一个就会立即显示。</span></div> : sourceSwitchError ? <div className="empty-state error"><strong>换源扫描未完成</strong><span>{sourceSwitchError}</span><button onClick={() => void loadAvailableSources(true)}>重新扫描</button></div> : <div className="empty-state"><strong>没有已验证的可用来源</strong><span>可以重新扫描；空结果不会缓存，下次打开会自动重试。</span></div>}
+                  <button disabled={sourceApplying || candidate.sourceValidating} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "正在获取目录"}{latestChapterFor(candidate) ? ` · 最新：${latestChapterFor(candidate)}` : ""}</small></div><i>{sourceApplying ? "切换中" : candidate.sourceValidating ? "查目录" : "切换"}</i></button>
+                )) : sourceSwitching ? <div className="empty-state"><strong>正在搜索可用书源…</strong><span>书名和作者匹配后会立即出现，随后只检查目录是否可用。</span></div> : sourceSwitchError ? <div className="empty-state error"><strong>换源扫描未完成</strong><span>{sourceSwitchError}</span><button onClick={() => void loadAvailableSources(true)}>重新扫描</button></div> : <div className="empty-state"><strong>没有已验证的可用来源</strong><span>可以重新扫描；空结果不会缓存，下次打开会自动重试。</span></div>}
               </div>
             </aside>
           )}

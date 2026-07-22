@@ -13,6 +13,8 @@ export interface Book {
   intro?: string;
   kind?: string;
   latestChapterTitle?: string;
+  lastChapter?: string;
+  sourceValidating?: boolean;
   durChapterTitle?: string;
   durChapterIndex?: number;
   durChapterPos?: number;

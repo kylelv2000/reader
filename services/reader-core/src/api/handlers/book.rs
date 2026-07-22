@@ -26,6 +26,7 @@ use futures::stream::{self, FuturesUnordered};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -36,6 +37,7 @@ const MAX_AVAILABLE_RESULT_LIMIT: usize = 100;
 const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 4;
 const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
 const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
+const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 2;
 const READER_PREFETCH_CHAPTERS: usize = 10;
 const READER_PREFETCH_CONCURRENT: usize = 2;
 const DEFAULT_GLOBAL_EXPLORE_LIMIT: usize = 20;
@@ -3292,34 +3294,43 @@ pub async fn get_available_book_source_sse(
                     &book.author,
                     AVAILABLE_SOURCE_SSE_RESULT_LIMIT,
                 );
-                tokio::spawn(async move {
-                    let mut last_index = -1;
-                    for book in cached {
-                        last_index += 1;
-                        let payload = serde_json::json!({
-                            "lastIndex": last_index,
-                            "hasMore": false,
-                            "cached": true,
-                            "data": [book]
-                        });
-                        if tx
-                            .send(Event::default().data(payload.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    let _ = tx
-                        .send(
-                            Event::default().event("end").data(
-                                serde_json::json!({"lastIndex": last_index, "hasMore": false, "cached": true})
-                                    .to_string(),
-                            ),
-                        )
+                if cached.is_empty() {
+                    // An interrupted or fully failed scan must not make future
+                    // drawer opens look like a successful empty cache hit.
+                    let _ = state
+                        .book_service
+                        .delete_book_sources_cache(&user_ns, url)
                         .await;
-                });
-                return Ok(Sse::new(ReceiverStream::new(rx).map(Ok)));
+                } else {
+                    tokio::spawn(async move {
+                        let mut last_index = -1;
+                        for book in cached {
+                            last_index += 1;
+                            let payload = serde_json::json!({
+                                "lastIndex": last_index,
+                                "hasMore": false,
+                                "cached": true,
+                                "data": [book]
+                            });
+                            if tx
+                                .send(Event::default().data(payload.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = tx
+                            .send(
+                                Event::default().event("end").data(
+                                    serde_json::json!({"lastIndex": last_index, "hasMore": false, "cached": true})
+                                        .to_string(),
+                                ),
+                            )
+                            .await;
+                    });
+                    return Ok(Sse::new(ReceiverStream::new(rx).map(Ok)));
+                }
             }
         }
     }
@@ -3347,21 +3358,22 @@ pub async fn get_available_book_source_sse(
 
         let mut next_index = (last_index_start + 1).max(0) as usize;
         let mut last_idx = last_index_start;
-        let mut emitted = 0usize;
+        let mut discovered = 0usize;
         let mut all_results: Vec<SearchBook> = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
-        let mut tasks = JoinSet::new();
-        let probe_index = book.dur_chapter_index.unwrap_or(0).max(0) as usize;
+        let mut search_tasks = JoinSet::new();
+        let mut validation_tasks = JoinSet::new();
+        let mut validation_queue: VecDeque<(i32, BookSource, SearchBook)> = VecDeque::new();
 
-        'scan: while next_index < sources.len() || !tasks.is_empty() {
-            while tasks.len() < concurrent_count && next_index < sources.len() {
+        'scan: loop {
+            while search_tasks.len() < concurrent_count && next_index < sources.len() {
                 let source_index = next_index;
                 let source = sources[source_index].clone();
                 let svc = state_clone.book_service.clone();
                 let target_name = book.name.clone();
                 let target_author = book.author.clone();
                 let user_ns_value = user_ns.clone();
-                tasks.spawn(async move {
+                search_tasks.spawn(async move {
                     let res = svc
                         .search_book(&user_ns_value, &source, &target_name, 1)
                         .await;
@@ -3370,83 +3382,144 @@ pub async fn get_available_book_source_sse(
                 next_index += 1;
             }
 
-            if tasks.is_empty() {
+            while validation_tasks.len() < AVAILABLE_SOURCE_VALIDATION_CONCURRENT {
+                let Some((source_index, source, candidate)) = validation_queue.pop_front() else {
+                    break;
+                };
+                let state_value = state_clone.clone();
+                let user_ns_value = user_ns.clone();
+                let candidate_origin = candidate.origin.clone();
+                let candidate_url = candidate.book_url.clone();
+                validation_tasks.spawn(async move {
+                    let validated = validate_available_source_candidate(
+                        &state_value,
+                        &user_ns_value,
+                        &source,
+                        candidate,
+                    )
+                    .await;
+                    (source_index, candidate_origin, candidate_url, validated)
+                });
+            }
+
+            if next_index >= sources.len()
+                && search_tasks.is_empty()
+                && validation_tasks.is_empty()
+                && validation_queue.is_empty()
+            {
                 break;
             }
 
-            let joined = tokio::select! {
+            let search_active = !search_tasks.is_empty();
+            let validation_active = !validation_tasks.is_empty();
+            tokio::select! {
                 _ = tx.closed() => {
-                    tasks.abort_all();
+                    search_tasks.abort_all();
+                    validation_tasks.abort_all();
                     break 'scan;
                 }
-                result = tasks.join_next() => result,
-            };
-
-            match joined {
-                Some(Ok((source_index, source, search_result, target_name, target_author))) => {
-                    last_idx = last_idx.max(source_index);
-                    match search_result {
-                        Ok(list) => {
-                            let matches = take_available_source_sse_matches(
-                                list,
-                                &target_name,
-                                &target_author,
-                                Some(&book.origin),
-                                &mut seen,
-                                AVAILABLE_SOURCE_SSE_RESULT_LIMIT.saturating_sub(emitted),
-                            );
-                            for candidate in matches {
-                                let Some(book) = validate_available_source_candidate(
-                                    &state_clone,
-                                    &user_ns,
-                                    &source,
-                                    candidate,
-                                    probe_index,
-                                )
-                                .await
-                                else {
-                                    continue;
-                                };
-                                emitted += 1;
-                                all_results.push(book.clone());
-                                let payload = serde_json::json!({
-                                    "lastIndex": source_index,
-                                    "hasMore": next_index < sources.len() || !tasks.is_empty(),
-                                    "data": [book]
-                                });
-                                if tx
-                                    .send(Event::default().data(payload.to_string()))
-                                    .await
-                                    .is_err()
-                                {
-                                    tasks.abort_all();
-                                    break 'scan;
+                result = search_tasks.join_next(), if search_active => {
+                    match result {
+                        Some(Ok((source_index, source, search_result, target_name, target_author))) => {
+                            last_idx = last_idx.max(source_index);
+                            match search_result {
+                                Ok(list) => {
+                                    let matches = take_available_source_sse_matches(
+                                        list,
+                                        &target_name,
+                                        &target_author,
+                                        Some(&book.origin),
+                                        &mut seen,
+                                        AVAILABLE_SOURCE_SSE_RESULT_LIMIT.saturating_sub(discovered),
+                                    );
+                                    for candidate in matches {
+                                        discovered += 1;
+                                        let payload = serde_json::json!({
+                                            "lastIndex": source_index,
+                                            "hasMore": next_index < sources.len() || !search_tasks.is_empty(),
+                                            "validating": true,
+                                            "data": [candidate.clone()]
+                                        });
+                                        if tx.send(Event::default().data(payload.to_string())).await.is_err() {
+                                            search_tasks.abort_all();
+                                            validation_tasks.abort_all();
+                                            break 'scan;
+                                        }
+                                        validation_queue.push_back((source_index, source.clone(), candidate));
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::debug!(
+                                        "getAvailableBookSourceSSE search failed at source index {}: {:?}",
+                                        source_index,
+                                        err
+                                    );
                                 }
                             }
                         }
-                        Err(err) => {
-                            tracing::debug!(
-                                "getAvailableBookSourceSSE search failed at source index {}: {:?}",
-                                source_index,
-                                err
-                            );
+                        Some(Err(err)) => {
+                            tracing::debug!("getAvailableBookSourceSSE search task join failed: {:?}", err);
                         }
+                        None => {}
                     }
                 }
-                Some(Err(err)) => {
-                    tracing::debug!("getAvailableBookSourceSSE task join failed: {:?}", err);
+                result = validation_tasks.join_next(), if validation_active => {
+                    match result {
+                        Some(Ok((source_index, _origin, _book_url, Some(validated)))) => {
+                            all_results.push(validated.clone());
+                            let payload = serde_json::json!({
+                                "lastIndex": source_index,
+                                "hasMore": next_index < sources.len()
+                                    || !search_tasks.is_empty()
+                                    || !validation_tasks.is_empty()
+                                    || !validation_queue.is_empty(),
+                                "validating": false,
+                                "data": [validated]
+                            });
+                            if tx.send(Event::default().data(payload.to_string())).await.is_err() {
+                                search_tasks.abort_all();
+                                validation_tasks.abort_all();
+                                break 'scan;
+                            }
+                        }
+                        Some(Ok((source_index, origin, book_url, None))) => {
+                            let payload = serde_json::json!({
+                                "lastIndex": source_index,
+                                "hasMore": next_index < sources.len()
+                                    || !search_tasks.is_empty()
+                                    || !validation_tasks.is_empty()
+                                    || !validation_queue.is_empty(),
+                                "remove": [{"origin": origin, "bookUrl": book_url}]
+                            });
+                            if tx.send(Event::default().data(payload.to_string())).await.is_err() {
+                                search_tasks.abort_all();
+                                validation_tasks.abort_all();
+                                break 'scan;
+                            }
+                        }
+                        Some(Err(err)) => {
+                            tracing::debug!("getAvailableBookSourceSSE validation task join failed: {:?}", err);
+                        }
+                        None => {}
+                    }
                 }
-                None => break,
             }
         }
 
         let has_more = false;
         let final_last_idx = last_idx.max(next_index as i32 - 1);
 
-        let _ = state_clone
-            .book_service
-            .save_book_sources_cache(&user_ns, &book.book_url, &all_results)
-            .await;
+        if all_results.is_empty() {
+            let _ = state_clone
+                .book_service
+                .delete_book_sources_cache(&user_ns, &book.book_url)
+                .await;
+        } else {
+            let _ = state_clone
+                .book_service
+                .save_book_sources_cache(&user_ns, &book.book_url, &all_results)
+                .await;
+        }
 
         let _ = tx
             .send(Event::default().event("end").data(
@@ -3463,7 +3536,6 @@ async fn validate_available_source_candidate(
     user_ns: &str,
     source: &BookSource,
     mut candidate: SearchBook,
-    probe_index: usize,
 ) -> Option<SearchBook> {
     let mut toc_url = candidate.book_url.clone();
     if let Ok(info) = state
@@ -3485,15 +3557,6 @@ async fn validate_available_source_candidate(
         .await
         .ok()?;
     if chapters.is_empty() {
-        return None;
-    }
-    let probe = &chapters[probe_index.min(chapters.len() - 1)];
-    let content = state
-        .book_service
-        .get_content(user_ns, &candidate.book_url, source, &probe.url)
-        .await
-        .ok()?;
-    if content.trim().chars().count() < 20 {
         return None;
     }
     candidate.total_chapter_num = Some(chapters.len() as i32);

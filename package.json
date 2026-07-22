@@ -9,7 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "npm run build && NODE_ENV=test node --test tests/rendered-html.test.mjs services/web-runtime/server.test.mjs services/security-gateway/server.test.mjs",
+    "test": "npm run build && NODE_ENV=test node --test tests/reader-text.test.mjs tests/rendered-html.test.mjs services/web-runtime/server.test.mjs services/security-gateway/server.test.mjs",
     "test:security:smoke": "node scripts/security-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"

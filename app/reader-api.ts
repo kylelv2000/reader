@@ -642,12 +642,25 @@ export class ReaderApi {
       for (const event of events) {
         const data = event.split("\n").find((line) => line.startsWith("data:"))?.slice(5).trim();
         if (!data) continue;
-        const payload = JSON.parse(data) as { data?: Book[]; books?: Book[]; lastIndex?: number; hasMore?: boolean };
+        const payload = JSON.parse(data) as {
+          data?: Book[];
+          books?: Book[];
+          remove?: Array<Pick<Book, "origin" | "bookUrl">>;
+          validating?: boolean;
+          lastIndex?: number;
+          hasMore?: boolean;
+        };
         if (typeof payload.lastIndex === "number") nextLastIndex = payload.lastIndex;
         if (typeof payload.hasMore === "boolean") hasMore = payload.hasMore;
+        for (const candidate of payload.remove || []) {
+          results.delete(`${candidate.origin}\u0000${candidate.bookUrl}`);
+        }
         for (const candidate of payload.data || payload.books || []) {
           if (candidate.origin === book.origin) continue;
-          results.set(`${candidate.origin}\u0000${candidate.bookUrl}`, candidate);
+          results.set(`${candidate.origin}\u0000${candidate.bookUrl}`, {
+            ...candidate,
+            sourceValidating: payload.validating === true,
+          });
         }
         onBatch([...results.values()]);
       }
