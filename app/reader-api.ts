@@ -597,18 +597,30 @@ export class ReaderApi {
   ) {
     const isAbsolute = this.baseUrl.startsWith("http");
     const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
-    const url = new URL(`${this.baseUrl}/getAvailableBookSourceSSE`, isAbsolute ? undefined : origin);
-    url.searchParams.set("url", book.bookUrl);
-    url.searchParams.set("name", book.name);
-    url.searchParams.set("author", book.author);
-    if (book.origin) url.searchParams.set("origin", book.origin);
-    url.searchParams.set("lastIndex", String(lastIndex));
-    url.searchParams.set("concurrentCount", "4");
-    if (refresh) url.searchParams.set("refresh", "1");
-    const response = await fetch(isAbsolute ? url.toString() : `${url.pathname}${url.search}`, {
+    const requestUrl = (route: string) => {
+      const url = new URL(`${this.baseUrl}${route}`, isAbsolute ? undefined : origin);
+      url.searchParams.set("url", book.bookUrl);
+      url.searchParams.set("name", book.name);
+      url.searchParams.set("author", book.author);
+      if (book.origin) url.searchParams.set("origin", book.origin);
+      url.searchParams.set("lastIndex", String(lastIndex));
+      url.searchParams.set("concurrentCount", "4");
+      if (refresh) url.searchParams.set("refresh", "1");
+      return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
+    };
+    let response = await fetch(requestUrl("/getAvailableBookSourceSSE"), {
       credentials: "include",
       signal,
     });
+    // Reader forks expose either endpoint depending on their core version. Keep
+    // source switching usable during an in-place core upgrade instead of
+    // surfacing a bare 404 to the reader.
+    if ([404, 405].includes(response.status)) {
+      response = await fetch(requestUrl("/searchBookSourceSSE"), {
+        credentials: "include",
+        signal,
+      });
+    }
     if (!response.ok) {
       const envelope = (await response.json().catch(() => null)) as ApiEnvelope<unknown> | null;
       throw new ReaderApiError(envelope?.errorMsg || `换源搜索失败：${response.status}`);

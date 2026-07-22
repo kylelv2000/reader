@@ -373,6 +373,7 @@ export function ReaderShell() {
   const [showSourceSwitch, setShowSourceSwitch] = useState(false);
   const [sourceSwitching, setSourceSwitching] = useState(false);
   const [sourceApplying, setSourceApplying] = useState(false);
+  const [sourceSwitchError, setSourceSwitchError] = useState("");
   const [speaking, setSpeaking] = useState(false);
   const [autoReading, setAutoReading] = useState(false);
   const [readerChrome, setReaderChrome] = useState(true);
@@ -891,16 +892,20 @@ export function ReaderShell() {
 
   function updateReaderPreference(patch: Partial<ReaderPreferences>) {
     const paper = readingPaperRef.current;
-    const preservePage = preferences.pageMode === "paged" && paper;
-    const maxScroll = preservePage ? Math.max(0, paper.scrollWidth - paper.clientWidth) : 0;
-    const pageProgress = maxScroll > 0 && paper ? paper.scrollLeft / maxScroll : 0;
     setPreferences((current) => ({ ...current, ...patch }));
-    if (!preservePage || !paper) return;
+    if (!paper) return;
+    const resetsLayout = patch.fontSize !== undefined
+      || patch.lineHeight !== undefined
+      || patch.contentWidth !== undefined
+      || patch.fontFamily !== undefined
+      || patch.pageMode !== undefined;
+    if (!resetsLayout) return;
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      const nextMaxScroll = Math.max(0, paper.scrollWidth - paper.clientWidth);
-      const pageWidth = Math.max(1, paper.clientWidth);
-      const target = Math.round((pageProgress * nextMaxScroll) / pageWidth) * pageWidth;
-      paper.scrollLeft = Math.min(nextMaxScroll, Math.max(0, target));
+      // Reflowing CSS columns while keeping the old horizontal offset is what
+      // produced a completely blank page at small font sizes. Start the current
+      // chapter from its first valid page after any layout-changing setting.
+      paper.scrollLeft = 0;
+      readerOverlayRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
     }));
   }
 
@@ -1360,6 +1365,7 @@ export function ReaderShell() {
     sourceSwitchAbortRef.current = controller;
     setSourceSwitching(true);
     setSourceApplying(false);
+    setSourceSwitchError("");
     setSourceCandidates([]);
     if (refresh) sourceCandidatesForRef.current = "";
     try {
@@ -1367,7 +1373,7 @@ export function ReaderShell() {
         reader.book,
         refresh,
         (batch) => {
-          sourceCandidatesForRef.current = reader.book.bookUrl;
+          if (batch.length) sourceCandidatesForRef.current = reader.book.bookUrl;
           setSourceCandidates(() => {
             const merged = new Map<string, Book>();
             for (const book of batch) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
@@ -1377,14 +1383,19 @@ export function ReaderShell() {
         controller.signal,
         -1,
       );
-      sourceCandidatesForRef.current = reader.book.bookUrl;
+      sourceCandidatesForRef.current = result.books.length ? reader.book.bookUrl : "";
       setSourceCandidates(() => {
         const merged = new Map<string, Book>();
         for (const book of result.books) merged.set(`${book.origin}\u0000${book.bookUrl}`, book);
         return [...merged.values()];
       });
     } catch (error) {
-      if (!controller.signal.aborted) toast(error instanceof Error ? error.message : "换源搜索失败");
+      if (!controller.signal.aborted) {
+        const detail = error instanceof Error ? error.message : "换源搜索失败";
+        sourceCandidatesForRef.current = "";
+        setSourceSwitchError(detail);
+        toast(detail);
+      }
     } finally {
       if (sourceSwitchAbortRef.current === controller) sourceSwitchAbortRef.current = null;
       if (!controller.signal.aborted) setSourceSwitching(false);
@@ -1393,7 +1404,7 @@ export function ReaderShell() {
 
   function stopSourceScan() {
     if (!sourceSwitching) return;
-    sourceCandidatesForRef.current = reader?.book.bookUrl || sourceCandidatesForRef.current;
+    sourceCandidatesForRef.current = sourceCandidates.length ? reader?.book.bookUrl || sourceCandidatesForRef.current : "";
     sourceSwitchAbortRef.current?.abort();
     sourceSwitchAbortRef.current = null;
     setSourceSwitching(false);
@@ -1636,7 +1647,14 @@ export function ReaderShell() {
       await api.downloadBookForOffline(
         book,
         amount,
-        (done, total) => setOfflineDownload({ bookUrl: book.bookUrl, done, total }),
+        (done, total) => {
+          setOfflineDownload({ bookUrl: book.bookUrl, done, total });
+          if (done === 1 || done === total || done % 4 === 0) {
+            void api.getOfflineBookStatus(book.bookUrl).then((status) => {
+              setOfflineStatus((current) => ({ ...current, [book.bookUrl]: status }));
+            }).catch(() => undefined);
+          }
+        },
         controller.signal,
       );
       await refreshOfflineStatuses([book]);
@@ -2369,6 +2387,13 @@ export function ReaderShell() {
             </footer>
           </article>
           <div className="reader-progress"><span style={{ width: `${reader.chapters.length ? ((reader.chapterIndex + 1) / reader.chapters.length) * 100 : 0}%` }} /></div>
+          {offlineDownload?.bookUrl === reader.book.bookUrl && (
+            <div className="reader-cache-progress" role="status" aria-live="polite">
+              <strong>正在缓存章节</strong>
+              <span>{offlineDownload.done} / {offlineDownload.total || "?"}</span>
+              <i><b style={{ width: `${offlineDownload.total ? Math.min(100, (offlineDownload.done / offlineDownload.total) * 100) : 0}%` }} /></i>
+            </div>
+          )}
 
           {showCatalog && (
             <aside className="reader-drawer catalog-drawer">
@@ -2396,7 +2421,7 @@ export function ReaderShell() {
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
                   <button disabled={sourceApplying} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "章节数待更新"}{candidate.latestChapterTitle ? ` · 最新：${candidate.latestChapterTitle}` : ""}</small></div><i>{sourceApplying ? "切换中" : "切换"}</i></button>
-                )) : sourceSwitching ? <div className="empty-state"><strong>正在检测可读书源…</strong><span>结果通过目录和正文校验后会立即显示。</span></div> : <div className="empty-state"><strong>没有已验证的可用来源</strong><span>可以重新扫描，出现结果后也可以随时停止。</span></div>}
+                )) : sourceSwitching ? <div className="empty-state"><strong>正在检测可读书源…</strong><span>搜索、目录和正文校验可能需要几十秒，找到一个就会立即显示。</span></div> : sourceSwitchError ? <div className="empty-state error"><strong>换源扫描未完成</strong><span>{sourceSwitchError}</span><button onClick={() => void loadAvailableSources(true)}>重新扫描</button></div> : <div className="empty-state"><strong>没有已验证的可用来源</strong><span>可以重新扫描；空结果不会缓存，下次打开会自动重试。</span></div>}
               </div>
             </aside>
           )}
