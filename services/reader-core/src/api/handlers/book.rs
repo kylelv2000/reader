@@ -2303,14 +2303,42 @@ pub async fn set_book_source(
         .load_book_sources_cache(&user_ns, &shelf_book.book_url)
         .await?
         .unwrap_or_default();
-    let candidate = known_sources
-        .iter()
-        .find(|item| {
-            item.book_url == new_book_url
-                && normalize_source_url(&item.origin)
-                    == normalize_source_url(&new_source.book_source_url)
-        })
-        .ok_or_else(|| AppError::BadRequest("书源扫描缓存已失效，请重新扫描".to_string()))?;
+    let candidate = match known_sources.iter().find(|item| {
+        item.book_url == new_book_url
+            && normalize_source_url(&item.origin)
+                == normalize_source_url(&new_source.book_source_url)
+    }) {
+        Some(cached) => cached.clone(),
+        None => {
+            // Cache miss — scan still in progress or expired. Resolve inline
+            // so the user does not have to re-scan after every mid-scan click.
+            let mut fallback = SearchBook {
+                book_url: new_book_url.clone(),
+                origin: new_source.book_source_url.clone(),
+                name: shelf_book.name.clone(),
+                author: shelf_book.author.clone(),
+                ..Default::default()
+            };
+            if let Ok(info) = state
+                .book_service
+                .get_book_info(&user_ns, &new_source, &new_book_url)
+                .await
+            {
+                if !info.name.trim().is_empty() {
+                    fallback.name = info.name;
+                }
+                if !info.author.trim().is_empty() {
+                    fallback.author = info.author;
+                }
+                fallback.cover_url = info.cover_url;
+                fallback.intro = info.intro;
+                fallback.kind = info.kind;
+                fallback.last_chapter = info.latest_chapter_title;
+                fallback.toc_url = info.toc_url;
+            }
+            fallback
+        }
+    };
     if !candidate.name.trim().is_empty() {
         updated.name = candidate.name.clone();
     }
@@ -2333,12 +2361,25 @@ pub async fn set_book_source(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(&new_book_url);
-    let chapters = state
+    let chapters = match state
         .book_service
         .load_chapter_list_cache(&user_ns, toc_url)
         .await?
         .filter(|chapters| !chapters.is_empty())
-        .ok_or_else(|| AppError::BadRequest("目录缓存已失效，请重新扫描书源".to_string()))?;
+    {
+        Some(cached) => cached,
+        None => {
+            let fetched = state
+                .book_service
+                .get_chapter_list_with_cache(&user_ns, &new_source, toc_url, false)
+                .await
+                .map_err(|_| AppError::BadRequest("获取目录失败，请稍后重试".to_string()))?;
+            if fetched.is_empty() {
+                return Err(AppError::BadRequest("该书源目录为空，请选择其他书源".to_string()));
+            }
+            fetched
+        }
+    };
     updated.total_chapter_num = Some(chapters.len() as i32);
     updated.latest_chapter_title = chapters
         .last()
