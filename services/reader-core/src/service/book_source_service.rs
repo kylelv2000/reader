@@ -170,8 +170,6 @@ fn source_incompatibility_reason(error: &AppError) -> Option<String> {
                     .filter(|value| !value.is_empty())
                     .unwrap_or("书源脚本无法在当前规则引擎运行");
                 Some(format!("规则脚本不兼容：{}", truncate_reason(summary)))
-            } else if lower.contains("url resolves to a blocked network") {
-                Some("书源地址被服务器安全策略阻止".to_string())
             } else {
                 None
             }
@@ -284,10 +282,14 @@ mod tests {
             "JS Exception: ReferenceError: isGet is not defined"
         ));
         let timeout = AppError::Internal(anyhow::anyhow!("connection timed out"));
+        let blocked = AppError::Internal(anyhow::anyhow!(
+            "URL resolves to a blocked network"
+        ));
 
         assert!(source_incompatibility_reason(&js_error)
             .is_some_and(|reason| reason.contains("isGet")));
         assert!(source_incompatibility_reason(&timeout).is_none());
+        assert!(source_incompatibility_reason(&blocked).is_none());
         assert!(source_incompatibility_reason(&AppError::BadRequest(
             "invalid url options: expected value".to_string()
         ))

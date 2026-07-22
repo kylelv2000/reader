@@ -32,16 +32,25 @@ pub struct BookService {
     source_cookies: Arc<RwLock<HashMap<String, String>>>,
     rate_states: Arc<RwLock<HashMap<String, RateState>>>,
     outbound_slots: Arc<Semaphore>,
+    cover_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone, Default)]
 struct RateState {
-    in_flight: bool,
     last_start: Option<Instant>,
     window_starts: Vec<Instant>,
 }
 
 const COVER_FAILURE_RETRY_SECONDS: i64 = 6 * 60 * 60;
+const CANDIDATE_COVER_FAILURE_RETRY_SECONDS: i64 = 10 * 60;
+const COVER_CACHE_VERSION: &str = "cover-v2";
+const CANDIDATE_COVER_CACHE_VERSION: &str = "candidate-cover-v2";
+const BOOK_RESOURCE_CACHE_VERSION: &str = "resource-v2";
+const COVER_DISCOVERY_CACHE_VERSION: &str = "discovery-v2";
+
+fn versioned_source_hash(version: &str, url: &str) -> String {
+    md5_hex(&format!("{version}\0{url}"))
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +96,7 @@ impl BookService {
             source_cookies: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_slots: Arc::new(Semaphore::new(outbound_limit)),
+            cover_slots: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -152,16 +162,13 @@ impl BookService {
         spec: RequestSpec,
     ) -> anyhow::Result<FetchResponse> {
         self.wait_for_rate(source).await;
-        let permit = match self.outbound_slots.acquire().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.finish_rate(source).await;
-                return Err(anyhow::anyhow!("outbound request limiter is unavailable"));
-            }
-        };
+        let permit = self
+            .outbound_slots
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("outbound request limiter is unavailable"))?;
         let result = fetch(&self.http, spec).await;
         drop(permit);
-        self.finish_rate(source).await;
         result
     }
 
@@ -191,19 +198,15 @@ impl BookService {
                 let mut states = self.rate_states.write().await;
                 let state = states.entry(source_key.to_string()).or_default();
                 let now = Instant::now();
-                if state.in_flight {
-                    delay
-                } else if let Some(last_start) = state.last_start {
+                if let Some(last_start) = state.last_start {
                     let elapsed = now.saturating_duration_since(last_start);
                     if elapsed < delay {
                         delay - elapsed
                     } else {
-                        state.in_flight = true;
                         state.last_start = Some(now);
                         return;
                     }
                 } else {
-                    state.in_flight = true;
                     state.last_start = Some(now);
                     return;
                 }
@@ -237,13 +240,6 @@ impl BookService {
                 }
             };
             sleep(wait).await;
-        }
-    }
-
-    async fn finish_rate(&self, source: &BookSource) {
-        let mut states = self.rate_states.write().await;
-        if let Some(state) = states.get_mut(&source.book_source_url) {
-            state.in_flight = false;
         }
     }
 
@@ -1012,7 +1008,7 @@ impl BookService {
         if let Some(cached) = self.load_cached_book_cover(user_ns, book_url).await? {
             return Ok(cached);
         }
-        let source_hash = md5_hex(source_url);
+        let source_hash = versioned_source_hash(COVER_CACHE_VERSION, source_url);
         let failure_path = self.book_cover_failure_path(user_ns, book_url);
         if failure_path.is_file() {
             if let Ok(data) = fs::read_to_string(&failure_path).await {
@@ -1116,7 +1112,7 @@ impl BookService {
         self.store_book_cover(
             user_ns,
             book_url,
-            &md5_hex(source_url),
+            &versioned_source_hash(COVER_CACHE_VERSION, source_url),
             &bytes,
             &content_type,
         )
@@ -1161,6 +1157,7 @@ impl BookService {
         let data_path = base.with_extension("bin");
         let meta_path = base.with_extension("json");
         let failure_path = base.with_extension("miss.json");
+        let source_hash = versioned_source_hash(CANDIDATE_COVER_CACHE_VERSION, source_url);
         if data_path.is_file() && meta_path.is_file() {
             let bytes = fs::read(data_path)
                 .await
@@ -1175,7 +1172,8 @@ impl BookService {
         if failure_path.is_file() {
             if let Ok(data) = fs::read_to_string(&failure_path).await {
                 if serde_json::from_str::<BookCoverFailure>(&data).is_ok_and(|failure| {
-                    failure.retry_after > chrono::Utc::now().timestamp()
+                    failure.source_hash == source_hash
+                        && failure.retry_after > chrono::Utc::now().timestamp()
                 }) {
                     return Err(AppError::NotFound(
                         "cover candidate retry is temporarily paused".to_string(),
@@ -1195,7 +1193,7 @@ impl BookService {
                     .map_err(|error| AppError::Internal(error.into()))?;
                 let metadata = serde_json::to_vec(&BookCoverCacheMeta {
                     content_type: content_type.clone(),
-                    source_hash: md5_hex(source_url),
+                    source_hash: source_hash.clone(),
                 })
                 .map_err(|error| AppError::Internal(error.into()))?;
                 fs::write(meta_path, metadata)
@@ -1211,8 +1209,9 @@ impl BookService {
                     let _ = fs::create_dir_all(parent).await;
                 }
                 let failure = BookCoverFailure {
-                    source_hash: md5_hex(source_url),
-                    retry_after: chrono::Utc::now().timestamp() + COVER_FAILURE_RETRY_SECONDS,
+                    source_hash,
+                    retry_after: chrono::Utc::now().timestamp()
+                        + CANDIDATE_COVER_FAILURE_RETRY_SECONDS,
                 };
                 if let Ok(data) = serde_json::to_vec(&failure) {
                     let _ = fs::write(failure_path, data).await;
@@ -1265,11 +1264,19 @@ impl BookService {
             Some(format!("{}://{}", scheme, host))
         });
 
-        let _permit = self
-            .outbound_slots
+        // Covers are low-priority decoration. Keep them on a small independent
+        // lane so a shelf full of uncached images cannot occupy every outbound
+        // slot needed by catalog and chapter requests.
+        let _cover_permit = self
+            .cover_slots
             .acquire()
             .await
             .map_err(|_| AppError::Internal(anyhow::anyhow!("cover limiter closed")))?;
+        let _outbound_permit = self
+            .outbound_slots
+            .acquire()
+            .await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("outbound limiter closed")))?;
         let mut req = self.http.client().get(url);
 
         // Add necessary headers to bypass anti-hotlinking
@@ -1347,7 +1354,10 @@ impl BookService {
             return false;
         };
         serde_json::from_str::<BookCoverFailure>(&data)
-            .is_ok_and(|failure| failure.retry_after > chrono::Utc::now().timestamp())
+            .is_ok_and(|failure| {
+                failure.source_hash == COVER_DISCOVERY_CACHE_VERSION
+                    && failure.retry_after > chrono::Utc::now().timestamp()
+            })
     }
 
     pub async fn mark_cover_discovery_failure(&self, user_ns: &str, book_url: &str) {
@@ -1358,7 +1368,7 @@ impl BookService {
             let _ = fs::create_dir_all(parent).await;
         }
         let failure = BookCoverFailure {
-            source_hash: "discovery".to_string(),
+            source_hash: COVER_DISCOVERY_CACHE_VERSION.to_string(),
             retry_after: chrono::Utc::now().timestamp() + 24 * 60 * 60,
         };
         if let Ok(data) = serde_json::to_vec(&failure) {
@@ -1399,7 +1409,11 @@ impl BookService {
             return false;
         };
         serde_json::from_str::<BookCoverFailure>(&data)
-            .is_ok_and(|failure| failure.retry_after > chrono::Utc::now().timestamp())
+            .is_ok_and(|failure| {
+                failure.source_hash
+                    == versioned_source_hash(BOOK_RESOURCE_CACHE_VERSION, resource_url)
+                    && failure.retry_after > chrono::Utc::now().timestamp()
+            })
     }
 
     pub async fn store_book_resource(
@@ -1425,7 +1439,7 @@ impl BookService {
             .map_err(|error| AppError::Internal(error.into()))?;
         let metadata = serde_json::to_vec(&BookCoverCacheMeta {
             content_type: content_type.to_string(),
-            source_hash: md5_hex(resource_url),
+            source_hash: versioned_source_hash(BOOK_RESOURCE_CACHE_VERSION, resource_url),
         })
         .map_err(|error| AppError::Internal(error.into()))?;
         fs::write(meta_path, metadata)
@@ -1449,7 +1463,7 @@ impl BookService {
             let _ = fs::create_dir_all(parent).await;
         }
         let failure = BookCoverFailure {
-            source_hash: md5_hex(resource_url),
+            source_hash: versioned_source_hash(BOOK_RESOURCE_CACHE_VERSION, resource_url),
             retry_after: chrono::Utc::now().timestamp() + COVER_FAILURE_RETRY_SECONDS,
         };
         if let Ok(data) = serde_json::to_vec(&failure) {
