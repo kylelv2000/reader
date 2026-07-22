@@ -948,6 +948,12 @@ textarea:focus-visible {
   opacity: 1;
 }
 
+@media (hover: none) {
+  .book-delete {
+    opacity: 0.5;
+  }
+}
+
 .book-cover {
   position: relative;
   display: flex;
@@ -3408,8 +3414,7 @@ textarea:focus-visible {
     margin-bottom: 14px;
   }
 
-  .continue-chapter,
-  .progress-row {
+  .continue-chapter {
     display: none;
   }
 
@@ -3431,9 +3436,7 @@ textarea:focus-visible {
     font-size: 13px;
   }
 
-  .book-cover small,
-  .book-meta small,
-  .mini-progress {
+  .book-cover small {
     display: none;
   }
 
@@ -3463,7 +3466,7 @@ textarea:focus-visible {
   }
 
   .result-card small {
-    display: none;
+    font-size: 11px;
   }
 
   .source-summary-grid {

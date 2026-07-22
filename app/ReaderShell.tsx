@@ -892,10 +892,10 @@ export function ReaderShell() {
   async function addBook(book: Book) {
     try {
       if (!api || connection !== "connected") throw new Error("离线时无法添加书籍");
-      const bookToSave = { ...book, durChapterTime: Date.now() };
-      await api.saveBook(bookToSave);
+      const saved = await api.saveBook({ ...book, durChapterTime: Date.now() });
+      const enriched = { ...book, ...saved, durChapterTime: Date.now() };
       setBooks((current) =>
-        current.some((item) => item.bookUrl === bookToSave.bookUrl) ? current : [bookToSave, ...current],
+        current.some((item) => item.bookUrl === enriched.bookUrl) ? current : [enriched, ...current],
       );
       toast("已加入书架");
     } catch (error) {

@@ -242,7 +242,7 @@ export class ReaderApi {
   }
 
   saveBook(book: Book) {
-    return this.request<unknown>("/saveBook", { method: "POST", body: JSON.stringify(book) });
+    return this.request<Book>("/saveBook", { method: "POST", body: JSON.stringify(book) });
   }
 
   setBookCover(bookUrl: string, coverUrl?: string) {
