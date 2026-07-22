@@ -1,22 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="轻阅读">
   <defs>
     <linearGradient id="bg" x1="72" y1="54" x2="444" y2="468" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#4B8BFF"/>
-      <stop offset="1" stop-color="#2463D4"/>
+      <stop stop-color="#6489A2"/>
+      <stop offset="1" stop-color="#45677F"/>
     </linearGradient>
     <linearGradient id="leftPage" x1="84" y1="148" x2="250" y2="383" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#EAF2FF"/>
+      <stop stop-color="#FFFCF4"/>
+      <stop offset="1" stop-color="#F0E8D8"/>
     </linearGradient>
     <linearGradient id="rightPage" x1="428" y1="148" x2="262" y2="383" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#EAF2FF"/>
+      <stop stop-color="#FFFCF4"/>
+      <stop offset="1" stop-color="#F0E8D8"/>
     </linearGradient>
   </defs>
   <rect width="512" height="512" rx="116" fill="url(#bg)"/>
   <path d="M72 168c0-15 12-27 27-27 63 0 116 15 157 50v213c-42-30-94-42-158-37-15 1-26-10-26-25z" fill="url(#leftPage)"/>
   <path d="M440 168c0-15-12-27-27-27-63 0-116 15-157 50v213c42-30 94-42 158-37 15 1 26-10 26-25z" fill="url(#rightPage)"/>
-  <path d="M256 191v213" stroke="#FFD166" stroke-width="13" stroke-linecap="round"/>
-  <path d="M104 180c49 1 89 11 121 31M104 224c49 1 89 11 121 31M104 268c49 1 89 11 121 31" stroke="#8EB5F6" stroke-width="9" stroke-linecap="round" opacity=".62"/>
-  <path d="M408 180c-49 1-89 11-121 31M408 224c-49 1-89 11-121 31M408 268c-49 1-89 11-121 31" stroke="#8EB5F6" stroke-width="9" stroke-linecap="round" opacity=".62"/>
+  <path d="M256 191v213" stroke="#E7B85C" stroke-width="13" stroke-linecap="round"/>
+  <path d="M108 192c47 2 85 12 116 30M108 240c47 2 85 12 116 30" fill="none" stroke="#AAB7B7" stroke-width="9" stroke-linecap="round" opacity=".58"/>
+  <path d="M404 192c-47 2-85 12-116 30M404 240c-47 2-85 12-116 30" fill="none" stroke="#AAB7B7" stroke-width="9" stroke-linecap="round" opacity=".58"/>
 </svg>
