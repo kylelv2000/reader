@@ -892,9 +892,10 @@ export function ReaderShell() {
   async function addBook(book: Book) {
     try {
       if (!api || connection !== "connected") throw new Error("离线时无法添加书籍");
-      await api.saveBook(book);
+      const bookToSave = { ...book, durChapterTime: Date.now() };
+      await api.saveBook(bookToSave);
       setBooks((current) =>
-        current.some((item) => item.bookUrl === book.bookUrl) ? current : [book, ...current],
+        current.some((item) => item.bookUrl === bookToSave.bookUrl) ? current : [bookToSave, ...current],
       );
       toast("已加入书架");
     } catch (error) {
@@ -2230,8 +2231,12 @@ export function ReaderShell() {
                 <div className="continue-copy">
                   <p className="eyebrow">继续阅读</p>
                   <h2>{primaryBook.name}</h2>
-                  <p className="continue-author">{primaryBook.author}<span className="progress-pct">{progressFor(primaryBook)}%</span></p>
+                  <p className="continue-author">{primaryBook.author}</p>
                   <p className="continue-chapter">{primaryBook.durChapterTitle || "从第一章开始"}</p>
+                  <div className="progress-row">
+                    <div className="progress-track"><span style={{ width: `${progressFor(primaryBook)}%` }} /></div>
+                    <small>{progressFor(primaryBook)}%</small>
+                  </div>
                   <button className="read-button" onClick={() => openBook(primaryBook)}>继续阅读 <span>→</span></button>
                 </div>
                 <blockquote>“真正的阅读，是让一段文字在你身上多停留一会儿。”</blockquote>
@@ -2261,9 +2266,11 @@ export function ReaderShell() {
                       </button>
                       <button className="book-meta" onClick={() => openBook(book)}>
                         <strong>{book.name}</strong>
-                        <span>{book.author} <em className="progress-pct">{progressFor(book)}%</em></span>
+                        <span>{book.author}</span>
                         <small>{book.durChapterTitle || latestChapterFor(book) || "尚未开始"}</small>
                       </button>
+                      <div className="mini-progress"><span style={{ width: `${progressFor(book)}%` }} /></div>
+                      <button className="book-delete" onClick={() => removeBook(book)} aria-label={`删除 ${book.name}`}>×</button>
                     </article>
                   ))}
                 </div>
@@ -2306,10 +2313,10 @@ export function ReaderShell() {
                   const sourceCount = book.bookSourceUrls?.length || 1;
                   return (
                     <article className="result-card" key={`result-${book.bookUrl}`}>
-                      <div className="result-cover" style={coverStyle(book)}>{firstLetter(book.name)}</div>
+                      <div className={book.coverUrl ? "result-cover has-cover" : "result-cover"} style={coverStyle(book)}>{book.coverUrl ? null : firstLetter(book.name)}</div>
                       <div>
                         <h2>{book.name}</h2>
-                        <p>{book.author}{sourceCount > 1 ? ` · ${sourceCount} 个书源` : ""}</p>
+                        <p>{book.author} · {sourceCount} 个书源</p>
                         <small>{latestChapterFor(book) || (book.totalChapterNum ? `共 ${book.totalChapterNum} 章` : "")}</small>
                       </div>
                       {onShelf ? <span className="quiet-button on-shelf">已在书架</span> : <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>}

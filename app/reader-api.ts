@@ -218,10 +218,9 @@ export class ReaderApi {
           const key = `${book.name.trim()}\u0000${book.author.trim()}`;
           const existing = books.get(key);
           if (existing) {
-            existing.bookSourceUrls = existing.bookSourceUrls || [existing.origin];
-            if (book.origin && !existing.bookSourceUrls.includes(book.origin)) {
-              existing.bookSourceUrls.push(book.origin);
-            }
+            const urls = [...(existing.bookSourceUrls || [existing.origin])];
+            if (book.origin && !urls.includes(book.origin)) urls.push(book.origin);
+            books.set(key, { ...existing, bookSourceUrls: urls });
           } else {
             books.set(key, { ...book, bookSourceUrls: [book.origin] });
           }
