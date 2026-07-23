@@ -393,6 +393,7 @@ export function ReaderShell() {
   const [coverPickerBook, setCoverPickerBook] = useState<Book | null>(null);
   const [coverCandidates, setCoverCandidates] = useState<Book[]>([]);
   const [addingBooks, setAddingBooks] = useState<Set<string>>(new Set());
+  const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set());
   const [coverScanning, setCoverScanning] = useState(false);
   const [coverSaving, setCoverSaving] = useState(false);
   const [coverPickerError, setCoverPickerError] = useState("");
@@ -441,6 +442,10 @@ export function ReaderShell() {
       return (left.customOrder || 0) - (right.customOrder || 0);
     });
   }, [sourceFilter, sourceQuery, sourceSort, sources]);
+
+  useEffect(() => {
+    setSelectedSources(new Set());
+  }, [sourceFilter, sourceQuery]);
 
   const currentChapter = reader?.chapters[reader.chapterIndex];
   const sortedBooks = useMemo(
@@ -1245,16 +1250,33 @@ export function ReaderShell() {
     }
   }
 
-  async function deleteFilteredSources() {
-    if (!api || connection !== "connected" || !filteredSources.length) return;
-    if (!window.confirm(`确定删除当前筛选出的 ${filteredSources.length} 个书源吗？此操作不可恢复。`)) return;
+  async function batchSelectedSources(action: "enable" | "disable" | "delete") {
+    if (!api || connection !== "connected") return toast("离线时无法修改书源");
+    const targets = sources.filter((source) => selectedSources.has(source.bookSourceUrl));
+    if (!targets.length) return;
     try {
-      await api.deleteBookSources(filteredSources);
-      const urls = new Set(filteredSources.map((source) => source.bookSourceUrl));
-      setSources((current) => current.filter((source) => !urls.has(source.bookSourceUrl)));
-      toast(`已删除 ${urls.size} 个书源`);
+      if (action === "delete") {
+        if (!window.confirm(`确定删除选中的 ${targets.length} 个书源吗？此操作不可恢复。`)) return;
+        await api.deleteBookSources(targets);
+        setSources((current) => current.filter((source) => !selectedSources.has(source.bookSourceUrl)));
+        toast(`已删除 ${targets.length} 个书源`);
+      } else {
+        const enabled = action === "enable";
+        const updates = targets.map((source) => ({
+          ...source,
+          enabled,
+          ...(enabled ? { autoDisabledReason: undefined, autoDisabledAt: undefined } : {}),
+        }));
+        await api.saveBookSources(updates);
+        setSources((current) => current.map((source) => {
+          const updated = updates.find((item) => item.bookSourceUrl === source.bookSourceUrl);
+          return updated || source;
+        }));
+        toast(`已${enabled ? "启用" : "停用"} ${targets.length} 个书源`);
+      }
+      setSelectedSources(new Set());
     } catch (error) {
-      toast(error instanceof Error ? error.message : "批量删除失败");
+      toast(error instanceof Error ? error.message : "批量操作失败");
     }
   }
 
@@ -1347,19 +1369,6 @@ export function ReaderShell() {
       toast(error instanceof Error ? error.message : "书源检测失败");
     } finally {
       setLibraryBusy(false);
-    }
-  }
-
-  async function batchToggleSources(enabled: boolean) {
-    if (!filteredSources.length) return;
-    const updates = filteredSources.map((source) => ({ ...source, enabled }));
-    try {
-      if (api && connection === "connected") await api.saveBookSources(updates);
-      const urls = new Set(updates.map((source) => source.bookSourceUrl));
-      setSources((current) => current.map((source) => urls.has(source.bookSourceUrl) ? { ...source, enabled } : source));
-      toast(`已${enabled ? "启用" : "停用"}当前 ${updates.length} 个书源`);
-    } catch (error) {
-      toast(error instanceof Error ? error.message : "批量更新失败");
     }
   }
 
@@ -2405,11 +2414,21 @@ export function ReaderShell() {
                   <button className={sourceFilter === "incompatible" ? "active" : ""} onClick={() => setSourceFilter("incompatible")}>不兼容</button>
                   <button className={sourceFilter === "invalid" ? "active" : ""} onClick={() => setSourceFilter("invalid")}>失效</button>
                 </div>
-                <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><button onClick={() => batchToggleSources(true)}>全部启用</button><button onClick={() => batchToggleSources(false)}>全部停用</button>{(sourceFilter !== "all" || sourceQuery.trim()) && filteredSources.length > 0 && <button className="danger-text" onClick={() => void deleteFilteredSources()}>删除筛选结果</button>}<span>{filteredSources.length} 个结果</span></div>
+                <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><span>{filteredSources.length} 个结果</span></div>
               </div>
+              {filteredSources.length > 0 && <div className="source-select-bar">
+                <label><input type="checkbox" checked={filteredSources.every((source) => selectedSources.has(source.bookSourceUrl))} onChange={(event) => setSelectedSources(event.target.checked ? new Set(filteredSources.map((source) => source.bookSourceUrl)) : new Set())} />全选</label>
+                {selectedSources.size > 0 && <div className="select-actions">
+                  <span>已选 {selectedSources.size} 个</span>
+                  <button onClick={() => void batchSelectedSources("enable")}>启用</button>
+                  <button onClick={() => void batchSelectedSources("disable")}>停用</button>
+                  <button className="danger-text" onClick={() => void batchSelectedSources("delete")}>删除</button>
+                </div>}
+              </div>}
               <div className="source-list">
                 {filteredSources.map((source) => (
                   <article className="source-row" key={source.bookSourceUrl}>
+                    <input type="checkbox" className="source-check" checked={selectedSources.has(source.bookSourceUrl)} onChange={() => setSelectedSources((current) => { const next = new Set(current); if (next.has(source.bookSourceUrl)) next.delete(source.bookSourceUrl); else next.add(source.bookSourceUrl); return next; })} aria-label={`选择 ${source.bookSourceName}`} />
                     <button className={`source-toggle ${source.enabled === false ? "off" : ""}`} onClick={() => toggleSource(source)} aria-label={source.enabled === false ? `启用 ${source.bookSourceName}` : `停用 ${source.bookSourceName}`}><span /></button>
                     <div className="source-main">
                       <strong>{source.bookSourceName}</strong>

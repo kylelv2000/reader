@@ -1256,8 +1256,57 @@ textarea:focus-visible {
   font-size: 11px;
 }
 
+.source-select-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  margin-top: 12px;
+  padding: 0 12px;
+}
+
+.source-select-bar label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.select-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.select-actions span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.select-actions button {
+  padding: 6px 12px;
+  color: #6d716a;
+  background: #f4f2ec;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.source-check,
+.source-select-bar input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 .source-list {
-  margin-top: 14px;
+  margin-top: 10px;
   overflow: hidden;
   background: #fff;
   border: 1px solid var(--line);
@@ -1266,7 +1315,7 @@ textarea:focus-visible {
 
 .source-row {
   display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) auto auto 62px auto auto auto;
+  grid-template-columns: auto auto minmax(180px, 1fr) auto auto 62px auto auto auto;
   gap: 9px;
   align-items: center;
   min-height: 51px;
@@ -3108,6 +3157,7 @@ textarea:focus-visible {
 :root[data-theme="dark"] .source-chip,
 :root[data-theme="dark"] .source-group,
 :root[data-theme="dark"] .source-tools button,
+:root[data-theme="dark"] .select-actions button,
 :root[data-theme="dark"] .source-order-actions button,
 :root[data-theme="dark"] .modal-close {
   background: var(--soft);
@@ -3324,8 +3374,8 @@ textarea:focus-visible {
   }
 
   .source-row {
-    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
-    gap: 9px;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+    gap: 8px;
   }
 
   .source-group,
