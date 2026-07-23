@@ -2434,7 +2434,7 @@ textarea:focus-visible {
   top: 0;
   z-index: 5;
   display: grid;
-  grid-template-columns: 90px 1fr minmax(340px, auto);
+  grid-template-columns: 90px 1fr auto;
   align-items: center;
   min-height: 68px;
   padding: 8px clamp(16px, 3vw, 44px);
@@ -2450,9 +2450,7 @@ textarea:focus-visible {
   transform: translateY(-100%);
 }
 
-.reader-bar > button,
-.reader-actions button,
-.reader-actions a {
+.reader-bar > button {
   justify-self: start;
   padding: 8px 10px;
   color: inherit;
@@ -2518,15 +2516,70 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
-.reader-actions {
+.reader-quick-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
-  gap: 7px;
+  gap: 3px;
 }
 
-.reader-mobile-actions,
+.reader-quick-actions button {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  padding: 0;
+  color: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.reader-quick-actions button.active,
+.reader-quick-actions button:active {
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.reader-quick-actions button:hover {
+  background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+.reader-quick-actions .app-icon {
+  width: 21px;
+  height: 21px;
+}
+
 .reader-more-menu {
-  display: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 8px;
+  display: grid;
+  width: min(260px, calc(100vw - 16px));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px;
+  color: inherit;
+  background: var(--reader-panel);
+  border: 1px solid var(--reader-panel-line);
+  border-radius: 14px;
+  box-shadow: 0 18px 40px rgba(20, 22, 19, 0.18);
+}
+
+.reader-more-menu button {
+  min-height: 38px;
+  padding: 7px 9px;
+  overflow: hidden;
+  color: inherit;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--reader-panel-soft);
+  border: 0;
+  border-radius: 9px;
+  cursor: pointer;
 }
 
 .reading-paper {
@@ -3663,70 +3716,6 @@ textarea:focus-visible {
 
   .reader-title small em {
     flex: 1 1 auto;
-  }
-
-  .reader-desktop-actions {
-    display: none;
-  }
-
-  .reader-mobile-actions {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 3px;
-  }
-
-  .reader-mobile-actions button {
-    display: grid;
-    width: 38px;
-    height: 38px;
-    place-items: center;
-    padding: 0;
-    color: inherit;
-    font-size: 14px;
-    font-weight: 700;
-    background: transparent;
-    border: 0;
-    border-radius: 10px;
-  }
-
-  .reader-mobile-actions button.active,
-  .reader-mobile-actions button:active {
-    background: color-mix(in srgb, currentColor 10%, transparent);
-  }
-
-  .reader-mobile-actions .app-icon {
-    width: 21px;
-    height: 21px;
-  }
-
-  .reader-more-menu {
-    position: absolute;
-    top: calc(100% + 8px);
-    right: 8px;
-    display: grid;
-    width: min(260px, calc(100vw - 16px));
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px;
-    padding: 8px;
-    color: inherit;
-    background: var(--reader-panel);
-    border: 1px solid var(--reader-panel-line);
-    border-radius: 14px;
-    box-shadow: 0 18px 45px rgba(20, 22, 19, 0.2);
-  }
-
-  .reader-more-menu button {
-    min-height: 38px;
-    padding: 7px 9px;
-    overflow: hidden;
-    color: inherit;
-    font-size: 10px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    background: var(--reader-panel-soft);
-    border: 0;
-    border-radius: 9px;
   }
 
   .reading-paper {

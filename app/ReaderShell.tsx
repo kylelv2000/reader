@@ -2653,8 +2653,7 @@ export function ReaderShell() {
           <header className="reader-bar">
             <button className="reader-back" onClick={exitReader} aria-label="返回书架">←</button>
             <div className="reader-title"><strong>{currentChapter?.title || reader.book.name}</strong><small><span>{reader.book.name}</span><i>·</i><em>{sourceNameFor(reader.book)}</em></small></div>
-            <div className="reader-actions reader-desktop-actions"><button onClick={saveCurrentBookmark}>书签</button>{readerSourceType === 0 && <button onClick={toggleSpeech}>{speaking ? "停止" : "朗读"}</button>}{readerSourceType !== 1 && <button onClick={() => setAutoReading((value) => !value)}>{autoReading ? "停止" : "自动"}</button>}<button onClick={() => offlineDownload?.bookUrl === reader.book.bookUrl ? offlineDownloadRef.current?.abort() : setOfflinePickerBook(reader.book)}>{offlineDownload?.bookUrl === reader.book.bookUrl ? `${offlineDownload.done}/${offlineDownload.total || "?"}` : "缓存"}</button><button onClick={() => openCoverPicker(reader.book)}>封面</button><button onClick={() => void loadAvailableSources(false)}>换源</button>{readerSourceType === 0 && <button onClick={() => setShowChapterSearch(true)}>查找</button>}<button onClick={() => setShowCatalog(true)}>目录</button><button onClick={() => setShowReaderSettings(true)}>Aa</button></div>
-            <div className="reader-mobile-actions">
+            <div className="reader-quick-actions">
               <button onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }} aria-label="目录"><AppIcon name="catalog" /></button>
               <button onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }} aria-label="阅读设置">Aa</button>
               <button className={readerMenuOpen ? "active" : ""} onClick={() => setReaderMenuOpen((value) => !value)} aria-label="更多阅读操作" aria-expanded={readerMenuOpen}><AppIcon name="more" /></button>
@@ -2731,7 +2730,7 @@ export function ReaderShell() {
 
       {articleSession && (
         <section className={`reader-overlay article-overlay reader-theme-${resolvedReaderTheme}`} style={{ "--reader-font-size": `${preferences.fontSize}px`, "--reader-line-height": preferences.lineHeight, "--reader-width": `${preferences.contentWidth}px` } as CSSProperties}>
-          <header className="reader-bar"><button onClick={() => setArticleSession(null)} aria-label="退出文章阅读">←</button><div><strong>{selectedRssSource?.sourceName || "RSS 阅读"}</strong><small>{articleSession.article.pubDate || articleSession.article.origin}</small></div><div className="reader-actions"><button onClick={() => setShowReaderSettings(true)}>Aa</button></div></header>
+          <header className="reader-bar"><button onClick={() => setArticleSession(null)} aria-label="退出文章阅读">←</button><div><strong>{selectedRssSource?.sourceName || "RSS 阅读"}</strong><small>{articleSession.article.pubDate || articleSession.article.origin}</small></div><div className="reader-quick-actions"><button onClick={() => setShowReaderSettings(true)}>Aa</button></div></header>
           <article className={`reading-paper font-${preferences.fontFamily}`}><p className="chapter-kicker">RSS · {selectedRssSource?.sourceName}</p><h1>{articleSession.article.title}</h1>{articleSession.loading ? <div className="reader-loading"><span /><span /><span /><p>正在整理文章…</p></div> : articleSession.content.split(/\n{2,}/).map((paragraph, index) => <p key={`article-${index}`}>{paragraph}</p>)}</article>
           {showReaderSettings && (
             <aside className="reader-drawer settings-drawer">
