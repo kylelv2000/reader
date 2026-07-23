@@ -409,7 +409,8 @@ export function ReaderShell() {
   const readingPaperRef = useRef<HTMLElement>(null);
   const readerRef = useRef<ReaderSession | null>(null);
   const progressSyncRef = useRef<() => void>(() => undefined);
-  const progressSyncTimerRef = useRef<number | null>(null);
+  const progressDirtyRef = useRef(false);
+  const lastSyncedProgressRef = useRef<{ index: number; position: number } | null>(null);
   const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
   const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number } | null>(null);
   const readerTouchActiveRef = useRef(false);
@@ -669,25 +670,32 @@ export function ReaderShell() {
   });
 
   useEffect(() => {
-    // Real-time progress sync: debounce scroll/page turns, flush on hide.
+    // Battery-friendly progress sync: scrolling only flips a dirty flag
+    // (zero network traffic). The position is actually sent when the user
+    // leaves - chapter change, tab hide (lock screen / app switch), reader
+    // exit - plus a 3-minute fallback in case the browser is killed.
     if (!reader) return;
     const overlay = readerOverlayRef.current;
     const paper = readingPaperRef.current;
-    const schedule = () => {
-      if (progressSyncTimerRef.current !== null) window.clearTimeout(progressSyncTimerRef.current);
-      progressSyncTimerRef.current = window.setTimeout(() => progressSyncRef.current(), 4000);
+    const markDirty = () => {
+      progressDirtyRef.current = true;
     };
     const flushOnHide = () => {
-      if (document.visibilityState === "hidden") progressSyncRef.current();
+      if (document.visibilityState === "hidden" && progressDirtyRef.current) progressSyncRef.current();
     };
-    overlay?.addEventListener("scroll", schedule, { passive: true });
-    paper?.addEventListener("scroll", schedule, { passive: true });
+    const fallback = window.setInterval(() => {
+      if (progressDirtyRef.current) progressSyncRef.current();
+    }, 3 * 60_000);
+    overlay?.addEventListener("scroll", markDirty, { passive: true });
+    paper?.addEventListener("scroll", markDirty, { passive: true });
     document.addEventListener("visibilitychange", flushOnHide);
+    window.addEventListener("pagehide", flushOnHide);
     return () => {
-      overlay?.removeEventListener("scroll", schedule);
-      paper?.removeEventListener("scroll", schedule);
+      overlay?.removeEventListener("scroll", markDirty);
+      paper?.removeEventListener("scroll", markDirty);
       document.removeEventListener("visibilitychange", flushOnHide);
-      if (progressSyncTimerRef.current !== null) window.clearTimeout(progressSyncTimerRef.current);
+      window.removeEventListener("pagehide", flushOnHide);
+      window.clearInterval(fallback);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [Boolean(reader)]);
@@ -1021,7 +1029,14 @@ export function ReaderShell() {
   function syncReadingProgress() {
     const current = readerRef.current;
     if (!current || current.loading || connection !== "connected") return;
-    void api.saveProgress(current.book.bookUrl, current.chapterIndex, currentReadingPosition()).catch(() => undefined);
+    const position = currentReadingPosition();
+    const last = lastSyncedProgressRef.current;
+    // Skip the network round-trip (radio wake-ups drain mobile batteries)
+    // when the position barely moved since the last sync.
+    if (last && last.index === current.chapterIndex && Math.abs(last.position - position) < 150) return;
+    lastSyncedProgressRef.current = { index: current.chapterIndex, position };
+    progressDirtyRef.current = false;
+    void api.saveProgress(current.book.bookUrl, current.chapterIndex, position).catch(() => undefined);
   }
 
   function exitReader() {
@@ -1136,7 +1151,11 @@ export function ReaderShell() {
       setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? openedBook : item));
       void api.saveOfflineProgress(openedBook, chapters, chapterIndex);
       prefetchFollowingChapters(openedBook, chapters, chapterIndex);
-      if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex, openedBook.durChapterPos || 0);
+      if (connection === "connected") {
+        void api.saveProgress(book.bookUrl, chapterIndex, openedBook.durChapterPos || 0);
+        lastSyncedProgressRef.current = { index: chapterIndex, position: openedBook.durChapterPos || 0 };
+        progressDirtyRef.current = false;
+      }
       const restorePos = !preferredChapter && chapterIndex === fallbackIndex ? openedBook.durChapterPos || 0 : 0;
       window.setTimeout(() => restoreReadingPosition(restorePos), 30);
     } catch (error) {
@@ -1178,7 +1197,11 @@ export function ReaderShell() {
       );
       void api.saveOfflineProgress(reader.book, reader.chapters, index);
       prefetchFollowingChapters(reader.book, reader.chapters, index);
-      if (api && connection === "connected") void api.saveProgress(reader.book.bookUrl, index, 0);
+      if (api && connection === "connected") {
+        void api.saveProgress(reader.book.bookUrl, index, 0);
+        lastSyncedProgressRef.current = { index, position: 0 };
+        progressDirtyRef.current = false;
+      }
       readerOverlayRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
       setReader((current) => (current ? { ...current, loading: false } : current));

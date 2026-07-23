@@ -462,6 +462,9 @@ export class ReaderApi {
     return this.request<unknown>("/saveBookProgress", {
       method: "POST",
       body: JSON.stringify({ url: bookUrl, index, ...(position !== undefined ? { position } : {}) }),
+      // Progress is often flushed right as the tab hides / the PWA is
+      // backgrounded; keepalive lets the request finish anyway.
+      keepalive: true,
     });
   }
 
