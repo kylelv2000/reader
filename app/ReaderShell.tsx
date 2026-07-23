@@ -407,6 +407,9 @@ export function ReaderShell() {
   const readerTopRef = useRef<HTMLDivElement>(null);
   const readerOverlayRef = useRef<HTMLElement>(null);
   const readingPaperRef = useRef<HTMLElement>(null);
+  const readerRef = useRef<ReaderSession | null>(null);
+  const progressSyncRef = useRef<() => void>(() => undefined);
+  const progressSyncTimerRef = useRef<number | null>(null);
   const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
   const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number } | null>(null);
   const readerTouchActiveRef = useRef(false);
@@ -656,6 +659,38 @@ export function ReaderShell() {
     void hydrateFromServer(api, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
+
+  useEffect(() => {
+    readerRef.current = reader;
+  }, [reader]);
+
+  useEffect(() => {
+    progressSyncRef.current = syncReadingProgress;
+  });
+
+  useEffect(() => {
+    // Real-time progress sync: debounce scroll/page turns, flush on hide.
+    if (!reader) return;
+    const overlay = readerOverlayRef.current;
+    const paper = readingPaperRef.current;
+    const schedule = () => {
+      if (progressSyncTimerRef.current !== null) window.clearTimeout(progressSyncTimerRef.current);
+      progressSyncTimerRef.current = window.setTimeout(() => progressSyncRef.current(), 4000);
+    };
+    const flushOnHide = () => {
+      if (document.visibilityState === "hidden") progressSyncRef.current();
+    };
+    overlay?.addEventListener("scroll", schedule, { passive: true });
+    paper?.addEventListener("scroll", schedule, { passive: true });
+    document.addEventListener("visibilitychange", flushOnHide);
+    return () => {
+      overlay?.removeEventListener("scroll", schedule);
+      paper?.removeEventListener("scroll", schedule);
+      document.removeEventListener("visibilitychange", flushOnHide);
+      if (progressSyncTimerRef.current !== null) window.clearTimeout(progressSyncTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [Boolean(reader)]);
 
   useEffect(() => {
     // PWAs stay alive in the background for days; re-sync shelf data and
@@ -952,7 +987,45 @@ export function ReaderShell() {
     readerHistoryActiveRef.current = true;
   }
 
+  // Reading position is stored as a 0-10000 scroll ratio so it survives
+  // different screen sizes and font settings across devices.
+  function currentReadingPosition(): number {
+    const overlay = readerOverlayRef.current;
+    const paper = readingPaperRef.current;
+    if (!overlay || !paper) return 0;
+    if (preferences.pageMode === "paged") {
+      const max = paper.scrollWidth - paper.clientWidth;
+      return max > 0 ? Math.round((paper.scrollLeft / max) * 10000) : 0;
+    }
+    const max = overlay.scrollHeight - overlay.clientHeight;
+    return max > 0 ? Math.round((overlay.scrollTop / max) * 10000) : 0;
+  }
+
+  function restoreReadingPosition(position: number) {
+    const overlay = readerOverlayRef.current;
+    const paper = readingPaperRef.current;
+    if (!overlay || !paper) return;
+    if (position <= 0) {
+      readerTopRef.current?.scrollIntoView();
+      return;
+    }
+    if (preferences.pageMode === "paged") {
+      const max = paper.scrollWidth - paper.clientWidth;
+      if (max > 0) paper.scrollLeft = Math.round((position / 10000) * max);
+      return;
+    }
+    const max = overlay.scrollHeight - overlay.clientHeight;
+    if (max > 0) overlay.scrollTo({ top: Math.round((position / 10000) * max) });
+  }
+
+  function syncReadingProgress() {
+    const current = readerRef.current;
+    if (!current || current.loading || connection !== "connected") return;
+    void api.saveProgress(current.book.bookUrl, current.chapterIndex, currentReadingPosition()).catch(() => undefined);
+  }
+
   function exitReader() {
+    syncReadingProgress();
     window.speechSynthesis?.cancel();
     clientPrefetchAbortRef.current?.abort();
     setSpeaking(false);
@@ -1012,14 +1085,13 @@ export function ReaderShell() {
   async function openBook(book: Book, preferredChapter?: { title?: string; progress?: number }) {
     clientPrefetchAbortRef.current?.abort();
     if (clientPrefetchTimerRef.current !== null) window.clearTimeout(clientPrefetchTimerRef.current);
-    const fallbackIndex = Math.max(0, book.durChapterIndex || 0);
     const openedAt = Date.now();
-    const openingBook = { ...book, durChapterTime: openedAt };
+    let openingBook = { ...book, durChapterTime: openedAt };
     setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? { ...item, durChapterTime: openedAt } : item));
     setReader({
       book: openingBook,
       chapters: [],
-      chapterIndex: fallbackIndex,
+      chapterIndex: Math.max(0, book.durChapterIndex || 0),
       content: "",
       loading: true,
     });
@@ -1027,20 +1099,32 @@ export function ReaderShell() {
     setReaderChrome(true);
     setReaderMenuOpen(false);
     setReaderError("");
-    if (connection === "connected") void api.saveProgress(book.bookUrl, fallbackIndex).catch(() => undefined);
     try {
       if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
-      const chapters = await api.getChapterList(book);
+      // Progress may have advanced on another device; the server copy wins.
+      if (connection === "connected" && !preferredChapter) {
+        const remote = await api.getShelfBook(book.bookUrl).catch(() => null);
+        if (remote) {
+          openingBook = {
+            ...openingBook,
+            durChapterIndex: remote.durChapterIndex,
+            durChapterTitle: remote.durChapterTitle,
+            durChapterPos: remote.durChapterPos,
+          };
+        }
+      }
+      const fallbackIndex = Math.max(0, openingBook.durChapterIndex || 0);
+      const chapters = await api.getChapterList(openingBook);
       if (!chapters.length) throw new Error("这本书没有可读取的章节");
-      const chapterPreference = preferredChapter || (book.durChapterTitle
-        ? { title: book.durChapterTitle }
+      const chapterPreference = preferredChapter || (openingBook.durChapterTitle
+        ? { title: openingBook.durChapterTitle }
         : undefined);
       const chapterIndex = resolveChapterIndex(chapters, fallbackIndex, chapterPreference);
       // Keep the usable catalog in the reader even if the selected chapter's
       // source is temporarily unavailable. Users can still pick another cached
       // chapter, retry, refresh the catalog, or switch source.
       setReader({ book: openingBook, chapters, chapterIndex, content: "", loading: true });
-      const content = await api.getBookContent(book, chapters[chapterIndex], chapterIndex);
+      const content = await api.getBookContent(openingBook, chapters[chapterIndex], chapterIndex);
       const openedBook = {
         ...openingBook,
         durChapterIndex: chapterIndex,
@@ -1052,8 +1136,9 @@ export function ReaderShell() {
       setBooks((current) => current.map((item) => item.bookUrl === book.bookUrl ? openedBook : item));
       void api.saveOfflineProgress(openedBook, chapters, chapterIndex);
       prefetchFollowingChapters(openedBook, chapters, chapterIndex);
-      if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex);
-      window.setTimeout(() => readerTopRef.current?.scrollIntoView(), 10);
+      if (connection === "connected") void api.saveProgress(book.bookUrl, chapterIndex, openedBook.durChapterPos || 0);
+      const restorePos = !preferredChapter && chapterIndex === fallbackIndex ? openedBook.durChapterPos || 0 : 0;
+      window.setTimeout(() => restoreReadingPosition(restorePos), 30);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "打开书籍失败";
       setReader((current) => current ? { ...current, loading: false } : current);
@@ -1093,7 +1178,7 @@ export function ReaderShell() {
       );
       void api.saveOfflineProgress(reader.book, reader.chapters, index);
       prefetchFollowingChapters(reader.book, reader.chapters, index);
-      if (api && connection === "connected") void api.saveProgress(reader.book.bookUrl, index);
+      if (api && connection === "connected") void api.saveProgress(reader.book.bookUrl, index, 0);
       readerOverlayRef.current?.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
       setReader((current) => (current ? { ...current, loading: false } : current));

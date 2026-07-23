@@ -458,10 +458,17 @@ export class ReaderApi {
     return { completed, total: selected.length };
   }
 
-  saveProgress(bookUrl: string, index: number) {
+  saveProgress(bookUrl: string, index: number, position?: number) {
     return this.request<unknown>("/saveBookProgress", {
       method: "POST",
-      body: JSON.stringify({ url: bookUrl, index }),
+      body: JSON.stringify({ url: bookUrl, index, ...(position !== undefined ? { position } : {}) }),
+    });
+  }
+
+  getShelfBook(bookUrl: string) {
+    return this.request<Book>("/getShelfBook", {
+      method: "POST",
+      body: JSON.stringify({ url: bookUrl }),
     });
   }
 
