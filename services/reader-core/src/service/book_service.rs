@@ -1259,19 +1259,14 @@ impl BookService {
             Some(format!("{}://{}", scheme, host))
         });
 
-        // Covers are low-priority decoration. Keep them on a small independent
-        // lane so a shelf full of uncached images cannot occupy every outbound
-        // slot needed by catalog and chapter requests.
+        // Covers run on their own small lane, fully isolated from the shared
+        // outbound slots: they can never crowd out catalog/chapter requests,
+        // and a running source scan can never starve cover previews.
         let _cover_permit = self
             .cover_slots
             .acquire()
             .await
             .map_err(|_| AppError::Internal(anyhow::anyhow!("cover limiter closed")))?;
-        let _outbound_permit = self
-            .outbound_slots
-            .acquire()
-            .await
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("outbound limiter closed")))?;
         let mut req = self.http.client().get(url);
 
         // Add necessary headers to bypass anti-hotlinking

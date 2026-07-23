@@ -2915,7 +2915,7 @@ pub async fn get_book_cover(
             let headers = resp.headers_mut();
             headers.insert(
                 header::CACHE_CONTROL,
-                header::HeaderValue::from_static("86400"),
+                header::HeaderValue::from_static("private, max-age=86400"),
             );
             if let Ok(v) = header::HeaderValue::from_str(&content_type) {
                 headers.insert(header::CONTENT_TYPE, v);
