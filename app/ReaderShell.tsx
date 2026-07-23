@@ -230,6 +230,14 @@ function mediaUrls(content: string) {
   return [...new Set(matches.map((url) => url.replace(/[),，。]+$/, "")))];
 }
 
+function CandidateCoverImage({ src, alt }: { src: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <i className="cover-candidate-image cover-candidate-failed" role="img" aria-label={`${alt}（加载失败）`}>✕</i>;
+  // Candidate covers are proxied through the server, so the fixed-origin image loader cannot optimize them.
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img className="cover-candidate-image" src={src} alt={alt} loading="lazy" onError={() => setFailed(true)} />;
+}
+
 function ComicImage({ src, alt }: { src: string; alt: string }) {
   // Comic pages are user-source URLs, so the built-in fixed-origin image loader cannot optimize them.
   // eslint-disable-next-line @next/next/no-img-element
@@ -2576,7 +2584,7 @@ export function ReaderShell() {
             {coverPickerError && <p className="cover-picker-error" role="alert">{coverPickerError}</p>}
             {coverCandidates.length > 0 && <div className="cover-candidate-grid">
               {coverCandidates.map((candidate) => <button key={`${candidate.origin}-${candidate.bookUrl}-${candidate.coverUrl}`} disabled={coverSaving} onClick={() => void applyBookCover(candidate.coverUrl)}>
-                <i className="cover-candidate-image" role="img" aria-label={`${sourceNameFor(candidate)} 封面候选`} style={{ backgroundImage: `url("${api.getBookCoverCandidateUrl(coverPickerBook.bookUrl, candidate.coverUrl || "")}")` }} />
+                <CandidateCoverImage src={api.getBookCoverCandidateUrl(coverPickerBook.bookUrl, candidate.coverUrl || "")} alt={`${sourceNameFor(candidate)} 封面候选`} />
                 <span><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `${candidate.totalChapterNum} 章` : ""}</small></span>
               </button>)}
             </div>}

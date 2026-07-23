@@ -96,7 +96,7 @@ impl BookService {
             source_cookies: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_slots: Arc::new(Semaphore::new(outbound_limit)),
-            cover_slots: Arc::new(Semaphore::new(2)),
+            cover_slots: Arc::new(Semaphore::new(4)),
         }
     }
 

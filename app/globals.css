@@ -1439,9 +1439,16 @@ textarea:focus-visible {
   width: 52px;
   aspect-ratio: 3 / 4;
   background: var(--soft);
-  background-position: center;
-  background-size: cover;
   border-radius: 7px;
+  object-fit: cover;
+}
+
+.cover-candidate-failed {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 14px;
+  font-style: normal;
 }
 
 .offline-picker > p:not(.eyebrow) {
