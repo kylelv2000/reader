@@ -1256,23 +1256,13 @@ textarea:focus-visible {
   font-size: 11px;
 }
 
-.source-select-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 34px;
-  margin-top: 12px;
-  padding: 0 12px;
-}
-
-.source-select-bar label {
+.select-all {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   color: var(--muted);
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -1285,6 +1275,7 @@ textarea:focus-visible {
 .select-actions span {
   color: var(--muted);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .select-actions button {
@@ -1297,7 +1288,7 @@ textarea:focus-visible {
 }
 
 .source-check,
-.source-select-bar input[type="checkbox"] {
+.select-all input[type="checkbox"] {
   width: 15px;
   height: 15px;
   margin: 0;
@@ -1306,7 +1297,7 @@ textarea:focus-visible {
 }
 
 .source-list {
-  margin-top: 10px;
+  margin-top: 14px;
   overflow: hidden;
   background: #fff;
   border: 1px solid var(--line);
@@ -3374,18 +3365,15 @@ textarea:focus-visible {
   }
 
   .source-row {
-    grid-template-columns: auto auto minmax(0, 1fr) auto auto auto;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
     gap: 8px;
   }
 
   .source-group,
   .runtime-badge,
-  .latency {
-    display: none;
-  }
-
+  .latency,
   .source-order-actions {
-    display: flex;
+    display: none;
   }
 
   .source-tools {
@@ -3395,7 +3383,7 @@ textarea:focus-visible {
   }
 
   .source-tools input {
-    width: 100%;
+    flex: 1 1 160px;
   }
 
   .resource-form {
@@ -3480,7 +3468,7 @@ textarea:focus-visible {
   .sources-view .intro-actions {
     display: grid;
     width: 100%;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 8px;
   }
 
@@ -3596,25 +3584,36 @@ textarea:focus-visible {
   .source-toolbar > .segmented {
     display: grid;
     width: 100%;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .source-toolbar > .segmented button {
+    padding-right: 4px;
+    padding-left: 4px;
+    white-space: nowrap;
   }
 
   .source-tools {
-    display: grid;
     width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    flex-wrap: wrap;
     gap: 8px;
   }
 
-  .source-tools input,
-  .source-tools select,
-  .source-tools > span {
-    width: 100%;
-    grid-column: 1 / -1;
+  .source-tools input {
+    flex: 1 1 100%;
+  }
+
+  .source-tools select {
+    flex: 1 1 auto;
   }
 
   .source-tools button {
     min-height: 34px;
+  }
+
+  .select-actions {
+    flex: 1 1 auto;
+    justify-content: flex-end;
   }
 
   .tool-grid {

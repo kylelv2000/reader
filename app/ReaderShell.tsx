@@ -658,6 +658,24 @@ export function ReaderShell() {
   }, [api]);
 
   useEffect(() => {
+    // PWAs stay alive in the background for days; re-sync shelf data and
+    // check for a new app version whenever the user returns (throttled).
+    const onVisible = () => {
+      if (document.visibilityState !== "visible" || connection !== "connected") return;
+      const last = Number(sessionStorage.getItem("yomu-visible-sync-at") || 0);
+      if (Date.now() - last < 5 * 60_000) return;
+      sessionStorage.setItem("yomu-visible-sync-at", String(Date.now()));
+      void hydrateFromServer(api, false);
+      void navigator.serviceWorker?.getRegistration()
+        .then((registration) => registration?.update())
+        .catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, connection]);
+
+  useEffect(() => {
     if (connection !== "connected" || !profile.username) return;
     const key = `yomu-shelf-refresh-at:${profile.username}`;
     const lastRefresh = Number(localStorage.getItem(key) || 0);
@@ -2414,17 +2432,20 @@ export function ReaderShell() {
                   <button className={sourceFilter === "incompatible" ? "active" : ""} onClick={() => setSourceFilter("incompatible")}>不兼容</button>
                   <button className={sourceFilter === "invalid" ? "active" : ""} onClick={() => setSourceFilter("invalid")}>失效</button>
                 </div>
-                <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><span>{filteredSources.length} 个结果</span></div>
+                <div className="source-tools">
+                  <label className="select-all"><input type="checkbox" checked={filteredSources.length > 0 && filteredSources.every((source) => selectedSources.has(source.bookSourceUrl))} onChange={(event) => setSelectedSources(event.target.checked ? new Set(filteredSources.map((source) => source.bookSourceUrl)) : new Set())} aria-label="全选书源" />全选</label>
+                  {selectedSources.size > 0 ? <div className="select-actions">
+                    <span>已选 {selectedSources.size} 个</span>
+                    <button onClick={() => void batchSelectedSources("enable")}>启用</button>
+                    <button onClick={() => void batchSelectedSources("disable")}>停用</button>
+                    <button className="danger-text" onClick={() => void batchSelectedSources("delete")}>删除</button>
+                  </div> : <>
+                    <input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" />
+                    <select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select>
+                    <span>{filteredSources.length} 个结果</span>
+                  </>}
+                </div>
               </div>
-              {filteredSources.length > 0 && <div className="source-select-bar">
-                <label><input type="checkbox" checked={filteredSources.every((source) => selectedSources.has(source.bookSourceUrl))} onChange={(event) => setSelectedSources(event.target.checked ? new Set(filteredSources.map((source) => source.bookSourceUrl)) : new Set())} />全选</label>
-                {selectedSources.size > 0 && <div className="select-actions">
-                  <span>已选 {selectedSources.size} 个</span>
-                  <button onClick={() => void batchSelectedSources("enable")}>启用</button>
-                  <button onClick={() => void batchSelectedSources("disable")}>停用</button>
-                  <button className="danger-text" onClick={() => void batchSelectedSources("delete")}>删除</button>
-                </div>}
-              </div>}
               <div className="source-list">
                 {filteredSources.map((source) => (
                   <article className="source-row" key={source.bookSourceUrl}>
