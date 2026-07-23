@@ -1229,6 +1229,46 @@ export function ReaderShell() {
     }
   }
 
+  async function importSourcesFromUrl() {
+    if (connection !== "connected") return toast("离线时无法导入书源");
+    const url = window.prompt("输入书源 JSON 的网址（服务器会代理下载）");
+    if (!url?.trim()) return;
+    try {
+      const rows = await api.readRemoteBookSources(url.trim());
+      const imported = rows.map((row) => JSON.parse(row) as BookSource).filter((source) => source.bookSourceName && source.bookSourceUrl);
+      if (!imported.length) throw new Error("该地址没有可识别的书源");
+      await api.saveBookSources(imported);
+      await hydrateFromServer(api, false);
+      toast(`已从网址导入 ${imported.length} 个书源`);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "网址导入失败");
+    }
+  }
+
+  async function deleteFilteredSources() {
+    if (!api || connection !== "connected" || !filteredSources.length) return;
+    if (!window.confirm(`确定删除当前筛选出的 ${filteredSources.length} 个书源吗？此操作不可恢复。`)) return;
+    try {
+      await api.deleteBookSources(filteredSources);
+      const urls = new Set(filteredSources.map((source) => source.bookSourceUrl));
+      setSources((current) => current.filter((source) => !urls.has(source.bookSourceUrl)));
+      toast(`已删除 ${urls.size} 个书源`);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "批量删除失败");
+    }
+  }
+
+  async function dedupeSources() {
+    if (!api || connection !== "connected") return;
+    try {
+      const result = await api.dedupeBookSources();
+      await hydrateFromServer(api, false);
+      toast(result.removed ? `已合并 ${result.removed} 个重复书源` : "没有发现重复书源");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "重复清理失败");
+    }
+  }
+
   async function toggleSource(source: BookSource) {
     if (connection !== "connected") return toast("离线时无法修改书源");
     const enabling = source.enabled === false;
@@ -1320,17 +1360,6 @@ export function ReaderShell() {
       toast(`已${enabled ? "启用" : "停用"}当前 ${updates.length} 个书源`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "批量更新失败");
-    }
-  }
-
-  async function deleteInvalidSources() {
-    if (!api || connection !== "connected" || !window.confirm("确定删除所有已标记为“失效”的书源吗？")) return;
-    try {
-      const result = await api.deleteInvalidBookSources();
-      await hydrateFromServer(api, false);
-      toast(`已删除 ${result.deleted} 个失效书源`);
-    } catch (error) {
-      toast(error instanceof Error ? error.message : "失效书源清理失败");
     }
   }
 
@@ -2356,7 +2385,9 @@ export function ReaderShell() {
                 <div className="intro-actions">
                   <input ref={sourceFileRef} type="file" accept="application/json,.json" hidden onChange={importSources} />
                   <button className="quiet-button" onClick={() => sourceFileRef.current?.click()}>导入 JSON</button>
+                  <button className="quiet-button" onClick={() => void importSourcesFromUrl()}>网址导入</button>
                   <button className="quiet-button" onClick={() => downloadJson("yomu-book-sources.json", sources)}>导出</button>
+                  <button className="quiet-button" onClick={() => void dedupeSources()}>清理重复</button>
                   <button className="quiet-button" disabled={libraryBusy} onClick={testVisibleSources}>{libraryBusy ? "检测中…" : "检测"}</button>
                   <button className="primary-button" aria-label="新建书源" onClick={() => { setSourceEditor(null); setShowSourceEditor(true); }}>＋ 新建</button>
                 </div>
@@ -2374,7 +2405,7 @@ export function ReaderShell() {
                   <button className={sourceFilter === "incompatible" ? "active" : ""} onClick={() => setSourceFilter("incompatible")}>不兼容</button>
                   <button className={sourceFilter === "invalid" ? "active" : ""} onClick={() => setSourceFilter("invalid")}>失效</button>
                 </div>
-                <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><button onClick={() => batchToggleSources(true)}>全部启用</button><button onClick={() => batchToggleSources(false)}>全部停用</button>{sourceFilter === "invalid" && <button className="danger-text" onClick={deleteInvalidSources}>删除失效</button>}<span>{filteredSources.length} 个结果</span></div>
+                <div className="source-tools"><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="筛选名称、地址或分组" aria-label="筛选书源" /><select value={sourceSort} onChange={(event) => setSourceSort(event.target.value as typeof sourceSort)} aria-label="书源排序"><option value="order">自定义顺序</option><option value="name">按名称</option><option value="latency">按响应时间</option></select><button onClick={() => batchToggleSources(true)}>全部启用</button><button onClick={() => batchToggleSources(false)}>全部停用</button>{(sourceFilter !== "all" || sourceQuery.trim()) && filteredSources.length > 0 && <button className="danger-text" onClick={() => void deleteFilteredSources()}>删除筛选结果</button>}<span>{filteredSources.length} 个结果</span></div>
               </div>
               <div className="source-list">
                 {filteredSources.map((source) => (

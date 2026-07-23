@@ -1095,6 +1095,19 @@ pub async fn delete_book_sources(
     Ok(Json(ApiResponse::ok(serde_json::json!({"deleted": true}))))
 }
 
+pub async fn dedupe_book_sources(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let user_ns = state
+        .user_service
+        .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
+        .await
+        .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
+    let removed = state.book_source_service.dedupe(&user_ns).await?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({"removed": removed}))))
+}
+
 pub async fn delete_all_book_sources(
     State(state): State<AppState>,
     auth: AuthContext,

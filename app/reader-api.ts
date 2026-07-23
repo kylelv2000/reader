@@ -519,8 +519,22 @@ export class ReaderApi {
     });
   }
 
-  deleteInvalidBookSources() {
-    return this.request<{ deleted: number }>("/deleteInvalidBookSources", { method: "POST" });
+  deleteBookSources(sources: BookSource[]) {
+    return this.request<unknown>("/deleteBookSources", {
+      method: "POST",
+      body: JSON.stringify(sources.map((source) => ({ bookSourceUrl: source.bookSourceUrl }))),
+    });
+  }
+
+  dedupeBookSources() {
+    return this.request<{ removed: number }>("/dedupeBookSources", { method: "POST" });
+  }
+
+  readRemoteBookSources(url: string) {
+    return this.request<string[]>("/readRemoteSourceFile", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
   }
 
   saveBookGroup(group: BookGroup) {

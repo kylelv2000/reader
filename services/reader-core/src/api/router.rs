@@ -59,6 +59,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::delete_book_sources),
         )
         .route(
+            "/reader3/dedupeBookSources",
+            post(handlers::dedupe_book_sources),
+        )
+        .route(
             "/reader3/deleteAllBookSources",
             post(handlers::delete_all_book_sources),
         )

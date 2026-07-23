@@ -1,6 +1,8 @@
 use crate::error::error::AppError;
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::storage::db::repo::BookSourceRepo;
+use crate::util::text::normalize_source_url;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -27,6 +29,8 @@ impl BookSourceService {
     }
 
     pub async fn save(&self, user_ns: &str, mut source: BookSource) -> Result<(), AppError> {
+        // Whitespace variants of the same URL must not create duplicate rows.
+        source.book_source_url = normalize_source_url(&source.book_source_url);
         clear_auto_disable_when_reenabled(&mut source);
         let json =
             serde_json::to_string(&source).map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -37,6 +41,7 @@ impl BookSourceService {
         let serialized = sources
             .into_iter()
             .map(|mut source| {
+                source.book_source_url = normalize_source_url(&source.book_source_url);
                 clear_auto_disable_when_reenabled(&mut source);
                 serde_json::to_string(&source)
                     .map(|json| (source, json))
@@ -44,6 +49,43 @@ impl BookSourceService {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.repo.upsert_many(user_ns, &serialized).await
+    }
+
+    /// Merge duplicate rows that differ only by URL whitespace or a trailing
+    /// slash. Keeps the healthiest entry per group and returns the number of
+    /// removed rows.
+    pub async fn dedupe(&self, user_ns: &str) -> Result<usize, AppError> {
+        let list = self.list_own(user_ns).await?;
+        let mut groups: HashMap<String, Vec<BookSource>> = HashMap::new();
+        for source in list {
+            let key = normalize_source_url(&source.book_source_url)
+                .trim_end_matches('/')
+                .to_string();
+            groups.entry(key).or_default().push(source);
+        }
+        let mut removed = 0;
+        for (_, mut group) in groups {
+            if group.len() <= 1 {
+                continue;
+            }
+            group.sort_by_key(|source| {
+                (
+                    source.enabled == Some(false),
+                    std::cmp::Reverse(source.toc_success_count.unwrap_or(0)),
+                )
+            });
+            let keep = group.remove(0);
+            for other in group {
+                self.repo.delete(user_ns, &other.book_source_url).await?;
+                removed += 1;
+            }
+            let normalized = normalize_source_url(&keep.book_source_url);
+            if normalized != keep.book_source_url {
+                self.repo.delete(user_ns, &keep.book_source_url).await?;
+            }
+            self.save(user_ns, keep).await?;
+        }
+        Ok(removed)
     }
 
     /// Track toc-validation outcomes per source. Sources whose catalog rules
@@ -92,7 +134,26 @@ impl BookSourceService {
         Ok(true)
     }
 
+    /// Look up a source in the user's own namespace, falling back to the
+    /// default-owner (shared) namespace so every user can read through the
+    /// admin's sources without configuring their own.
     pub async fn get(
+        &self,
+        user_ns: &str,
+        book_source_url: &str,
+    ) -> Result<Option<BookSource>, AppError> {
+        if let Some(source) = self.get_own(user_ns, book_source_url).await? {
+            return Ok(Some(source));
+        }
+        if let Some(owner) = self.get_default_owner().await? {
+            if owner != user_ns {
+                return self.get_own(&owner, book_source_url).await;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_own(
         &self,
         user_ns: &str,
         book_source_url: &str,
@@ -109,7 +170,26 @@ impl BookSourceService {
         }
     }
 
+    /// The user's own sources plus the default owner's shared sources
+    /// (own entries win on URL conflicts).
     pub async fn list(&self, user_ns: &str) -> Result<Vec<BookSource>, AppError> {
+        let mut out = self.list_own(user_ns).await?;
+        if let Some(owner) = self.get_default_owner().await? {
+            if owner != user_ns {
+                let own_urls: HashSet<String> = out
+                    .iter()
+                    .map(|source| normalize_source_url(&source.book_source_url))
+                    .collect();
+                let shared = self.list_own(&owner).await?;
+                out.extend(shared.into_iter().filter(|source| {
+                    !own_urls.contains(&normalize_source_url(&source.book_source_url))
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_own(&self, user_ns: &str) -> Result<Vec<BookSource>, AppError> {
         let rows = self.repo.list(user_ns).await?;
         let mut out = Vec::with_capacity(rows.len());
         for j in rows {
