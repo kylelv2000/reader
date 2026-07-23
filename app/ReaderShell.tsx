@@ -2224,9 +2224,9 @@ export function ReaderShell() {
 
   async function resetReaderUserPassword(user: ReaderUser) {
     if (!api) return;
-    const password = window.prompt(`为 ${user.username} 设置新密码（至少 12 位）`);
+    const password = window.prompt(`为 ${user.username} 设置新密码（至少 6 位）`);
     if (!password) return;
-    if (password.length < 12 || password.length > 128) return toast("密码长度应为 12–128 位");
+    if (password.length < 6 || password.length > 128) return toast("密码长度应为 6–128 位");
     try {
       await api.resetPassword(user.username, password);
       toast("密码已重置");
@@ -2252,7 +2252,7 @@ export function ReaderShell() {
     const values = new FormData(form);
     const oldPassword = String(values.get("oldPassword") || "");
     const newPassword = String(values.get("newPassword") || "");
-    if (newPassword.length < 12 || newPassword.length > 128) return toast("新密码长度应为 12–128 位");
+    if (newPassword.length < 6 || newPassword.length > 128) return toast("新密码长度应为 6–128 位");
     try {
       await api.changePassword(oldPassword, newPassword);
       form.reset();
@@ -2319,7 +2319,7 @@ export function ReaderShell() {
             {waiting ? <div className="auth-loading" role="status"><span /><p>{connection === "authenticating" ? "正在登录…" : "正在连接…"}</p></div> : <>
               <p className="auth-hint">使用管理员创建的账号</p>
               <form onSubmit={loginAccount}>
-                <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={5} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
+                <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={3} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
                 <label>密码<input name="password" type="password" autoComplete="current-password" maxLength={128} required /></label>
                 <button className="primary-button full-button">登录</button>
               </form>
@@ -2715,12 +2715,12 @@ export function ReaderShell() {
                 <section className="library-panel">
                   <div className="panel-heading"><div><p className="eyebrow">账户安全</p><h2>{adminAuthorized ? "用户与权限" : "密码与登录会话"}</h2></div><span>{adminAuthorized ? "新账号仅能由管理员创建。" : "公开注册已关闭；如需新账号请联系管理员。"}</span></div>
                   {adminAuthorized && <>
-                    <form className="resource-form admin-user-form" onSubmit={addReaderUser}><input name="username" placeholder="新用户名（小写字母或数字）" minLength={5} maxLength={32} pattern="[a-z0-9]+" required /><input name="password" type="password" minLength={12} maxLength={128} placeholder="初始密码（至少 12 位）" autoComplete="new-password" required /><button className="quiet-button">创建用户</button></form>
+                    <form className="resource-form admin-user-form" onSubmit={addReaderUser}><input name="username" placeholder="新用户名（小写字母或数字，至少 3 位）" minLength={3} maxLength={32} pattern="[a-z0-9]+" required /><input name="password" type="password" minLength={6} maxLength={128} placeholder="初始密码（至少 6 位）" autoComplete="new-password" required /><button className="quiet-button">创建用户</button></form>
                     <div className="library-list">
                       {users.map((user) => <article className="library-row user-row" key={user.username}><span className="bookmark-mark"><AppIcon name="user" /></span><div><strong>{user.username}{user.isAdmin ? " · 管理员" : ""}</strong><small>最近登录：{user.lastLoginAt ? new Date(user.lastLoginAt).toLocaleString("zh-CN") : "从未"}</small></div><label><input type="checkbox" checked={user.enableLocalStore} onChange={() => toggleUserPermission(user, "enableLocalStore")} /> 本地书</label><label><input type="checkbox" checked={user.enableWebdav} onChange={() => toggleUserPermission(user, "enableWebdav")} /> WebDAV</label><div className="row-actions"><button className="text-button" onClick={() => resetReaderUserPassword(user)}>重置密码</button>{!user.isAdmin && <button className="text-button danger-text" onClick={() => deleteReaderUser(user)}>删除</button>}</div></article>)}
                     </div>
                   </>}
-                  <form className="resource-form password-form" onSubmit={changeOwnPassword}><input name="oldPassword" type="password" autoComplete="current-password" placeholder="当前密码" required /><input name="newPassword" type="password" minLength={12} maxLength={128} autoComplete="new-password" placeholder="新密码（至少 12 位）" required /><button className="quiet-button">修改我的密码</button></form>
+                  <form className="resource-form password-form" onSubmit={changeOwnPassword}><input name="oldPassword" type="password" autoComplete="current-password" placeholder="当前密码" required /><input name="newPassword" type="password" minLength={6} maxLength={128} autoComplete="new-password" placeholder="新密码（至少 6 位）" required /><button className="quiet-button">修改我的密码</button></form>
                 </section>
               )}
 

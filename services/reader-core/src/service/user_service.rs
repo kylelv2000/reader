@@ -232,8 +232,8 @@ impl UserService {
     }
 
     pub async fn reset_password(&self, username: &str, password: &str) -> Result<(), AppError> {
-        if !(12..=128).contains(&password.len()) {
-            return Err(AppError::BadRequest("密码长度应为12到128位".to_string()));
+        if !(6..=128).contains(&password.len()) {
+            return Err(AppError::BadRequest("密码长度应为6到128位".to_string()));
         }
         if username == "default" {
             return Err(AppError::BadRequest("用户不存在".to_string()));
@@ -256,8 +256,8 @@ impl UserService {
         old_password: &str,
         new_password: &str,
     ) -> Result<(), AppError> {
-        if !(12..=128).contains(&new_password.len()) {
-            return Err(AppError::BadRequest("密码长度应为12到128位".to_string()));
+        if !(6..=128).contains(&new_password.len()) {
+            return Err(AppError::BadRequest("密码长度应为6到128位".to_string()));
         }
         let (username, token) = parse_access_token(access_token)?;
         let mut user = self
@@ -705,11 +705,11 @@ impl UserService {
         if password.is_empty() {
             return Err(AppError::BadRequest("请输入密码".to_string()));
         }
-        if !(5..=32).contains(&username.len()) {
-            return Err(AppError::BadRequest("用户名长度应为5到32位".to_string()));
+        if !(3..=32).contains(&username.len()) {
+            return Err(AppError::BadRequest("用户名长度应为3到32位".to_string()));
         }
-        if !(12..=128).contains(&password.len()) {
-            return Err(AppError::BadRequest("密码长度应为12到128位".to_string()));
+        if !(6..=128).contains(&password.len()) {
+            return Err(AppError::BadRequest("密码长度应为6到128位".to_string()));
         }
         if username == "default" {
             return Err(AppError::BadRequest("用户名不能为非法字符".to_string()));

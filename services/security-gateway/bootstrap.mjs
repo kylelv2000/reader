@@ -4,8 +4,8 @@ const password = String(process.env.YOMU_ADMIN_PASSWORD || "");
 const code = String(process.env.READER_INVITE_CODE || "");
 const secureKey = String(process.env.READER_SECURE_KEY || "");
 
-if (!/^[a-z0-9]{5,32}$/.test(username)) throw new Error("YOMU_ADMIN_USERNAME must be 5-32 lowercase letters or digits");
-if (password.length < 12 || password.length > 128) throw new Error("YOMU_ADMIN_PASSWORD must be 12-128 characters");
+if (!/^[a-z0-9]{3,32}$/.test(username)) throw new Error("YOMU_ADMIN_USERNAME must be 3-32 lowercase letters or digits");
+if (password.length < 6 || password.length > 128) throw new Error("YOMU_ADMIN_PASSWORD must be 6-128 characters");
 if (!code) throw new Error("READER_INVITE_CODE is required for first-time setup");
 if (secureKey.length < 24) throw new Error("READER_SECURE_KEY must be configured for first-time setup");
 

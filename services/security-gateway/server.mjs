@@ -253,7 +253,7 @@ async function handleLogin(request, response) {
   const rateKey = `account\0${address}\0${username}`;
   const addressKey = `address\0${address}`;
   if (loginLimited(rateKey, 5) || loginLimited(addressKey, 20)) return json(response, 429, { isSuccess: false, errorMsg: "尝试次数过多，请稍后再试" });
-  if (!/^[a-z0-9]{5,32}$/.test(username) || password.length < 8 || password.length > 128) {
+  if (!/^[a-z0-9]{3,32}$/.test(username) || password.length < 6 || password.length > 128) {
     recordLoginFailure(rateKey);
     recordLoginFailure(addressKey);
     return json(response, 401, { isSuccess: false, errorMsg: "用户名或密码错误" });
