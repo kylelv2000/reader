@@ -6,6 +6,7 @@ use tokio::fs;
 
 pub const INVALID_BOOK_SOURCE_GROUP: &str = "失效";
 pub const INCOMPATIBLE_BOOK_SOURCE_GROUP: &str = "不兼容";
+const TOC_FAILURE_DISABLE_THRESHOLD: i32 = 3;
 
 #[derive(Clone)]
 pub struct BookSourceService {
@@ -43,6 +44,29 @@ impl BookSourceService {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.repo.upsert_many(user_ns, &serialized).await
+    }
+
+    /// Track toc-validation outcomes per source. Sources whose catalog rules
+    /// keep failing get auto-disabled so they stop polluting search results;
+    /// a single success resets the streak (tolerates transient failures).
+    pub async fn record_toc_outcome(
+        &self,
+        user_ns: &str,
+        source_url: &str,
+        ok: bool,
+    ) -> Result<bool, AppError> {
+        let Some(mut source) = self.get(user_ns, source_url).await? else {
+            return Ok(false);
+        };
+        if source.enabled == Some(false) {
+            return Ok(false);
+        }
+        if ok && source.toc_failure_count.unwrap_or(0) == 0 {
+            return Ok(false);
+        }
+        let disabled = apply_toc_outcome(&mut source, ok);
+        self.save(user_ns, source).await?;
+        Ok(disabled)
     }
 
     pub async fn auto_disable_if_incompatible(
@@ -188,6 +212,26 @@ fn truncate_reason(value: &str) -> String {
     }
 }
 
+/// Pure state transition for toc-outcome tracking. Returns true when the
+/// source crossed the failure threshold and was auto-disabled.
+fn apply_toc_outcome(source: &mut BookSource, ok: bool) -> bool {
+    if ok {
+        source.toc_failure_count = None;
+        return false;
+    }
+    let count = source.toc_failure_count.unwrap_or(0) + 1;
+    if count >= TOC_FAILURE_DISABLE_THRESHOLD {
+        source.enabled = Some(false);
+        source.auto_disabled_reason = Some("目录规则连续失败".to_string());
+        source.auto_disabled_at = Some(chrono::Utc::now().timestamp_millis());
+        source.toc_failure_count = None;
+        add_source_group(source, INCOMPATIBLE_BOOK_SOURCE_GROUP);
+        return true;
+    }
+    source.toc_failure_count = Some(count);
+    false
+}
+
 fn add_source_group(source: &mut BookSource, group: &str) {
     let mut groups = source
         .book_source_group
@@ -294,6 +338,30 @@ mod tests {
             "invalid url options: expected value".to_string()
         ))
         .is_some());
+    }
+
+    #[test]
+    fn toc_failures_disable_source_after_threshold_and_success_resets() {
+        let mut source = BookSource {
+            enabled: Some(true),
+            ..BookSource::default()
+        };
+
+        assert!(!apply_toc_outcome(&mut source, false));
+        assert!(!apply_toc_outcome(&mut source, false));
+        assert_eq!(source.toc_failure_count, Some(2));
+
+        // One success wipes the streak.
+        assert!(!apply_toc_outcome(&mut source, true));
+        assert!(source.toc_failure_count.is_none());
+
+        // Three consecutive failures auto-disable the source.
+        assert!(!apply_toc_outcome(&mut source, false));
+        assert!(!apply_toc_outcome(&mut source, false));
+        assert!(apply_toc_outcome(&mut source, false));
+        assert_eq!(source.enabled, Some(false));
+        assert_eq!(source.auto_disabled_reason.as_deref(), Some("目录规则连续失败"));
+        assert!(book_source_has_group(&source, INCOMPATIBLE_BOOK_SOURCE_GROUP));
     }
 
     #[test]

@@ -17,6 +17,9 @@ pub struct BookSource {
     pub auto_disabled_reason: Option<String>,
     #[serde(deserialize_with = "deserialize_i64_option")]
     pub auto_disabled_at: Option<i64>,
+    /// Consecutive toc-validation failures; the source is auto-disabled once
+    /// this reaches the threshold, and any success resets it.
+    pub toc_failure_count: Option<i32>,
     pub enabled_explore: Option<bool>,
     pub enabled_cookie_jar: Option<bool>,
     pub js_lib: Option<String>,

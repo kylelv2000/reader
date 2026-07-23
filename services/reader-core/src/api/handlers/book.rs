@@ -2177,6 +2177,10 @@ pub async fn save_book(
         .unwrap_or_else(|_| Ok(Vec::new()))
         .unwrap_or_default();
 
+        let _ = state
+            .book_source_service
+            .record_toc_outcome(&user_ns, &src.book_source_url, !chapters.is_empty())
+            .await;
         if !chapters.is_empty() {
             book.toc_url = Some(toc_url);
             book.total_chapter_num = Some(chapters.len() as i32);
@@ -4084,6 +4088,33 @@ pub async fn get_available_book_source_sse(
 }
 
 async fn validate_available_source_candidate(
+    state: &AppState,
+    user_ns: &str,
+    source: &BookSource,
+    candidate: SearchBook,
+) -> Option<SearchBook> {
+    let result = validate_candidate_toc(state, user_ns, source, candidate).await;
+    // Track per-source toc reliability so sources with broken catalog rules
+    // are auto-disabled and stop appearing in search and scans.
+    match state
+        .book_source_service
+        .record_toc_outcome(user_ns, &source.book_source_url, result.is_some())
+        .await
+    {
+        Ok(true) => tracing::warn!(
+            source = %source.book_source_name,
+            "auto-disabled book source after repeated toc failures"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::debug!(
+            source = %source.book_source_name,
+            "failed to record toc outcome: {error:?}"
+        ),
+    }
+    result
+}
+
+async fn validate_candidate_toc(
     state: &AppState,
     user_ns: &str,
     source: &BookSource,
