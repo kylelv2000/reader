@@ -2145,50 +2145,158 @@ pub async fn save_book(
         book.toc_url = Some(repair_encoded_url(toc_url));
     }
 
-    let source = state
+    let mut source = state
         .book_source_service
         .get(&user_ns, &book.origin)
         .await?;
 
-    if let Some(ref source) = source {
+    if let Some(src) = source.clone() {
         if let Ok(info) = state
             .book_service
-            .get_book_info(&user_ns, source, &book.book_url)
+            .get_book_info(&user_ns, &src, &book.book_url)
             .await
         {
             merge_book(&mut book, info);
+        }
+
+        // The catalog must actually work before the book lands on the shelf.
+        // Search results can come from sources whose detail/toc rules are
+        // broken, so validate now and fall back to a working source if needed.
+        let toc_url = book
+            .toc_url
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| book.book_url.clone());
+        let chapters = tokio::time::timeout(
+            std::time::Duration::from_secs(AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS),
+            state
+                .book_service
+                .get_chapter_list_with_cache(&user_ns, &src, &toc_url, false),
+        )
+        .await
+        .unwrap_or_else(|_| Ok(Vec::new()))
+        .unwrap_or_default();
+
+        if !chapters.is_empty() {
+            book.toc_url = Some(toc_url);
+            book.total_chapter_num = Some(chapters.len() as i32);
+            if book
+                .latest_chapter_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                book.latest_chapter_title = chapters.last().map(|c| c.title.clone());
+            }
+        } else {
+            let fallback = if book.name.trim().is_empty() {
+                None
+            } else {
+                find_working_source_for_book(&state, &user_ns, &book.name, &book.author, &book.origin)
+                    .await
+            };
+            let Some((new_source, candidate)) = fallback else {
+                return Err(AppError::BadRequest(
+                    "该书源无法获取目录，且未找到其他可用书源".to_string(),
+                ));
+            };
+            book.origin = normalize_source_url(&new_source.book_source_url);
+            book.origin_name = Some(new_source.book_source_name.clone());
+            book.book_url = candidate.book_url;
+            book.toc_url = candidate.toc_url;
+            book.total_chapter_num = candidate.total_chapter_num;
+            book.cover_url = candidate.cover_url.or(book.cover_url);
+            book.latest_chapter_title = candidate.last_chapter.or(book.latest_chapter_title);
+            book.intro = candidate.intro.or(book.intro);
+            book.kind = candidate.kind.or(book.kind);
+            source = Some(new_source);
         }
     }
 
     let saved = state.book_service.save_book(&user_ns, book).await?;
 
-    // Pre-fetch chapter list and cover in background
-    if let Some(source) = source {
-        let state_bg = state.clone();
-        let user_ns_bg = user_ns.clone();
-        let book_url = saved.book_url.clone();
-        let toc_url = saved
-            .toc_url
-            .clone()
-            .unwrap_or_else(|| book_url.clone());
-        let cover_url = saved.cover_url.clone();
-        tokio::spawn(async move {
-            let _ = state_bg
-                .book_service
-                .get_chapter_list_with_cache(&user_ns_bg, &source, &toc_url, false)
-                .await;
-            if let Some(url) = cover_url {
+    // Chapter list is already cached by validation; only the cover download
+    // still needs to happen, and it can run in the background.
+    if source.is_some() {
+        if let Some(cover_url) = saved.cover_url.clone() {
+            let state_bg = state.clone();
+            let user_ns_bg = user_ns.clone();
+            let book_url = saved.book_url.clone();
+            tokio::spawn(async move {
                 let _ = state_bg
                     .book_service
-                    .get_or_cache_book_cover(&user_ns_bg, &book_url, &url)
+                    .get_or_cache_book_cover(&user_ns_bg, &book_url, &cover_url)
                     .await;
-            }
-        });
+            });
+        }
     }
 
     Ok(Json(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
     )))
+}
+
+/// Scan enabled sources for an exact name/author match whose catalog actually
+/// resolves. Returns the first validated hit (sources are tried in priority
+/// order, four at a time).
+async fn find_working_source_for_book(
+    state: &AppState,
+    user_ns: &str,
+    name: &str,
+    author: &str,
+    exclude_origin: &str,
+) -> Option<(BookSource, SearchBook)> {
+    let mut sources = state
+        .book_source_service
+        .list(user_ns)
+        .await
+        .ok()?
+        .into_iter()
+        .filter(source_supports_available_search)
+        .filter(|s| normalize_source_url(&s.book_source_url) != exclude_origin)
+        .collect::<Vec<_>>();
+    prioritize_available_sources(&mut sources);
+
+    let mut next = 0usize;
+    let mut tasks: JoinSet<Option<(BookSource, SearchBook)>> = JoinSet::new();
+    loop {
+        while tasks.len() < AVAILABLE_SOURCE_VALIDATION_CONCURRENT && next < sources.len() {
+            let source = sources[next].clone();
+            next += 1;
+            let state = state.clone();
+            let user_ns = user_ns.to_string();
+            let name = name.to_string();
+            let author = author.to_string();
+            tasks.spawn(async move {
+                let list = tokio::time::timeout(
+                    std::time::Duration::from_secs(AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS),
+                    state.book_service.search_book(&user_ns, &source, &name, 1),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                let candidate = list
+                    .into_iter()
+                    .find(|b| available_source_matches_target(b, &name, &author))?;
+                let validated = tokio::time::timeout(
+                    std::time::Duration::from_secs(AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS),
+                    validate_available_source_candidate(&state, &user_ns, &source, candidate),
+                )
+                .await
+                .ok()??;
+                Some((source, validated))
+            });
+        }
+        match tasks.join_next().await {
+            Some(Ok(Some(hit))) => {
+                tasks.abort_all();
+                return Some(hit);
+            }
+            Some(_) => continue,
+            None => return None,
+        }
+    }
 }
 
 pub async fn save_books(

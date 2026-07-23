@@ -384,6 +384,7 @@ export function ReaderShell() {
   const [offlinePickerBook, setOfflinePickerBook] = useState<Book | null>(null);
   const [coverPickerBook, setCoverPickerBook] = useState<Book | null>(null);
   const [coverCandidates, setCoverCandidates] = useState<Book[]>([]);
+  const [addingBooks, setAddingBooks] = useState<Set<string>>(new Set());
   const [coverScanning, setCoverScanning] = useState(false);
   const [coverSaving, setCoverSaving] = useState(false);
   const [coverPickerError, setCoverPickerError] = useState("");
@@ -890,23 +891,26 @@ export function ReaderShell() {
   }
 
   async function addBook(book: Book) {
+    if (addingBooks.has(book.bookUrl)) return;
+    setAddingBooks((current) => new Set(current).add(book.bookUrl));
     try {
       if (!api || connection !== "connected") throw new Error("离线时无法添加书籍");
+      // Server validates the catalog and may switch to a working source,
+      // so trust the returned book (bookUrl/origin can change).
       const saved = await api.saveBook({ ...book, durChapterTime: Date.now() });
-      let enriched = { ...book, ...saved, durChapterTime: Date.now() };
+      const enriched = { ...book, ...saved, durChapterTime: Date.now() };
       setBooks((current) =>
         current.some((item) => item.bookUrl === enriched.bookUrl) ? current : [enriched, ...current],
       );
       toast("已加入书架");
-      // Pre-fetch chapter list and cover in background
-      api.getChapterList(enriched).then((chapters) => {
-        if (chapters.length) {
-          enriched = { ...enriched, totalChapterNum: chapters.length };
-          setBooks((current) => current.map((b) => b.bookUrl === enriched.bookUrl ? enriched : b));
-        }
-      }).catch(() => undefined);
     } catch (error) {
       toast(error instanceof Error ? error.message : "加入书架失败");
+    } finally {
+      setAddingBooks((current) => {
+        const next = new Set(current);
+        next.delete(book.bookUrl);
+        return next;
+      });
     }
   }
 
@@ -2326,7 +2330,7 @@ export function ReaderShell() {
                         <p>{book.author} · {sourceCount} 个书源</p>
                         <small>{latestChapterFor(book) || (book.totalChapterNum ? `共 ${book.totalChapterNum} 章` : "")}</small>
                       </div>
-                      {onShelf ? <span className="quiet-button on-shelf">已在书架</span> : <button className="quiet-button" onClick={() => addBook(book)}>加入书架</button>}
+                      {onShelf ? <span className="quiet-button on-shelf">已在书架</span> : <button className="quiet-button" disabled={addingBooks.has(book.bookUrl)} onClick={() => addBook(book)}>{addingBooks.has(book.bookUrl) ? "验证书源…" : "加入书架"}</button>}
                     </article>
                   );
                 })}
