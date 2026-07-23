@@ -218,11 +218,13 @@ export class ReaderApi {
           const key = `${book.name.trim()}\u0000${book.author.trim()}`;
           const existing = books.get(key);
           if (existing) {
-            const urls = [...(existing.bookSourceUrls || [existing.origin])];
-            if (book.origin && !urls.includes(book.origin)) urls.push(book.origin);
-            books.set(key, { ...existing, bookSourceUrls: urls });
+            const urls = existing.bookSourceUrls || (existing.origin ? [existing.origin] : []);
+            books.set(key, {
+              ...existing,
+              bookSourceUrls: book.origin && !urls.includes(book.origin) ? [...urls, book.origin] : urls,
+            });
           } else {
-            books.set(key, { ...book, bookSourceUrls: [book.origin] });
+            books.set(key, { ...book, bookSourceUrls: book.origin ? [book.origin] : [] });
           }
         }
         if (payload.data?.length) onBatch?.([...books.values()]);
