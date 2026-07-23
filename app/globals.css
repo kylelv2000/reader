@@ -1437,7 +1437,9 @@ textarea:focus-visible {
 .cover-candidate-image {
   display: block;
   width: 52px;
-  aspect-ratio: 3 / 4;
+  /* Explicit height: CSS aspect-ratio is ignored for loaded <img> elements,
+     which would let tall covers render at their intrinsic ratio. */
+  height: 69px;
   background: var(--soft);
   border-radius: 7px;
   object-fit: cover;
