@@ -3036,6 +3036,26 @@ textarea:focus-visible {
   border-radius: 50%;
 }
 
+.catalog-slider {
+  display: grid;
+  gap: 3px;
+  margin-top: 12px;
+}
+
+.catalog-slider input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.catalog-slider output {
+  overflow: hidden;
+  color: var(--reader-panel-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .catalog-list {
   overflow-y: auto;
   margin: 10px -8px 0;

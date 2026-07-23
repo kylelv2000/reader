@@ -412,6 +412,8 @@ export function ReaderShell() {
   const progressDirtyRef = useRef(false);
   const lastSyncedProgressRef = useRef<{ index: number; position: number } | null>(null);
   const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
+  const catalogListRef = useRef<HTMLDivElement>(null);
+  const [catalogSliderIndex, setCatalogSliderIndex] = useState(0);
   const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number } | null>(null);
   const readerTouchActiveRef = useRef(false);
   const pageSnapTimerRef = useRef<number | null>(null);
@@ -617,6 +619,7 @@ export function ReaderShell() {
 
   useEffect(() => {
     if (!showCatalog) return;
+    setCatalogSliderIndex(reader?.chapterIndex || 0);
     const frame = window.requestAnimationFrame(() => {
       activeCatalogChapterRef.current?.scrollIntoView({ block: "center" });
     });
@@ -2881,7 +2884,23 @@ export function ReaderShell() {
           {showCatalog && (
             <aside className="reader-drawer catalog-drawer">
               <header><div><p className="eyebrow">目录</p><h2>{reader.book.name}</h2></div><button onClick={() => setShowCatalog(false)}>×</button></header>
-              <div className="catalog-list">{reader.chapters.map((chapter) => <button ref={chapter.index === reader.chapterIndex ? activeCatalogChapterRef : undefined} key={`${chapter.index}-${chapter.url}`} className={chapter.index === reader.chapterIndex ? "active" : ""} onClick={() => loadChapter(chapter.index)}><span>{String(chapter.index + 1).padStart(2, "0")}</span>{chapter.title}</button>)}</div>
+              {reader.chapters.length > 1 && <div className="catalog-slider">
+                <input type="range" min={0} max={reader.chapters.length - 1} value={catalogSliderIndex} aria-label="快速定位章节" onChange={(event) => {
+                  const index = Number(event.target.value);
+                  setCatalogSliderIndex(index);
+                  const list = catalogListRef.current;
+                  if (!list) return;
+                  const max = list.scrollHeight - list.clientHeight;
+                  if (max > 0) list.scrollTop = (index / (reader.chapters.length - 1)) * max;
+                }} />
+                <output>{catalogSliderIndex + 1} / {reader.chapters.length} · {reader.chapters[catalogSliderIndex]?.title || ""}</output>
+              </div>}
+              <div className="catalog-list" ref={catalogListRef} onScroll={() => {
+                const list = catalogListRef.current;
+                if (!list || reader.chapters.length < 2) return;
+                const max = list.scrollHeight - list.clientHeight;
+                if (max > 0) setCatalogSliderIndex(Math.round((list.scrollTop / max) * (reader.chapters.length - 1)));
+              }}>{reader.chapters.map((chapter) => <button ref={chapter.index === reader.chapterIndex ? activeCatalogChapterRef : undefined} key={`${chapter.index}-${chapter.url}`} className={chapter.index === reader.chapterIndex ? "active" : ""} onClick={() => loadChapter(chapter.index)}><span>{String(chapter.index + 1).padStart(2, "0")}</span>{chapter.title}</button>)}</div>
             </aside>
           )}
           {showReaderSettings && (
