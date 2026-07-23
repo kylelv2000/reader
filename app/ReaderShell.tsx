@@ -1369,7 +1369,12 @@ export function ReaderShell() {
     if (!url?.trim()) return;
     try {
       const rows = await api.readRemoteBookSources(url.trim());
-      const imported = rows.map((row) => JSON.parse(row) as BookSource).filter((source) => source.bookSourceName && source.bookSourceUrl);
+      const imported = rows
+        .flatMap((row) => {
+          const parsed = JSON.parse(row) as BookSource | BookSource[];
+          return Array.isArray(parsed) ? parsed : [parsed];
+        })
+        .filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!imported.length) throw new Error("该地址没有可识别的书源");
       await api.saveBookSources(imported);
       await hydrateFromServer(api, false);

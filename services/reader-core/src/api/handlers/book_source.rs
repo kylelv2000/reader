@@ -1183,14 +1183,15 @@ pub async fn read_remote_source_file(
         .map_err(|e| AppError::BadRequest(format!("网络请求失败: {}", e)))?
         .error_for_status()
         .map_err(|e| AppError::BadRequest(format!("远程书源返回错误: {}", e)))?;
-    if response.content_length().map(|size| size > 2 * 1024 * 1024).unwrap_or(false) {
+    const MAX_REMOTE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
+    if response.content_length().map(|size| size > MAX_REMOTE_SOURCE_BYTES as u64).unwrap_or(false) {
         return Err(AppError::BadRequest("remote source file is too large".to_string()));
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(AppError::Http)?;
-        if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_SOURCE_BYTES {
             return Err(AppError::BadRequest("remote source file is too large".to_string()));
         }
         bytes.extend_from_slice(&chunk);
