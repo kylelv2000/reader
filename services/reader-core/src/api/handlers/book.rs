@@ -3292,7 +3292,7 @@ pub async fn search_book_multi_sse(
             return;
         }
 
-        let sources = if let Some(url) = book_source_url {
+        let mut sources = if let Some(url) = book_source_url {
             match state_clone.book_source_service.get(&user_ns, &url).await {
                 Ok(Some(s)) => vec![s],
                 _ => {
@@ -3342,6 +3342,8 @@ pub async fn search_book_multi_sse(
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
+        // Proven sources search first so their results stream in earliest.
+        prioritize_available_sources(&mut sources);
 
         let mut idx = last_index + 1;
         let mut last_idx = last_index;
@@ -4701,11 +4703,13 @@ fn source_search_requires_webview(source: &BookSource) -> bool {
 
 fn prioritize_available_sources(sources: &mut [BookSource]) {
     // Stable sorting retains the user's existing order for equivalent entries.
+    // Sources with a proven toc track record come first, then fast responders.
     // A recorded response time of zero/missing means "unknown", not "instant".
     sources.sort_by_key(|source| {
         let response_time = source.respond_time.filter(|value| *value > 0);
         (
             source_search_requires_webview(source),
+            std::cmp::Reverse(source.toc_success_count.unwrap_or(0)),
             response_time.is_none(),
             response_time.unwrap_or(i64::MAX),
         )

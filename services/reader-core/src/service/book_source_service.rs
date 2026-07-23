@@ -61,9 +61,6 @@ impl BookSourceService {
         if source.enabled == Some(false) {
             return Ok(false);
         }
-        if ok && source.toc_failure_count.unwrap_or(0) == 0 {
-            return Ok(false);
-        }
         let disabled = apply_toc_outcome(&mut source, ok);
         self.save(user_ns, source).await?;
         Ok(disabled)
@@ -217,6 +214,8 @@ fn truncate_reason(value: &str) -> String {
 fn apply_toc_outcome(source: &mut BookSource, ok: bool) -> bool {
     if ok {
         source.toc_failure_count = None;
+        // Frequently working sources get prioritized in search and scans.
+        source.toc_success_count = Some(source.toc_success_count.unwrap_or(0).saturating_add(1));
         return false;
     }
     let count = source.toc_failure_count.unwrap_or(0) + 1;
@@ -351,17 +350,20 @@ mod tests {
         assert!(!apply_toc_outcome(&mut source, false));
         assert_eq!(source.toc_failure_count, Some(2));
 
-        // One success wipes the streak.
+        // One success wipes the failure streak and counts toward priority.
         assert!(!apply_toc_outcome(&mut source, true));
         assert!(source.toc_failure_count.is_none());
+        assert_eq!(source.toc_success_count, Some(1));
 
-        // Three consecutive failures auto-disable the source.
+        // Three consecutive failures auto-disable the source; the success
+        // history is kept for reference.
         assert!(!apply_toc_outcome(&mut source, false));
         assert!(!apply_toc_outcome(&mut source, false));
         assert!(apply_toc_outcome(&mut source, false));
         assert_eq!(source.enabled, Some(false));
         assert_eq!(source.auto_disabled_reason.as_deref(), Some("目录规则连续失败"));
         assert!(book_source_has_group(&source, INCOMPATIBLE_BOOK_SOURCE_GROUP));
+        assert_eq!(source.toc_success_count, Some(1));
     }
 
     #[test]

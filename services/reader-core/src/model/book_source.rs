@@ -20,6 +20,9 @@ pub struct BookSource {
     /// Consecutive toc-validation failures; the source is auto-disabled once
     /// this reaches the threshold, and any success resets it.
     pub toc_failure_count: Option<i32>,
+    /// Total successful toc validations. Frequently working sources are
+    /// searched and scanned first.
+    pub toc_success_count: Option<i32>,
     pub enabled_explore: Option<bool>,
     pub enabled_cookie_jar: Option<bool>,
     pub js_lib: Option<String>,
