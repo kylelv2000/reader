@@ -1,5 +1,10 @@
 name: yomu-reader
 
+# 正式部署只需要这一个文件：
+#   docker compose --env-file deploy/.env -f deploy/compose.yml up -d
+# 需要 WebView 书源时加 --profile webview。
+# 自行编译源码请叠加 deploy/compose.dev.yml（见 deploy/README.md）。
+
 services:
   yomu-app:
     image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}
@@ -49,6 +54,9 @@ services:
       REQUEST_TIMEOUT_SECS: "${READER_REQUEST_TIMEOUT_SECS:-20}"
       MAX_OUTBOUND_CONCURRENT: "${READER_MAX_OUTBOUND_CONCURRENT:-16}"
       LOG_LEVEL: "${READER_LOG_LEVEL:-info}"
+      # 以下两项仅在 --profile webview 时由 Compose 注入；平时留空即可。
+      WEBVIEW_BRIDGE_URL: ${WEBVIEW_BRIDGE_URL:-}
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:-}
     expose:
       - "18080"
     volumes:
@@ -62,6 +70,34 @@ services:
       - ALL
     mem_limit: 512m
 
+  # 可选：内含 Chromium 的 WebView 旁车，仅少数书源需要。
+  # 启用：docker compose ... --profile webview up -d
+  # 同时在 deploy/.env 设置 WEBVIEW_BRIDGE_URL=http://webview-bridge:19090
+  webview-bridge:
+    profiles: ["webview"]
+    image: docker.io/komqaq/yomu-reader:webview-${YOMU_IMAGE_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?set WEBVIEW_BRIDGE_KEY in deploy/.env}
+      WEBVIEW_MAX_CONCURRENT: ${WEBVIEW_MAX_CONCURRENT:-1}
+      WEBVIEW_IDLE_SECONDS: ${WEBVIEW_IDLE_SECONDS:-120}
+      WEBVIEW_MAX_RESPONSE_BYTES: ${WEBVIEW_MAX_RESPONSE_BYTES:-8388608}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:19090/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+    shm_size: 512mb
+    mem_limit: 896m
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # 一次性任务：首次部署时创建管理员账号（不常驻）。
   admin-init:
     profiles: ["setup"]
     image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}

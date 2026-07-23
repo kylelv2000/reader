@@ -1,66 +1,103 @@
-# 小规模自托管
+# 部署指南
 
-默认部署面向个人和少量用户，常驻服务只有两个：`yomu-app` 同时提供 PWA、同源安全网关与安全响应头，`reader-core` 负责书源和持久数据。只有 App 绑定宿主机回环端口，Core 不对外开放。首次管理员初始化是一次性任务，不是常驻容器。
+正式部署只需要 `deploy/compose.yml` 一个文件，镜像从 Docker Hub（`komqaq/yomu-reader`）拉取，服务器不需要编译任何东西。常驻服务只有两个：
+
+- **yomu-app** — 网页界面 + 安全网关，只有它绑定宿主机端口（仅 127.0.0.1）
+- **reader-core** — 书源抓取与数据存储（SQLite + 文件），不对外开放
+
+## 快速开始（三步）
 
 ```bash
+# 1. 准备配置：复制模板并按注释填写 3 个必填项
 cp deploy/.env.example deploy/.env
-# 修改公开 HTTPS 地址，并用 `openssl rand -hex 32` 分别生成会话密钥、管理密钥和邀请码
-docker compose --env-file deploy/.env -f deploy/compose.yml pull
-docker compose --env-file deploy/.env -f deploy/compose.yml up -d reader-core
+vim deploy/.env   # 详细说明见 .env.example 内的注释，或下方参数表
 
-# 首次部署只运行一次：在容器内网创建首位管理员，不开放网页注册
+# 2. 首次部署：创建管理员账号（一次性，不常驻）
+docker compose --env-file deploy/.env -f deploy/compose.yml up -d reader-core
 read -r "YOMU_ADMIN_USERNAME?管理员用户名（5–32 位小写字母或数字）: "
 read -rs "YOMU_ADMIN_PASSWORD?管理员密码（至少 12 位）: "; echo
 export YOMU_ADMIN_USERNAME YOMU_ADMIN_PASSWORD
 docker compose --env-file deploy/.env -f deploy/compose.yml --profile setup run --rm admin-init
 unset YOMU_ADMIN_PASSWORD
 
+# 3. 启动全部服务
 docker compose --env-file deploy/.env -f deploy/compose.yml up -d
 ```
 
-也可以让仓库内脚本一次性生成权限为 `0600` 的生产配置，密钥只写入文件且不会打印：
+然后用浏览器打开 `YOMU_PUBLIC_ORIGIN` 填写的地址登录即可。外层反向代理（Caddy/Nginx 等）只需把 HTTPS 流量转发到 `127.0.0.1:8080`。
+
+也可以用脚本一次性生成权限为 `0600` 的配置文件（密钥自动生成、不打印）：
 
 ```bash
 python3 scripts/prepare-deploy-env.py \
   --output deploy/.env \
   --origin https://reader.example.com \
-  --port 8080 \
-  --storage /absolute/path/to/reader-storage
+  --port 8080
 ```
 
-生产环境通过 `YOMU_PUBLIC_ORIGIN` 填写的 HTTPS 域名访问。若外层已有反向代理，只把它连接到 Yomu 的 `8080` 端口；防火墙不要暴露 Core 或 WebView。只有本机临时测试时才可把 `YOMU_PUBLIC_ORIGIN` 改成 `http://localhost:8080` 并设置 `YOMU_COOKIE_SECURE=false`。
+## 参数说明
 
-持久数据默认位于 Docker volume `reader-storage`。升级前应备份该 volume；对个人实例，SQLite + 文件目录比引入独立数据库和缓存服务更省内存也更容易恢复。若要原位迁移旧 Reader Pro，可先完整备份旧目录，再在 `deploy/.env` 中把 `READER_STORAGE` 设置为旧数据目录的绝对路径；新版会自动迁移旧用户和继续读取原书架。旧版 `bookSource.json` 可在核心首次启动后用 `scripts/migrate-reader-pro.py` 事务导入。
+**必填 3 项：**
 
-生产 Compose 只从 Docker Hub 的 `komqaq/yomu-reader` 拉取预编译 amd64 镜像，服务器不会现场下载源码、安装依赖或编译。Rust Core 的固定源码已纳入本仓库。公开注册和 AI API 在外部入口关闭；管理员直接凭管理员账户管理用户，不把 `SECURE_KEY` 交给浏览器。需要真实 WebView 的书源才启用附加配置，避免普通阅读时常驻浏览器进程。
+| 参数 | 填什么 |
+|------|--------|
+| `YOMU_PUBLIC_ORIGIN` | 浏览器访问地址，如 `https://reader.example.com`；本机测试填 `http://localhost:8080` 并把 `YOMU_COOKIE_SECURE` 改为 `false` |
+| `YOMU_SESSION_SECRET` | 32 位以上随机字符串（`openssl rand -hex 32`），加密登录会话 |
+| `READER_SECURE_KEY` | 长随机字符串，服务器管理密钥，等同超级管理员密码 |
 
-App 生产容器只携带构建结果和运行期代码，不包含构建工具目录；默认两个服务均以非 root 身份运行。部署后可按 [`../docs/SECURITY.md`](../docs/SECURITY.md) 的命令执行端到端安全检查。
+**首次部署需要：**
 
-## 需要 WebView 的书源
+| 参数 | 填什么 |
+|------|--------|
+| `READER_INVITE_CODE` | 随机字符串，仅创建首位管理员时用到 |
 
-默认部署不启动浏览器。确认书源规则使用 `webView` / `webJs` 后，为 `WEBVIEW_BRIDGE_KEY` 生成随机长密钥，再用附加配置启动一个内含 Chromium 的 WebView 容器：
+**常用可选（有合理默认值）：**
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `YOMU_IMAGE_VERSION` | `latest` | 镜像版本，可固定如 `1.2.1` 便于回滚 |
+| `YOMU_PORT` | `8080` | 绑定到 127.0.0.1 的端口，反向代理转发到它 |
+| `READER_STORAGE` | `reader-storage` | 数据位置：默认 Docker 卷；填绝对路径可直接落盘、便于备份或迁移旧 Reader Pro 数据 |
+| `YOMU_COOKIE_SECURE` | `true` | 有 HTTPS 保持 `true`；localhost 测试改 `false` |
+| `READER_USER_LIMIT` | `10` | 用户数上限 |
+| `READER_USER_BOOK_LIMIT` | `2000` | 每用户书籍上限 |
+| `READER_REQUEST_TIMEOUT_SECS` | `20` | 抓取书源的请求超时（秒） |
+| `READER_MAX_OUTBOUND_CONCURRENT` | `16` | 对外抓取并发上限，小带宽可调低 |
+| `READER_LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` |
+
+其余进阶参数（会话时长、上传上限、WebView 细节等）见 `.env.example` 内的逐项注释。
+
+## 可选：WebView 书源
+
+个别书源需要真实浏览器执行 JS。默认不启动；确认需要后：
+
+1. 在 `deploy/.env` 取消注释 `WEBVIEW_BRIDGE_URL` 和 `WEBVIEW_BRIDGE_KEY`（KEY 填随机字符串）
+2. 启动时追加 profile：
 
 ```bash
-docker compose --env-file deploy/.env \
-  -f deploy/compose.yml \
-  -f deploy/compose.webview.yml \
-  pull
-docker compose --env-file deploy/.env \
-  -f deploy/compose.yml \
-  -f deploy/compose.webview.yml \
-  up -d
+docker compose --env-file deploy/.env -f deploy/compose.yml --profile webview up -d
 ```
 
-只有规则明确要求 WebView 时，Core 才把这一次抓取转给浏览器旁车。旁车默认只开一个页面，限制脚本时间和响应大小，屏蔽图片/媒体/字体，拒绝 localhost、内网和云元数据地址；Chromium 不开放调试端口，空闲后自动退出。
+WebView 容器常驻约 800MB 内存，空闲自动休眠；只有规则明确要求 WebView 的抓取才会经过它，普通书源始终走轻量 HTTP 引擎。去掉 `--profile webview` 重新 `up -d` 即可停用。
 
-升级、备份、密钥轮换与安全检查见 [`../docs/SECURITY.md`](../docs/SECURITY.md)。
-
-普通 HTTP 书源始终走 Rust/Reqwest，不会唤醒浏览器。停止 WebView 组件并回到低内存模式：
+## 升级与备份
 
 ```bash
-docker compose --env-file deploy/.env \
-  -f deploy/compose.yml \
-  -f deploy/compose.webview.yml \
-  down
+docker compose --env-file deploy/.env -f deploy/compose.yml pull
 docker compose --env-file deploy/.env -f deploy/compose.yml up -d
 ```
+
+数据全部在 `READER_STORAGE`（默认 Docker 卷 `reader-storage`）里，升级前备份它即可。旧版 Reader Pro 迁移：把 `READER_STORAGE` 指向旧数据目录，首次启动自动迁移；旧 `bookSource.json` 可用 `scripts/migrate-reader-pro.py` 导入。
+
+安全加固、密钥轮换与端到端检查见 [`../docs/SECURITY.md`](../docs/SECURITY.md)。
+
+## 开发 / 自编译版
+
+不想用预编译镜像、或者要在服务器上跑自己改过的代码时，叠加 `compose.dev.yml` 从源码构建（前端需要 Node 构建环境，Rust Core 编译一次约 5 分钟）：
+
+```bash
+docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.dev.yml build
+docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.dev.yml up -d
+```
+
+其余用法（初始化、WebView profile、参数）与正式版完全一致。
