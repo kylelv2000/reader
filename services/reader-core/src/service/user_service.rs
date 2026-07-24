@@ -202,6 +202,61 @@ impl UserService {
         Ok(users.values().map(|u| self.format_user(u)).collect())
     }
 
+    /// First-boot setup: when secure mode is on and no account exists yet,
+    /// create the initial admin so a plain `docker compose up -d` works with
+    /// no separate bootstrap step. Username/password come from
+    /// ADMIN_USERNAME / ADMIN_PASSWORD; a missing password is generated,
+    /// logged once, and saved to {storage}/data/initial-admin-password.txt.
+    pub async fn ensure_initial_admin(&self) -> Result<(), AppError> {
+        if !self.cfg.secure || self.user_count().await? > 0 {
+            return Ok(());
+        }
+        let username = std::env::var("ADMIN_USERNAME")
+            .ok()
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| {
+                (3..=32).contains(&value.len())
+                    && value.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+            })
+            .unwrap_or_else(|| "admin".to_string());
+        let supplied = std::env::var("ADMIN_PASSWORD")
+            .ok()
+            .filter(|value| (6..=128).contains(&value.len()));
+        let generated = supplied.is_none();
+        let password = supplied.unwrap_or_else(|| random_string(16));
+        let now = now_ms();
+        let user = User {
+            username: username.clone(),
+            password: hash_password(&password)?,
+            salt: String::new(),
+            token: String::new(),
+            last_login_at: now,
+            created_at: now,
+            enable_webdav: false,
+            token_map: None,
+            enable_local_store: false,
+            is_admin: true,
+        };
+        self.upsert_user_row(&user).await?;
+        if generated {
+            let path = self.data_root.join("initial-admin-password.txt");
+            fs::create_dir_all(&self.data_root)
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+            fs::write(&path, format!("{username}\n{password}\n"))
+                .await
+                .map_err(|e| AppError::Internal(e.into()))?;
+            tracing::warn!(
+                "created initial admin account \"{username}\" with password \"{password}\" \
+                 (also saved to {}); sign in and change it",
+                path.display()
+            );
+        } else {
+            tracing::info!("created initial admin account \"{username}\" from ADMIN_PASSWORD");
+        }
+        Ok(())
+    }
+
     pub async fn add_user(&self, username: &str, password: &str) -> Result<Vec<Value>, AppError> {
         let admin_code =
             (!self.cfg.invite_code.is_empty()).then_some(self.cfg.invite_code.as_str());

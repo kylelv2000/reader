@@ -4,7 +4,7 @@ Yomu 面向个人和少量受信用户，但按公网服务处理安全边界。
 
 ## 已实现的边界
 
-- **默认拒绝访问**：页面先检查同源会话，未登录时不加载书架、书源或用户数据。公开注册关闭，首位管理员通过容器内网一次性初始化，之后新账号只由管理员后台创建。
+- **默认拒绝访问**：页面先检查同源会话，未登录时不加载书架、书源或用户数据。公开注册关闭，首位管理员在首次启动时自动创建（随机初始密码只输出到服务器日志和存储卷），之后新账号只由管理员后台创建。
 - **浏览器不持有 Reader 令牌**：安全网关把上游令牌装进 AES-256-GCM 加密的 `HttpOnly + Secure + SameSite=Strict` Cookie。所有外部请求中的 `accessToken`、`secureKey`、`userNS`、`Authorization` 和覆盖头都会被丢弃，再由网关注入当前会话身份。
 - **写操作防伪造**：普通写请求同时要求同源 `Origin` 和双提交 CSRF 值。书源代理表单因浏览器无法添加自定义头，使用严格同源 Origin 校验；登录 Cookie 仍为 SameSite。
 - **管理员再鉴权**：用户列表、创建、删除、权限修改和密码重置在网关与 Core 两层检查管理员身份。管理密钥只存在服务器环境，不进入 HTML、URL、Local Storage 或前端日志。
@@ -23,8 +23,8 @@ Yomu 面向个人和少量受信用户，但按公网服务处理安全边界。
 
 ## 部署必须完成
 
-1. 只通过 HTTPS 域名提供服务；`YOMU_PUBLIC_ORIGIN` 必须与浏览器地址完全一致，生产保持 `YOMU_COOKIE_SECURE=true`。
-2. 为 `YOMU_SESSION_SECRET`、`READER_SECURE_KEY`、`READER_INVITE_CODE`、WebView 密钥分别生成不同的随机值。不要把 `deploy/.env` 提交到 Git；首次管理员创建后立即清除终端中的临时密码变量。
+1. 公网部署必须通过 HTTPS 域名提供服务并配置 `YOMU_PUBLIC_ORIGIN`（与浏览器地址完全一致）；配置后 Cookie 自动仅走 HTTPS，来源校验自动收紧。未配置时为本地模式，只接受 localhost 来源，不要在公网裸奔本地模式。
+2. 会话密钥与内部管理密钥默认自动生成并持久化在数据卷内，无需手工配置；如自行指定（`YOMU_SESSION_SECRET`、`READER_SECURE_KEY`、WebView 密钥），请使用互不相同的长随机值，且不要把 `.env` 提交到 Git。首次登录后立即修改自动生成的管理员初始密码。
 3. 防火墙只开放反向代理的 80/443（或既有入口），不要映射 Core、WebView、Chromium 或 SQLite 端口。
 4. 定期备份 `reader-storage`，备份文件加密并限制读取权限；恢复演练在隔离机器进行。
 5. 每月检查基础镜像和依赖安全更新。升级固定标签后必须重新执行 Rust 测试与构建、网关测试、PWA 构建和 Compose 配置验证。

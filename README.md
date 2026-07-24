@@ -25,6 +25,15 @@ npm run dev
 
 ## 自托管
 
-面向个人和少量用户的 Compose 配置位于 [`deploy/`](./deploy/README.md)。它把 PWA 和 Rust Reader Core 放在同一域名下，默认只使用 SQLite 和文件卷；AI 不启用，WebView 也不会常驻。正式镜像发布到 Docker Hub 的 `komqaq/yomu-reader`，服务器只执行 `docker compose pull` 和 `up -d`。
+一键部署——下载一个 Compose 文件即可，无需任何配置（密钥自动生成、首次启动自动创建管理员）：
+
+```bash
+mkdir yomu-reader && cd yomu-reader
+curl -LO https://raw.githubusercontent.com/kylelv2000/reader/main/deploy/compose.yml
+docker compose up -d
+docker compose logs reader-core | grep admin   # 查看初始管理员密码
+```
+
+打开 `http://localhost:8080` 登录。公网域名、参数调优等见 [部署指南](./deploy/README.md)。正式镜像发布在 Docker Hub 的 `komqaq/yomu-reader`，升级只需 `docker compose pull && docker compose up -d`。
 
 Yomu 不内置或分发任何书籍内容。用户应只添加有合法访问权的书源和本地文件。

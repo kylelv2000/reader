@@ -1,11 +1,23 @@
 name: yomu-reader
 
-# 正式部署只需要这一个文件：
-#   docker compose --env-file deploy/.env -f deploy/compose.yml up -d
-# 需要 WebView 书源时加 --profile webview。
-# 自行编译源码请叠加 deploy/compose.dev.yml（见 deploy/README.md）。
+# ====================== 一键部署 ======================
+# 下载本文件后直接启动，无需任何配置：
+#   docker compose up -d
+# 首次启动会自动创建管理员账号 admin，初始密码看日志：
+#   docker compose logs reader-core | grep admin
+# 打开 http://localhost:8080 登录即可（局域网访问见 YOMU_PORT 注释）。
+#
+# 公网部署只需两步：
+#   1. 用反向代理（Caddy/Nginx）把域名 HTTPS 转发到 127.0.0.1:8080
+#   2. 启动时带上域名：YOMU_PUBLIC_ORIGIN=https://reader.example.com docker compose up -d
+#      （或写进同目录 .env 文件；详见 README.md）
+#
+# 需要 WebView 书源时加 --profile webview；
+# 自行编译源码请叠加 compose.dev.yml。
+# ======================================================
 
 services:
+  # 网页界面 + 安全网关：唯一对外的服务
   yomu-app:
     image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}
     restart: unless-stopped
@@ -13,9 +25,11 @@ services:
       NODE_ENV: production
       PORT: 8080
       READER_CORE_ORIGIN: http://reader-core:18080
-      YOMU_PUBLIC_ORIGIN: ${YOMU_PUBLIC_ORIGIN:?Set the external HTTPS origin in deploy/.env}
-      YOMU_SESSION_SECRET: ${YOMU_SESSION_SECRET:?Set a random session secret in deploy/.env}
-      YOMU_COOKIE_SECURE: ${YOMU_COOKIE_SECURE:-true}
+      # 公网部署填 https 域名；留空 = 本地模式（http + localhost）。
+      YOMU_PUBLIC_ORIGIN: ${YOMU_PUBLIC_ORIGIN:-}
+      # 留空自动生成并保存在数据卷；下面几项一般不用动。
+      YOMU_SESSION_SECRET: ${YOMU_SESSION_SECRET:-}
+      YOMU_COOKIE_SECURE: ${YOMU_COOKIE_SECURE:-}
       YOMU_SESSION_TTL_SECONDS: ${YOMU_SESSION_TTL_SECONDS:-604800}
       YOMU_MAX_BODY_BYTES: ${YOMU_MAX_BODY_BYTES:-2097152}
       YOMU_MAX_UPLOAD_BYTES: ${YOMU_MAX_UPLOAD_BYTES:-104857600}
@@ -23,7 +37,11 @@ services:
       reader-core:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${YOMU_PORT:-8080}:8080"
+      # 默认只监听本机。想让局域网设备直接访问，改为 "8080:8080"
+      # （此时同时设置 YOMU_BIND=0.0.0.0）。
+      - "${YOMU_BIND:-127.0.0.1}:${YOMU_PORT:-8080}:8080"
+    volumes:
+      - yomu-app-data:/data
     read_only: true
     tmpfs:
       - /tmp
@@ -38,33 +56,42 @@ services:
       timeout: 5s
       retries: 5
 
+  # 书源抓取与数据存储（SQLite + 文件），不对外开放
   reader-core:
     image: docker.io/komqaq/yomu-reader:core-${YOMU_IMAGE_VERSION:-latest}
     restart: unless-stopped
     environment:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 18080
-      DATABASE_URL: sqlite:/app/storage/reader.db?mode=rwc
+      # 首次启动自动创建管理员：用户名默认 admin，密码自动生成
+      # （日志和 storage/data/initial-admin-password.txt 都能看到）。
+      # 想指定就取消注释：
+      ADMIN_USERNAME: ${YOMU_ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${YOMU_ADMIN_PASSWORD:-}
+      # 内部管理密钥留空自动生成并保存在数据卷。
       SECURE: "${READER_SECURE:-true}"
-      SECURE_KEY: "${READER_SECURE_KEY:?Set READER_SECURE_KEY in deploy/.env}"
-      INVITE_CODE: "${READER_INVITE_CODE:?Set a private bootstrap invite code in deploy/.env}"
+      SECURE_KEY: "${READER_SECURE_KEY:-}"
       ALLOW_REGISTRATION: "false"
+      # ---- 配额（按需调整） ----
       USER_LIMIT: "${READER_USER_LIMIT:-10}"
       USER_BOOK_LIMIT: "${READER_USER_BOOK_LIMIT:-2000}"
       USER_SOURCE_LIMIT: "${READER_USER_SOURCE_LIMIT:-50}"
+      # ---- 性能（默认适合 2 核 2G 以上的机器） ----
       SEARCH_SOURCE_LIMIT: "${READER_SEARCH_SOURCE_LIMIT:-200}"
-      REQUEST_TIMEOUT_SECS: "${READER_REQUEST_TIMEOUT_SECS:-20}"
       MAX_OUTBOUND_CONCURRENT: "${READER_MAX_OUTBOUND_CONCURRENT:-32}"
       SCAN_SEARCH_CONCURRENT: "${READER_SCAN_SEARCH_CONCURRENT:-12}"
       SCAN_VALIDATE_CONCURRENT: "${READER_SCAN_VALIDATE_CONCURRENT:-6}"
       COVER_CONCURRENT: "${READER_COVER_CONCURRENT:-8}"
+      REQUEST_TIMEOUT_SECS: "${READER_REQUEST_TIMEOUT_SECS:-20}"
       LOG_LEVEL: "${READER_LOG_LEVEL:-info}"
-      # 以下两项仅在 --profile webview 时由 Compose 注入；平时留空即可。
+      # 以下两项仅在 --profile webview 时使用；平时留空即可。
       WEBVIEW_BRIDGE_URL: ${WEBVIEW_BRIDGE_URL:-}
       WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:-}
     expose:
       - "18080"
     volumes:
+      # 全部数据（数据库、书籍缓存、密钥）都在这一个卷里。
+      # 想直接落盘便于备份：改成绝对路径，如 /srv/yomu-data:/app/storage
       - ${READER_STORAGE:-reader-storage}:/app/storage
     read_only: true
     tmpfs:
@@ -76,14 +103,14 @@ services:
     mem_limit: ${READER_CORE_MEM_LIMIT:-1g}
 
   # 可选：内含 Chromium 的 WebView 旁车，仅少数书源需要。
-  # 启用：docker compose ... --profile webview up -d
-  # 同时在 deploy/.env 设置 WEBVIEW_BRIDGE_URL=http://webview-bridge:19090
+  # 启用：WEBVIEW_BRIDGE_URL=http://webview-bridge:19090 WEBVIEW_BRIDGE_KEY=<随机串> \
+  #       docker compose --profile webview up -d
   webview-bridge:
     profiles: ["webview"]
     image: docker.io/komqaq/yomu-reader:webview-${YOMU_IMAGE_VERSION:-latest}
     restart: unless-stopped
     environment:
-      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?set WEBVIEW_BRIDGE_KEY in deploy/.env}
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?启用 WebView 时需要设置 WEBVIEW_BRIDGE_KEY}
       WEBVIEW_MAX_CONCURRENT: ${WEBVIEW_MAX_CONCURRENT:-1}
       WEBVIEW_IDLE_SECONDS: ${WEBVIEW_IDLE_SECONDS:-120}
       WEBVIEW_MAX_RESPONSE_BYTES: ${WEBVIEW_MAX_RESPONSE_BYTES:-8388608}
@@ -102,25 +129,6 @@ services:
     cap_drop:
       - ALL
 
-  # 一次性任务：首次部署时创建管理员账号（不常驻）。
-  admin-init:
-    profiles: ["setup"]
-    image: docker.io/komqaq/yomu-reader:app-${YOMU_IMAGE_VERSION:-latest}
-    command: ["node", "services/security-gateway/bootstrap.mjs"]
-    environment:
-      READER_CORE_ORIGIN: http://reader-core:18080
-      READER_INVITE_CODE: ${READER_INVITE_CODE:-}
-      READER_SECURE_KEY: ${READER_SECURE_KEY:-}
-      YOMU_ADMIN_USERNAME: ${YOMU_ADMIN_USERNAME:-}
-      YOMU_ADMIN_PASSWORD: ${YOMU_ADMIN_PASSWORD:-}
-    depends_on:
-      reader-core:
-        condition: service_healthy
-    read_only: true
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-
 volumes:
   reader-storage:
+  yomu-app-data:

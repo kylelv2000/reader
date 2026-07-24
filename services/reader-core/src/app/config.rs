@@ -33,7 +33,8 @@ impl Default for AppConfig {
         Self {
             server_host: "0.0.0.0".to_string(),
             server_port: 18080,
-            database_url: "sqlite:storage/reader.db?mode=rwc".to_string(),
+            // Empty = derived from storage_dir at startup ({storage}/reader.db).
+            database_url: String::new(),
             storage_dir: "storage".to_string(),
             web_root: "frontend/dist".to_string(),
             assets_dir: "storage/assets".to_string(),

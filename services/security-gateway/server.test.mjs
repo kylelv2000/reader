@@ -19,6 +19,10 @@ test("requires the configured same origin in production", () => {
   assert.equal(isAllowedOrigin("https://reader.example.com", "https://reader.example.com", "production"), true);
   assert.equal(isAllowedOrigin("https://evil.example", "https://reader.example.com", "production"), false);
   assert.equal(isAllowedOrigin("http://localhost:3000", "", "test"), true);
+  // Local mode: without a configured public origin only loopback is accepted.
+  assert.equal(isAllowedOrigin("http://localhost:8080", "", "production"), true);
+  assert.equal(isAllowedOrigin("http://127.0.0.1:8080", "", "production"), true);
+  assert.equal(isAllowedOrigin("https://evil.example", "", "production"), false);
 });
 
 test("strips privilege override parameters and blocks traversal", () => {

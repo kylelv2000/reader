@@ -17,7 +17,7 @@ use crate::service::{
 use crate::storage::{cache::file_cache::FileCache, db, fs::storage_fs::StorageFs};
 
 pub async fn run() -> anyhow::Result<()> {
-    let cfg = config::load()?;
+    let mut cfg = config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(cfg.log_level.clone()))
@@ -25,6 +25,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     let storage_fs = StorageFs::new(&cfg.storage_dir, &cfg.assets_dir);
     storage_fs.ensure().await?;
+
+    // Zero-config startup: the database lives inside the storage volume and
+    // the internal admin key is generated once and persisted there, so the
+    // only thing a deployment must configure is where storage is mounted.
+    if cfg.database_url.trim().is_empty() {
+        cfg.database_url = format!("sqlite:{}/reader.db?mode=rwc", cfg.storage_dir);
+    }
+    if cfg.secure && cfg.secure_key.trim().is_empty() {
+        cfg.secure_key = load_or_create_secret(
+            &std::path::Path::new(&cfg.storage_dir)
+                .join("data")
+                .join("secure-key.txt"),
+        )
+        .await?;
+        tracing::info!("SECURE_KEY not set; using the generated key persisted in storage/data/secure-key.txt");
+    }
 
     let pool = db::init_pool(&cfg.database_url).await?;
     let repo = db::repo::BookSourceRepo::new(pool.clone());
@@ -42,6 +58,7 @@ pub async fn run() -> anyhow::Result<()> {
     let json_document_service = Arc::new(JsonDocumentService::new(pool.clone(), &cfg.storage_dir));
     let user_service = Arc::new(UserService::new(cfg.clone(), pool.clone()));
     user_service.migrate_legacy_users_from_json().await?;
+    user_service.ensure_initial_admin().await?;
     let book_group_service = Arc::new(BookGroupService::new(json_document_service.clone()));
     let update_service = Arc::new(UpdateService::new(
         json_document_service.clone(),
@@ -71,4 +88,19 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!("listening on {}", addr);
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
+}
+
+async fn load_or_create_secret(path: &std::path::Path) -> anyhow::Result<String> {
+    if let Ok(existing) = tokio::fs::read_to_string(path).await {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Ok(existing);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let secret = crate::util::crypto::random_string(48);
+    tokio::fs::write(path, &secret).await?;
+    Ok(secret)
 }

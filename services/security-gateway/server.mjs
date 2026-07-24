@@ -1,13 +1,42 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { handleWebRequest } from "../web-runtime/server.mjs";
 
+// Zero-config startup: without YOMU_SESSION_SECRET a random secret is
+// generated once and persisted in the data volume, so sessions survive
+// restarts and a plain `docker compose up -d` needs no configuration.
+function loadOrCreateSessionSecret() {
+  const fromEnv = process.env.YOMU_SESSION_SECRET || "";
+  if (fromEnv) return fromEnv;
+  const dir = process.env.YOMU_DATA_DIR || "/data";
+  const file = `${dir}/session-secret`;
+  try {
+    if (existsSync(file)) {
+      const existing = readFileSync(file, "utf8").trim();
+      if (existing.length >= 32) return existing;
+    }
+    mkdirSync(dir, { recursive: true });
+    const secret = randomBytes(48).toString("base64url");
+    writeFileSync(file, secret, { mode: 0o600 });
+    return secret;
+  } catch {
+    process.stderr.write(`YOMU_SESSION_SECRET is not set and ${dir} is not writable; sessions will reset on every restart\n`);
+    return randomBytes(48).toString("base64url");
+  }
+}
+
 const port = Number(process.env.PORT || 18081);
 const coreOrigin = new URL(process.env.READER_CORE_ORIGIN || "http://reader-core:18080");
-const sessionSecret = process.env.YOMU_SESSION_SECRET || "";
+const sessionSecret = process.env.NODE_ENV === "test" ? (process.env.YOMU_SESSION_SECRET || "") : loadOrCreateSessionSecret();
 const publicOrigin = (process.env.YOMU_PUBLIC_ORIGIN || "").replace(/\/+$/, "");
-const secureCookies = process.env.YOMU_COOKIE_SECURE !== "false";
+// Secure cookies follow the configured origin: an https origin means real
+// deployment, no origin (or http) means local mode where Secure cookies
+// would break login. An explicit YOMU_COOKIE_SECURE always wins.
+const secureCookies = process.env.YOMU_COOKIE_SECURE
+  ? process.env.YOMU_COOKIE_SECURE !== "false"
+  : publicOrigin.startsWith("https://");
 const sessionTtlSeconds = Math.max(900, Number(process.env.YOMU_SESSION_TTL_SECONDS || 7 * 86_400));
 const standardBodyLimit = Math.max(64 * 1024, Number(process.env.YOMU_MAX_BODY_BYTES || 2 * 1024 * 1024));
 const uploadBodyLimit = Math.max(standardBodyLimit, Number(process.env.YOMU_MAX_UPLOAD_BYTES || 100 * 1024 * 1024));
@@ -153,7 +182,9 @@ function safeEqual(left, right) {
 export function isAllowedOrigin(origin, configuredOrigin = publicOrigin, environment = process.env.NODE_ENV) {
   if (!origin) return false;
   if (configuredOrigin && origin === configuredOrigin) return true;
-  if (environment !== "production") {
+  // Local mode: no public origin configured (or not in production) accepts
+  // loopback origins so LAN/localhost deployments work out of the box.
+  if (environment !== "production" || !configuredOrigin) {
     try {
       const url = new URL(origin);
       return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
