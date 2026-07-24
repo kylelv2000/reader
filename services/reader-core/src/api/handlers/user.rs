@@ -101,13 +101,10 @@ pub async fn login(
         .user_service
         .login(&username, &password, is_login, req.code.as_deref())
         .await?;
-    // If this was a new user registration, copy default book sources
-    if is_new_user {
-        let _ = state
-            .book_source_service
-            .copy_default_to_user(&username)
-            .await;
-    }
+    // New users start with zero own sources; the admin's shared/system
+    // sources are readable through the namespace fallback instead of being
+    // copied (which would eat into the per-user source quota).
+    let _ = is_new_user;
     Ok(Json(ApiResponse::ok(data)))
 }
 

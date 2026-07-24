@@ -61,6 +61,8 @@ python3 scripts/prepare-deploy-env.py \
 | `YOMU_COOKIE_SECURE` | `true` | 有 HTTPS 保持 `true`；localhost 测试改 `false` |
 | `READER_USER_LIMIT` | `10` | 用户数上限 |
 | `READER_USER_BOOK_LIMIT` | `2000` | 每用户书籍上限 |
+| `READER_USER_SOURCE_LIMIT` | `50` | 每个普通用户自有书源上限（0 不限）；管理员的系统书源全员可用、不占额度 |
+| `READER_SEARCH_SOURCE_LIMIT` | `200` | 单次搜索最多使用的书源数，按用户优先级取前 N（0 不限） |
 | `READER_REQUEST_TIMEOUT_SECS` | `20` | 抓取书源的请求超时（秒） |
 | `READER_MAX_OUTBOUND_CONCURRENT` | `16` | 对外抓取并发上限，小带宽可调低 |
 | `READER_LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` |

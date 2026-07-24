@@ -137,6 +137,12 @@ export interface ReaderUser {
   isAdmin: boolean;
 }
 
+export interface SourceOverview {
+  systemCount: number;
+  sourceLimit: number;
+  isAdmin: boolean;
+}
+
 export interface SourceTestSummary {
   total: number;
   valid: number;

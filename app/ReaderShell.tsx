@@ -23,6 +23,7 @@ import type {
   ReaderUser,
   ReaderPreferences,
   ReaderSession,
+  SourceOverview,
   SourceRule,
   OfflineBookStatus,
   RssArticle,
@@ -385,6 +386,9 @@ export function ReaderShell() {
   const [libraryBusy, setLibraryBusy] = useState(false);
   const [sourceImport, setSourceImport] = useState<"" | "file" | "url">("");
   const [taskProgress, setTaskProgress] = useState<{ label: string; done: number; total: number } | null>(null);
+  const [sourceOverview, setSourceOverview] = useState<SourceOverview | null>(null);
+  const [importPicker, setImportPicker] = useState<{ fresh: BookSource[]; existing: BookSource[]; selected: Set<string>; remaining: number } | null>(null);
+  const [importPickerQuery, setImportPickerQuery] = useState("");
   const [greeting, setGreeting] = useState("欢迎回来");
   const [appTheme, setAppTheme] = useState<AppTheme>("system");
   const [systemDark, setSystemDark] = useState(false);
@@ -831,12 +835,14 @@ export function ReaderShell() {
         client.getBookmarks(),
         client.getRssSources(),
         client.getReplaceRules(),
+        client.getBookSourceOverview(),
       ]).then((optional) => {
         if (optional[0].status === "fulfilled") setSources(optional[0].value as BookSource[]);
         if (optional[1].status === "fulfilled") setGroups(optional[1].value as BookGroup[]);
         if (optional[2].status === "fulfilled") setBookmarks(optional[2].value as Bookmark[]);
         if (optional[3].status === "fulfilled") setRssSources(optional[3].value as RssSource[]);
         if (optional[4].status === "fulfilled") setReplaceRules(optional[4].value as ReplaceRule[]);
+        if (optional[5].status === "fulfilled") setSourceOverview(optional[5].value as SourceOverview);
       });
     } catch (error) {
       if (error instanceof ReaderApiError && error.code === "NEED_LOGIN") {
@@ -1345,6 +1351,42 @@ export function ReaderShell() {
     else setReaderChrome((value) => !value);
   }
 
+  async function commitImportedSources(list: BookSource[]) {
+    if (!api) return;
+    setTaskProgress({ label: `正在保存 ${list.length} 个书源`, done: 0, total: 0 });
+    try {
+      await api.saveBookSources(list);
+      await hydrateFromServer(api, false);
+      toast(`已导入 ${list.length} 个书源`);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "书源导入失败");
+    } finally {
+      setTaskProgress(null);
+    }
+  }
+
+  /// Saves directly when the quota allows it; otherwise opens the picker so
+  /// the user chooses which new sources fill the remaining slots.
+  async function importWithQuota(valid: BookSource[]) {
+    const ownUrls = new Set(sources.map((source) => source.bookSourceUrl));
+    const fresh = valid.filter((source) => !ownUrls.has(source.bookSourceUrl));
+    const existing = valid.filter((source) => ownUrls.has(source.bookSourceUrl));
+    const limit = sourceOverview && !sourceOverview.isAdmin ? sourceOverview.sourceLimit : 0;
+    const remaining = limit > 0 ? Math.max(0, limit - sources.length) : Number.POSITIVE_INFINITY;
+    if (fresh.length > remaining) {
+      if (remaining === 0 && !existing.length) return toast(`书源数量已达上限（${limit} 个），请先删除一些书源`);
+      setImportPickerQuery("");
+      setImportPicker({
+        fresh,
+        existing,
+        selected: new Set(fresh.slice(0, remaining).map((source) => source.bookSourceUrl)),
+        remaining,
+      });
+      return;
+    }
+    await commitImportedSources(valid);
+  }
+
   async function importSources(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -1355,18 +1397,11 @@ export function ReaderShell() {
       const imported = extractBookSources(JSON.parse(await file.text()));
       const valid = imported.filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!valid.length) throw new Error("文件里没有可识别的书源");
-      setTaskProgress({ label: `正在保存 ${valid.length} 个书源`, done: 0, total: 0 });
-      if (api && connection === "connected") await api.saveBookSources(valid);
-      setSources((current) => {
-        const urls = new Set(valid.map((source) => source.bookSourceUrl));
-        return [...valid, ...current.filter((source) => !urls.has(source.bookSourceUrl))];
-      });
-      toast(`已导入 ${valid.length} 个书源`);
+      await importWithQuota(valid);
     } catch (error) {
       toast(error instanceof Error ? error.message : "书源导入失败");
     } finally {
       setSourceImport("");
-      setTaskProgress(null);
     }
   }
 
@@ -1385,16 +1420,23 @@ export function ReaderShell() {
         })
         .filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!imported.length) throw new Error("该地址没有可识别的书源");
-      setTaskProgress({ label: `正在保存 ${imported.length} 个书源`, done: 0, total: 0 });
-      await api.saveBookSources(imported);
-      await hydrateFromServer(api, false);
-      toast(`已从网址导入 ${imported.length} 个书源`);
+      setTaskProgress(null);
+      await importWithQuota(imported);
     } catch (error) {
       toast(error instanceof Error ? error.message : "网址导入失败");
     } finally {
       setSourceImport("");
       setTaskProgress(null);
     }
+  }
+
+  async function confirmImportPicker() {
+    if (!importPicker) return;
+    const picked = importPicker.fresh.filter((source) => importPicker.selected.has(source.bookSourceUrl));
+    const list = [...picked, ...importPicker.existing];
+    setImportPicker(null);
+    if (!list.length) return;
+    await commitImportedSources(list);
   }
 
   async function batchSelectedSources(action: "enable" | "disable" | "delete") {
@@ -2561,7 +2603,8 @@ export function ReaderShell() {
                 </div>
               </section>
               <div className="source-summary-grid">
-                <div><strong>{sources.length}</strong><span>全部书源</span></div>
+                <div><strong>{sources.length}{sourceOverview && !sourceOverview.isAdmin && sourceOverview.sourceLimit > 0 ? <em> / {sourceOverview.sourceLimit}</em> : null}</strong><span>我的书源</span></div>
+                {sourceOverview && !sourceOverview.isAdmin && sourceOverview.systemCount > 0 && <div><strong>{sourceOverview.systemCount}</strong><span>系统书源 · 自动参与搜索</span></div>}
                 <div><strong>{sources.filter((source) => source.enabled !== false).length}</strong><span>已启用</span></div>
                 <div><strong>{sources.filter((source) => source.loginUrl || source.enabledCookieJar).length}</strong><span>兼容模式</span></div>
               </div>
@@ -2863,6 +2906,51 @@ export function ReaderShell() {
               {sourceEditor && <button className="text-button danger-text" type="button" onClick={deleteEditedSource}>删除这个书源</button>}
             </form>
             {sourceEditor && <form className="source-debug" onSubmit={debugEditedSource}><div><input name="keyword" placeholder="输入关键词测试搜索规则" aria-label="书源调试关键词" /><button className="quiet-button" disabled={sourceDebugging}>{sourceDebugging ? "调试中…" : "运行调试"}</button></div>{sourceDebugLog.length > 0 && <pre>{sourceDebugLog.join("\n")}</pre>}</form>}
+          </section>
+        </div>
+      )}
+
+      {importPicker && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setImportPicker(null)}>
+          <section className="modal import-picker" role="dialog" aria-modal="true" aria-labelledby="import-picker-title">
+            <button className="modal-close" onClick={() => setImportPicker(null)} aria-label="关闭">×</button>
+            <h2 id="import-picker-title">选择要导入的书源</h2>
+            <p>本次新增 {importPicker.fresh.length} 个书源，超出你的剩余额度（还能添加 {importPicker.remaining} 个）。请挑选要保留的书源{importPicker.existing.length ? `；另有 ${importPicker.existing.length} 个已存在的书源会自动更新，不占额度` : ""}。</p>
+            <div className="import-picker-tools">
+              <input value={importPickerQuery} onChange={(event) => setImportPickerQuery(event.target.value)} placeholder="筛选名称或分组" aria-label="筛选待导入书源" />
+              <button className="quiet-button" type="button" onClick={() => setImportPicker((current) => current && ({ ...current, selected: new Set(current.fresh.slice(0, current.remaining).map((source) => source.bookSourceUrl)) }))}>选满前 {importPicker.remaining} 个</button>
+              <button className="quiet-button" type="button" onClick={() => setImportPicker((current) => current && ({ ...current, selected: new Set() }))}>清空</button>
+            </div>
+            <div className="import-picker-list">
+              {importPicker.fresh
+                .filter((source) => !importPickerQuery.trim() || `${source.bookSourceName}${source.bookSourceGroup || ""}`.toLowerCase().includes(importPickerQuery.trim().toLowerCase()))
+                .map((source) => {
+                  const picked = importPicker.selected.has(source.bookSourceUrl);
+                  const full = !picked && importPicker.selected.size >= importPicker.remaining;
+                  return (
+                    <label key={source.bookSourceUrl} className={`import-picker-row ${picked ? "picked" : ""} ${full ? "blocked" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={picked}
+                        disabled={full}
+                        onChange={() => setImportPicker((current) => {
+                          if (!current) return current;
+                          const selected = new Set(current.selected);
+                          if (selected.has(source.bookSourceUrl)) selected.delete(source.bookSourceUrl);
+                          else if (selected.size < current.remaining) selected.add(source.bookSourceUrl);
+                          return { ...current, selected };
+                        })}
+                      />
+                      <strong>{source.bookSourceName}</strong>
+                      <span>{source.bookSourceGroup || source.bookSourceUrl.replace(/^https?:\/\//, "").split("/")[0]}</span>
+                    </label>
+                  );
+                })}
+            </div>
+            <footer className="import-picker-footer">
+              <span>已选 {importPicker.selected.size} / {importPicker.remaining}</span>
+              <button className="primary-button" disabled={!importPicker.selected.size && !importPicker.existing.length} onClick={() => void confirmImportPicker()}>导入所选</button>
+            </footer>
           </section>
         </div>
       )}

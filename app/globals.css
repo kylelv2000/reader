@@ -1217,7 +1217,7 @@ textarea:focus-visible {
 
 .source-summary-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
   margin-top: 16px;
   background: #fff;
   border: 1px solid var(--line);
@@ -1245,6 +1245,103 @@ textarea:focus-visible {
 .source-summary-grid span {
   color: var(--muted);
   font-size: 11px;
+}
+
+.source-summary-grid strong em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.import-picker {
+  display: flex;
+  max-height: calc(100dvh - 36px);
+  flex-direction: column;
+}
+
+.import-picker-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.import-picker-tools input {
+  min-width: 0;
+  flex: 1 1 160px;
+  padding: 9px 12px;
+  font-size: 13px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.import-picker-list {
+  display: flex;
+  min-height: 120px;
+  flex: 1;
+  flex-direction: column;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.import-picker-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.import-picker-row:last-child {
+  border-bottom: 0;
+}
+
+.import-picker-row.picked {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.import-picker-row.blocked {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.import-picker-row input {
+  accent-color: var(--accent);
+}
+
+.import-picker-row strong {
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-picker-row span {
+  max-width: 40%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.import-picker-footer span {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .source-toolbar {
@@ -3651,15 +3748,27 @@ textarea:focus-visible {
   }
 
   .source-summary-grid {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .source-summary-grid div {
     padding: 16px 12px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
   }
 
-  .source-summary-grid div:nth-child(2) {
-    border-right: 1px solid var(--line);
+  .source-summary-grid div:nth-child(2n),
+  .source-summary-grid div:last-child {
+    border-right: 0;
+  }
+
+  .source-summary-grid div:nth-last-child(-n + 2):nth-child(2n + 1),
+  .source-summary-grid div:last-child {
+    border-bottom: 0;
+  }
+
+  .import-picker-row span {
+    display: none;
   }
 
   .source-toolbar > .segmented {

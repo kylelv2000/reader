@@ -80,6 +80,48 @@ pub struct UsernameParam {
     pub username: Option<String>,
 }
 
+/// Non-admin users may keep at most `user_source_limit` own sources
+/// (0 = unlimited); updates to already-owned URLs never count as additions.
+async fn enforce_source_quota(
+    state: &AppState,
+    auth: &AuthContext,
+    user_ns: &str,
+    new_sources: &[BookSource],
+) -> Result<(), AppError> {
+    let limit = state.config.user_source_limit as usize;
+    if limit == 0 || !state.user_service.secure_enabled() {
+        return Ok(());
+    }
+    if state
+        .user_service
+        .is_admin(auth.access_token(), auth.secure_key())
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let own: HashSet<String> = state
+        .book_source_service
+        .list_own(user_ns)
+        .await?
+        .iter()
+        .map(|source| normalize_source_url(&source.book_source_url))
+        .collect();
+    let added: HashSet<String> = new_sources
+        .iter()
+        .map(|source| normalize_source_url(&source.book_source_url))
+        .filter(|url| !own.contains(url))
+        .collect();
+    if own.len() + added.len() > limit {
+        let remaining = limit.saturating_sub(own.len());
+        return Err(AppError::BadRequest(format!(
+            "书源数量超出上限（{limit} 个）：已有 {} 个，最多还能添加 {remaining} 个",
+            own.len()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn save_book_source(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -92,6 +134,7 @@ pub async fn save_book_source(
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
     let source =
         book_source_from_value(payload).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    enforce_source_quota(&state, &auth, &user_ns, std::slice::from_ref(&source)).await?;
     state.book_source_service.save(&user_ns, source).await?;
     Ok(Json(ApiResponse::ok(serde_json::json!({"saved": true}))))
 }
@@ -110,6 +153,7 @@ pub async fn save_book_sources(
     if sources.is_empty() {
         return Err(AppError::BadRequest("empty book sources".to_string()));
     }
+    enforce_source_quota(&state, &auth, &user_ns, &sources).await?;
     let count = sources.len();
     state
         .book_source_service
@@ -154,10 +198,43 @@ pub async fn get_book_sources(
         .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
         .await
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
-    let list = state.book_source_service.list(&user_ns).await?;
+    // Management view: only the user's own sources. Shared/system sources
+    // still power search and reading via the namespace fallback, but they are
+    // maintained by the admin alone.
+    let list = state.book_source_service.list_own(&user_ns).await?;
     Ok(Json(ApiResponse::ok(
         serde_json::to_value(list).unwrap_or_default(),
     )))
+}
+
+/// Quota and shared-source summary for the source management page.
+pub async fn get_book_source_overview(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let user_ns = state
+        .user_service
+        .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
+        .await
+        .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
+    let is_admin = if state.user_service.secure_enabled() {
+        state
+            .user_service
+            .is_admin(auth.access_token(), auth.secure_key())
+            .await
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    let system_count = state
+        .book_source_service
+        .system_source_count(&user_ns)
+        .await?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "systemCount": system_count,
+        "sourceLimit": if is_admin { 0 } else { state.config.user_source_limit },
+        "isAdmin": is_admin,
+    }))))
 }
 
 pub async fn get_default_book_source_owner(
@@ -249,9 +326,11 @@ pub async fn test_book_sources(
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
 
     let requested = normalize_requested_source_urls(req.book_source_urls.as_deref())?;
+    // Only the user's own sources are testable; testing shared/system sources
+    // would otherwise write invalid markers into this user's namespace.
     let sources = state
         .book_source_service
-        .list(&user_ns)
+        .list_own(&user_ns)
         .await?
         .into_iter()
         .filter(|source| {
@@ -391,7 +470,7 @@ pub async fn delete_invalid_book_sources(
         .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
         .await
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
-    let sources = state.book_source_service.list(&user_ns).await?;
+    let sources = state.book_source_service.list_own(&user_ns).await?;
     let invalid_urls = sources
         .iter()
         .filter(|source| book_source_has_group(source, INVALID_BOOK_SOURCE_GROUP))

@@ -9,6 +9,7 @@ import type {
   OfflineBookStatus,
   RssArticle,
   RssSource,
+  SourceOverview,
   SourceTestSummary,
   WebdavFile,
 } from "./types";
@@ -167,6 +168,10 @@ export class ReaderApi {
 
   getBookSources() {
     return this.request<BookSource[]>("/getBookSources");
+  }
+
+  getBookSourceOverview() {
+    return this.request<SourceOverview>("/getBookSourceOverview");
   }
 
   getBookGroups() {

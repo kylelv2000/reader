@@ -88,24 +88,41 @@ impl BookSourceService {
         Ok(removed)
     }
 
-    /// Track toc-validation outcomes per source. Sources whose catalog rules
-    /// keep failing get auto-disabled so they stop polluting search results;
-    /// a single success resets the streak (tolerates transient failures).
+    /// Track toc-validation outcomes per user in the stats table (drives that
+    /// user's search priority). Only sources the user owns get auto-disabled
+    /// after repeated failures; shared/system sources are merely deprioritized
+    /// for this user so one user's bad network cannot disable them for everyone.
     pub async fn record_toc_outcome(
         &self,
         user_ns: &str,
         source_url: &str,
         ok: bool,
     ) -> Result<bool, AppError> {
-        let Some(mut source) = self.get(user_ns, source_url).await? else {
+        let url = normalize_source_url(source_url);
+        let (_, failure_streak) = self.repo.record_stat(user_ns, &url, ok).await?;
+        if ok || failure_streak < TOC_FAILURE_DISABLE_THRESHOLD as i64 {
+            return Ok(false);
+        }
+        let Some(mut source) = self.get_own(user_ns, &url).await? else {
             return Ok(false);
         };
         if source.enabled == Some(false) {
             return Ok(false);
         }
-        let disabled = apply_toc_outcome(&mut source, ok);
+        source.enabled = Some(false);
+        source.auto_disabled_reason = Some("目录规则连续失败".to_string());
+        source.auto_disabled_at = Some(chrono::Utc::now().timestamp_millis());
+        add_source_group(&mut source, INCOMPATIBLE_BOOK_SOURCE_GROUP);
         self.save(user_ns, source).await?;
-        Ok(disabled)
+        Ok(true)
+    }
+
+    /// Per-user usage stats keyed by normalized source URL.
+    pub async fn stats_map(
+        &self,
+        user_ns: &str,
+    ) -> Result<HashMap<String, (i64, i64)>, AppError> {
+        self.repo.stats_for_user(user_ns).await
     }
 
     pub async fn auto_disable_if_incompatible(
@@ -117,10 +134,11 @@ impl BookSourceService {
         let Some(reason) = source_incompatibility_reason(error) else {
             return Ok(false);
         };
-        let mut updated = self
-            .get(user_ns, &source.book_source_url)
-            .await?
-            .unwrap_or_else(|| source.clone());
+        // Only sources in the user's own namespace are disabled; shared/system
+        // sources stay untouched (their health is managed by the admin).
+        let Some(mut updated) = self.get_own(user_ns, &source.book_source_url).await? else {
+            return Ok(false);
+        };
         if updated.enabled == Some(false)
             && updated.auto_disabled_reason.as_deref() == Some(reason.as_str())
         {
@@ -231,9 +249,14 @@ impl BookSourceService {
         Ok(count)
     }
 
-    /// Copy default sources to a new user
-    pub async fn copy_default_to_user(&self, to_ns: &str) -> Result<i64, AppError> {
-        self.repo.copy_to("__default__", to_ns).await
+    /// Number of shared/system sources a non-owner user can search through.
+    pub async fn system_source_count(&self, user_ns: &str) -> Result<usize, AppError> {
+        if let Some(owner) = self.get_default_owner().await? {
+            if owner != user_ns {
+                return Ok(self.list_own(&owner).await?.len());
+            }
+        }
+        Ok(0)
     }
 
     pub async fn get_default_owner(&self) -> Result<Option<String>, AppError> {
@@ -287,28 +310,6 @@ fn truncate_reason(value: &str) -> String {
     } else {
         format!("{}…", compact.chars().take(MAX_CHARS).collect::<String>())
     }
-}
-
-/// Pure state transition for toc-outcome tracking. Returns true when the
-/// source crossed the failure threshold and was auto-disabled.
-fn apply_toc_outcome(source: &mut BookSource, ok: bool) -> bool {
-    if ok {
-        source.toc_failure_count = None;
-        // Frequently working sources get prioritized in search and scans.
-        source.toc_success_count = Some(source.toc_success_count.unwrap_or(0).saturating_add(1));
-        return false;
-    }
-    let count = source.toc_failure_count.unwrap_or(0) + 1;
-    if count >= TOC_FAILURE_DISABLE_THRESHOLD {
-        source.enabled = Some(false);
-        source.auto_disabled_reason = Some("目录规则连续失败".to_string());
-        source.auto_disabled_at = Some(chrono::Utc::now().timestamp_millis());
-        source.toc_failure_count = None;
-        add_source_group(source, INCOMPATIBLE_BOOK_SOURCE_GROUP);
-        return true;
-    }
-    source.toc_failure_count = Some(count);
-    false
 }
 
 fn add_source_group(source: &mut BookSource, group: &str) {
@@ -419,31 +420,80 @@ mod tests {
         .is_some());
     }
 
-    #[test]
-    fn toc_failures_disable_source_after_threshold_and_success_resets() {
-        let mut source = BookSource {
-            enabled: Some(true),
-            ..BookSource::default()
-        };
+    async fn service_with_temp_db(tag: &str) -> (BookSourceService, std::path::PathBuf) {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "yomu-source-stats-{tag}-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let database_url = format!("sqlite:{}?mode=rwc", temp_dir.join("reader.db").display());
+        let pool = crate::storage::db::init_pool(&database_url).await.unwrap();
+        let repo = BookSourceRepo::new(pool);
+        (
+            BookSourceService::new(repo, temp_dir.to_str().unwrap()),
+            temp_dir,
+        )
+    }
 
-        assert!(!apply_toc_outcome(&mut source, false));
-        assert!(!apply_toc_outcome(&mut source, false));
-        assert_eq!(source.toc_failure_count, Some(2));
+    #[tokio::test]
+    async fn toc_outcomes_track_stats_and_only_disable_owned_sources() {
+        let (service, temp_dir) = service_with_temp_db("outcome").await;
 
-        // One success wipes the failure streak and counts toward priority.
-        assert!(!apply_toc_outcome(&mut source, true));
-        assert!(source.toc_failure_count.is_none());
-        assert_eq!(source.toc_success_count, Some(1));
+        // A shared/system source (not owned by this user): failures accumulate
+        // in the stats table but never disable or copy the source.
+        for _ in 0..4 {
+            let disabled = service
+                .record_toc_outcome("reader1", "https://shared.test", false)
+                .await
+                .unwrap();
+            assert!(!disabled);
+        }
+        assert!(service
+            .list_own("reader1")
+            .await
+            .unwrap()
+            .is_empty());
+        let stats = service.stats_map("reader1").await.unwrap();
+        assert_eq!(stats.get("https://shared.test"), Some(&(0, 4)));
 
-        // Three consecutive failures auto-disable the source; the success
-        // history is kept for reference.
-        assert!(!apply_toc_outcome(&mut source, false));
-        assert!(!apply_toc_outcome(&mut source, false));
-        assert!(apply_toc_outcome(&mut source, false));
-        assert_eq!(source.enabled, Some(false));
-        assert_eq!(source.auto_disabled_reason.as_deref(), Some("目录规则连续失败"));
-        assert!(book_source_has_group(&source, INCOMPATIBLE_BOOK_SOURCE_GROUP));
-        assert_eq!(source.toc_success_count, Some(1));
+        // An owned source crosses the threshold and gets auto-disabled.
+        service
+            .save(
+                "reader1",
+                BookSource {
+                    book_source_name: "own".to_string(),
+                    book_source_url: "https://own.test".to_string(),
+                    enabled: Some(true),
+                    ..BookSource::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!service
+            .record_toc_outcome("reader1", "https://own.test", false)
+            .await
+            .unwrap());
+        assert!(!service
+            .record_toc_outcome("reader1", "https://own.test", false)
+            .await
+            .unwrap());
+        assert!(service
+            .record_toc_outcome("reader1", "https://own.test", false)
+            .await
+            .unwrap());
+        let own = service.list_own("reader1").await.unwrap();
+        assert_eq!(own[0].enabled, Some(false));
+        assert!(book_source_has_group(&own[0], INCOMPATIBLE_BOOK_SOURCE_GROUP));
+
+        // A success resets the streak in the stats table.
+        service
+            .record_toc_outcome("reader1", "https://shared.test", true)
+            .await
+            .unwrap();
+        let stats = service.stats_map("reader1").await.unwrap();
+        assert_eq!(stats.get("https://shared.test"), Some(&(1, 0)));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]

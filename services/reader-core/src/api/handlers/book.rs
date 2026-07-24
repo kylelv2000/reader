@@ -2260,7 +2260,7 @@ async fn find_working_source_for_book(
         .filter(source_supports_available_search)
         .filter(|s| normalize_source_url(&s.book_source_url) != exclude_origin)
         .collect::<Vec<_>>();
-    prioritize_available_sources(&mut sources);
+    prioritize_sources_for_user(state, user_ns, &mut sources).await;
 
     let mut next = 0usize;
     let mut tasks: JoinSet<Option<(BookSource, SearchBook)>> = JoinSet::new();
@@ -3342,8 +3342,14 @@ pub async fn search_book_multi_sse(
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
-        // Proven sources search first so their results stream in earliest.
-        prioritize_available_sources(&mut sources);
+        // Proven sources search first so their results stream in earliest,
+        // and each search only fans out to the best-ranked slice to keep the
+        // outbound load bounded no matter how many sources exist.
+        prioritize_sources_for_user(&state_clone, &user_ns, &mut sources).await;
+        let search_source_limit = state_clone.config.search_source_limit as usize;
+        if search_source_limit > 0 && sources.len() > search_source_limit {
+            sources.truncate(search_source_limit);
+        }
 
         let mut idx = last_index + 1;
         let mut last_idx = last_index;
@@ -3496,7 +3502,11 @@ pub async fn search_book_source_sse(
                         .await;
                     return;
                 }
-                prioritize_available_sources(&mut list);
+                prioritize_sources_for_user(&state_clone, &user_ns, &mut list).await;
+                let search_source_limit = state_clone.config.search_source_limit as usize;
+                if search_source_limit > 0 && list.len() > search_source_limit {
+                    list.truncate(search_source_limit);
+                }
                 list
             }
             _ => {
@@ -3654,7 +3664,7 @@ pub async fn get_available_book_source(
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
-    prioritize_available_sources(&mut sources);
+    prioritize_sources_for_user(&state, &user_ns, &mut sources).await;
     if sources.is_empty() {
         if paged_request {
             return Ok(Json(ApiResponse::ok(
@@ -3868,7 +3878,7 @@ pub async fn get_available_book_source_sse(
         .into_iter()
         .filter(source_supports_available_search)
         .collect::<Vec<_>>();
-    prioritize_available_sources(&mut sources);
+    prioritize_sources_for_user(&state, &user_ns, &mut sources).await;
     let state_clone = state.clone();
     tokio::spawn(async move {
         if sources.is_empty() {
@@ -4701,19 +4711,39 @@ fn source_search_requires_webview(source: &BookSource) -> bool {
     .any(|marker| compact.contains(marker))
 }
 
-fn prioritize_available_sources(sources: &mut [BookSource]) {
+fn prioritize_available_sources(
+    sources: &mut [BookSource],
+    stats: &std::collections::HashMap<String, (i64, i64)>,
+) {
     // Stable sorting retains the user's existing order for equivalent entries.
-    // Sources with a proven toc track record come first, then fast responders.
-    // A recorded response time of zero/missing means "unknown", not "instant".
+    // Ranking is per user: the stats table tracks how often each source worked
+    // for this user (legacy JSON counters act as the baseline), and sources
+    // that keep failing for this user sink to the back without being disabled
+    // for anyone else. Fast responders break ties; a recorded response time of
+    // zero/missing means "unknown", not "instant".
     sources.sort_by_key(|source| {
+        let url = normalize_source_url(&source.book_source_url);
+        let (recent_success, failure_streak) = stats.get(&url).copied().unwrap_or((0, 0));
+        let success = recent_success.saturating_add(source.toc_success_count.unwrap_or(0) as i64);
         let response_time = source.respond_time.filter(|value| *value > 0);
         (
             source_search_requires_webview(source),
-            std::cmp::Reverse(source.toc_success_count.unwrap_or(0)),
+            failure_streak >= 3,
+            std::cmp::Reverse(success),
             response_time.is_none(),
             response_time.unwrap_or(i64::MAX),
         )
     });
+}
+
+/// Per-user prioritisation: loads this user's usage stats and sorts in place.
+async fn prioritize_sources_for_user(state: &AppState, user_ns: &str, sources: &mut [BookSource]) {
+    let stats = state
+        .book_source_service
+        .stats_map(user_ns)
+        .await
+        .unwrap_or_default();
+    prioritize_available_sources(sources, &stats);
 }
 
 async fn record_source_incompatibility(
@@ -5196,7 +5226,7 @@ mod tests {
             ),
         ];
 
-        prioritize_available_sources(&mut sources);
+        prioritize_available_sources(&mut sources, &std::collections::HashMap::new());
 
         assert_eq!(
             sources
@@ -5204,6 +5234,36 @@ mod tests {
                 .map(|source| source.book_source_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["explicitly-not-webview", "fast", "slow", "unknown", "webview"]
+        );
+    }
+
+    #[test]
+    fn per_user_stats_outrank_legacy_counters_and_sink_failing_sources() {
+        let source = |name: &str, url: &str, legacy: Option<i32>| BookSource {
+            book_source_name: name.to_string(),
+            book_source_url: url.to_string(),
+            toc_success_count: legacy,
+            search_url: Some(format!("{url}/search?q={{{{key}}}}")),
+            ..BookSource::default()
+        };
+        let mut sources = vec![
+            source("legacy", "https://legacy.test", Some(5)),
+            source("proven", "https://proven.test", None),
+            source("failing", "https://failing.test", Some(9)),
+        ];
+        let stats = std::collections::HashMap::from([
+            ("https://proven.test".to_string(), (8i64, 0i64)),
+            ("https://failing.test".to_string(), (0i64, 3i64)),
+        ]);
+
+        prioritize_available_sources(&mut sources, &stats);
+
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.book_source_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["proven", "legacy", "failing"]
         );
     }
 

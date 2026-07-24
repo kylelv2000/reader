@@ -71,6 +71,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::set_as_default_book_sources),
         )
         .route(
+            "/reader3/getBookSourceOverview",
+            get(handlers::get_book_source_overview),
+        )
+        .route(
             "/reader3/readRemoteSourceFile",
             post(handlers::read_remote_source_file),
         )
