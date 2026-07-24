@@ -2437,6 +2437,60 @@ textarea:focus-visible {
   transform: translateX(-50%);
 }
 
+.task-progress {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 290;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  width: min(300px, calc(100vw - 36px));
+  gap: 7px 14px;
+  padding: 13px 15px;
+  color: var(--ink);
+  font-size: 12px;
+  background: color-mix(in srgb, var(--elevated) 94%, transparent);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+}
+
+.task-progress strong {
+  font-size: 12px;
+}
+
+.task-progress span {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-progress > i {
+  grid-column: 1 / -1;
+  height: 4px;
+  overflow: hidden;
+  background: var(--soft);
+  border-radius: 999px;
+}
+
+.task-progress b {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: inherit;
+  transition: width 240ms ease;
+}
+
+.task-progress b.indeterminate {
+  width: 40%;
+  animation: taskProgressSlide 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes taskProgressSlide {
+  from { transform: translateX(-70%); }
+  to { transform: translateX(240%); }
+}
+
 .reader-overlay {
   --reader-panel: #f8f5ed;
   --reader-panel-soft: #ebe7de;
@@ -3371,6 +3425,13 @@ textarea:focus-visible {
   .toast {
     bottom: 88px;
     left: 50%;
+  }
+
+  .task-progress {
+    right: 12px;
+    bottom: calc(132px + env(safe-area-inset-bottom));
+    left: 12px;
+    width: auto;
   }
 
   .reader-cache-progress {

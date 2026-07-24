@@ -384,6 +384,7 @@ export function ReaderShell() {
   const [readerMenuOpen, setReaderMenuOpen] = useState(false);
   const [libraryBusy, setLibraryBusy] = useState(false);
   const [sourceImport, setSourceImport] = useState<"" | "file" | "url">("");
+  const [taskProgress, setTaskProgress] = useState<{ label: string; done: number; total: number } | null>(null);
   const [greeting, setGreeting] = useState("欢迎回来");
   const [appTheme, setAppTheme] = useState<AppTheme>("system");
   const [systemDark, setSystemDark] = useState(false);
@@ -1354,7 +1355,7 @@ export function ReaderShell() {
       const imported = extractBookSources(JSON.parse(await file.text()));
       const valid = imported.filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!valid.length) throw new Error("文件里没有可识别的书源");
-      toast(`正在保存 ${valid.length} 个书源…`);
+      setTaskProgress({ label: `正在保存 ${valid.length} 个书源`, done: 0, total: 0 });
       if (api && connection === "connected") await api.saveBookSources(valid);
       setSources((current) => {
         const urls = new Set(valid.map((source) => source.bookSourceUrl));
@@ -1365,6 +1366,7 @@ export function ReaderShell() {
       toast(error instanceof Error ? error.message : "书源导入失败");
     } finally {
       setSourceImport("");
+      setTaskProgress(null);
     }
   }
 
@@ -1373,7 +1375,7 @@ export function ReaderShell() {
     const url = window.prompt("输入书源 JSON 的网址（服务器会代理下载）");
     if (!url?.trim()) return;
     setSourceImport("url");
-    toast("正在下载书源…");
+    setTaskProgress({ label: "正在下载书源", done: 0, total: 0 });
     try {
       const rows = await api.readRemoteBookSources(url.trim());
       const imported = rows
@@ -1383,7 +1385,7 @@ export function ReaderShell() {
         })
         .filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!imported.length) throw new Error("该地址没有可识别的书源");
-      toast(`正在保存 ${imported.length} 个书源…`);
+      setTaskProgress({ label: `正在保存 ${imported.length} 个书源`, done: 0, total: 0 });
       await api.saveBookSources(imported);
       await hydrateFromServer(api, false);
       toast(`已从网址导入 ${imported.length} 个书源`);
@@ -1391,6 +1393,7 @@ export function ReaderShell() {
       toast(error instanceof Error ? error.message : "网址导入失败");
     } finally {
       setSourceImport("");
+      setTaskProgress(null);
     }
   }
 
@@ -1505,16 +1508,18 @@ export function ReaderShell() {
     if (!api || connection !== "connected") return toast("登录已过期，请重新登录");
     if (!filteredSources.length) return;
     setLibraryBusy(true);
+    const total = filteredSources.length;
+    setTaskProgress({ label: "正在检测书源", done: 0, total });
     try {
       // The server caps one test request at 100 sources, so batch through all of them.
       let valid = 0;
       let invalid = 0;
-      for (let start = 0; start < filteredSources.length; start += 100) {
+      for (let start = 0; start < total; start += 100) {
         const batch = filteredSources.slice(start, start + 100);
-        toast(`正在检测书源 ${start + 1}–${start + batch.length} / ${filteredSources.length}…`);
         const result = await api.testBookSources(batch);
         valid += result.valid;
         invalid += result.invalid;
+        setTaskProgress({ label: "正在检测书源", done: Math.min(start + batch.length, total), total });
       }
       await hydrateFromServer(api, false);
       toast(`检测完成：${valid} 可用，${invalid} 失效`);
@@ -1522,6 +1527,7 @@ export function ReaderShell() {
       toast(error instanceof Error ? error.message : "书源检测失败");
     } finally {
       setLibraryBusy(false);
+      setTaskProgress(null);
     }
   }
 
@@ -2975,6 +2981,15 @@ export function ReaderShell() {
         </section>
       )}
 
+      {taskProgress && (
+        <div className="task-progress" role="status" aria-live="polite">
+          <strong>{taskProgress.label}</strong>
+          <span>{taskProgress.total ? `${taskProgress.done} / ${taskProgress.total}` : "请稍候…"}</span>
+          <i>{taskProgress.total
+            ? <b style={{ width: `${Math.min(100, (taskProgress.done / taskProgress.total) * 100)}%` }} />
+            : <b className="indeterminate" />}</i>
+        </div>
+      )}
       {message && <div className="toast" role="status">{message}</div>}
     </main>
   );
