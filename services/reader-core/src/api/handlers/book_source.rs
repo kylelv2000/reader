@@ -1166,7 +1166,7 @@ pub async fn read_remote_source_file(
         .user_service
         .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
         .await?;
-    ensure_public_url(&param.url)
+    let mut url = ensure_public_url(&param.url)
         .await
         .map_err(|_| AppError::BadRequest("unsafe remote source URL".to_string()))?;
     let client = reqwest::Client::builder()
@@ -1176,13 +1176,36 @@ pub async fn read_remote_source_file(
         .build()
         .map_err(|e| AppError::Internal(e.into()))?;
 
-    let response = client
-        .get(&param.url)
-        .send()
-        .await
-        .map_err(|e| AppError::BadRequest(format!("网络请求失败: {}", e)))?
-        .error_for_status()
-        .map_err(|e| AppError::BadRequest(format!("远程书源返回错误: {}", e)))?;
+    // Redirects are followed manually so each hop is re-checked against SSRF rules.
+    let mut redirects = 0;
+    let response = loop {
+        let response = client
+            .get(url.as_str())
+            .send()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("网络请求失败: {}", e)))?;
+        if response.status().is_redirection() {
+            redirects += 1;
+            if redirects > 5 {
+                return Err(AppError::BadRequest("远程书源重定向次数过多".to_string()));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| AppError::BadRequest("远程书源重定向地址无效".to_string()))?;
+            let next = url
+                .join(location)
+                .map_err(|_| AppError::BadRequest("远程书源重定向地址无效".to_string()))?;
+            url = ensure_public_url(next.as_str())
+                .await
+                .map_err(|_| AppError::BadRequest("unsafe remote source URL".to_string()))?;
+            continue;
+        }
+        break response
+            .error_for_status()
+            .map_err(|e| AppError::BadRequest(format!("远程书源返回错误: {}", e)))?;
+    };
     const MAX_REMOTE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
     if response.content_length().map(|size| size > MAX_REMOTE_SOURCE_BYTES as u64).unwrap_or(false) {
         return Err(AppError::BadRequest("remote source file is too large".to_string()));
