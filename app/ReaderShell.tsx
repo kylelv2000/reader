@@ -3042,7 +3042,7 @@ export function ReaderShell() {
             <aside className="reader-drawer source-switch-drawer">
               <header><div><p className="eyebrow">换源 · {sourceCandidates.filter((candidate) => !candidate.sourceValidating).length} 个可用来源</p><h2>{reader.book.name}</h2></div><div className="drawer-header-actions">{sourceSwitching ? <button className="stop-scan" onClick={stopSourceScan}>停止</button> : <button disabled={sourceApplying} onClick={() => void loadAvailableSources(true)}>重新扫描</button>}<button onClick={() => { sourceSwitchAbortRef.current?.abort(); setSourceSwitching(false); setShowSourceSwitch(false); }}>×</button></div></header>
               <div className="current-source-card"><span>当前书源</span><strong>{sourceNameFor(reader.book)}</strong><small>共 {reader.chapters.length} 章{latestChapterFor(reader.book) ? ` · 最新：${latestChapterFor(reader.book)}` : ""}</small></div>
-              <p className="drawer-note">优先读取缓存；无缓存时找到 12 个可用来源即停止。重新扫描采用 8 路并发检查全部启用书源，最长 60 秒，可随时停止。</p>
+              <p className="drawer-note">优先读取缓存；无缓存时找到 12 个可用来源即停止。重新扫描多路并发检查全部启用书源，最长 60 秒，可随时停止。</p>
               <div className="candidate-list">
                 {sourceCandidates.length ? sourceCandidates.map((candidate, index) => (
                   <button disabled={sourceApplying || candidate.sourceValidating} key={`${candidate.bookUrl}-${index}`} onClick={() => switchBookSource(candidate)}><span>{index + 1}</span><div><strong>{sourceNameFor(candidate)}</strong><small>{candidate.totalChapterNum ? `共 ${candidate.totalChapterNum} 章` : "正在获取目录"}{latestChapterFor(candidate) ? ` · 最新：${latestChapterFor(candidate)}` : ""}</small></div><i>{sourceApplying ? "切换中" : candidate.sourceValidating ? "查目录" : "切换"}</i></button>

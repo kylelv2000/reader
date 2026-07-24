@@ -64,7 +64,11 @@ python3 scripts/prepare-deploy-env.py \
 | `READER_USER_SOURCE_LIMIT` | `50` | 每个普通用户自有书源上限（0 不限）；管理员的系统书源全员可用、不占额度 |
 | `READER_SEARCH_SOURCE_LIMIT` | `200` | 单次搜索最多使用的书源数，按用户优先级取前 N（0 不限） |
 | `READER_REQUEST_TIMEOUT_SECS` | `20` | 抓取书源的请求超时（秒） |
-| `READER_MAX_OUTBOUND_CONCURRENT` | `16` | 对外抓取并发上限，小带宽可调低 |
+| `READER_MAX_OUTBOUND_CONCURRENT` | `32` | 对外抓取并发上限（全局池），小带宽可调低 |
+| `READER_SCAN_SEARCH_CONCURRENT` | `12` | 换源扫描的搜索并发路数 |
+| `READER_SCAN_VALIDATE_CONCURRENT` | `6` | 换源扫描的目录校验并发路数 |
+| `READER_COVER_CONCURRENT` | `8` | 封面抓取并发（独立通道） |
+| `READER_CORE_MEM_LIMIT` | `1g` | reader-core 内存上限，小内存机器可改 `512m` |
 | `READER_LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` |
 
 其余进阶参数（会话时长、上传上限、WebView 细节等）见 `.env.example` 内的逐项注释。

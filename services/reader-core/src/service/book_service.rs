@@ -86,8 +86,13 @@ impl BookService {
         let outbound_limit = std::env::var("MAX_OUTBOUND_CONCURRENT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(16)
-            .clamp(4, 64);
+            .unwrap_or(32)
+            .clamp(4, 128);
+        let cover_limit = std::env::var("COVER_CONCURRENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(2, 32);
         Self {
             http,
             parser,
@@ -96,7 +101,7 @@ impl BookService {
             source_cookies: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_slots: Arc::new(Semaphore::new(outbound_limit)),
-            cover_slots: Arc::new(Semaphore::new(4)),
+            cover_slots: Arc::new(Semaphore::new(cover_limit)),
         }
     }
 

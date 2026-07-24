@@ -20,6 +20,12 @@ pub struct AppConfig {
     pub user_source_limit: u32,
     /// Max sources consulted per search, best-ranked first (0 = unlimited).
     pub search_source_limit: u32,
+    /// Search lanes for the source-switch scan (each lane = one in-flight
+    /// search request, ~8s timeout).
+    pub scan_search_concurrent: u32,
+    /// Validation lanes for the source-switch scan (each lane fetches the
+    /// candidate's catalog, ~2 requests, so keep it below the search lanes).
+    pub scan_validate_concurrent: u32,
 }
 
 impl Default for AppConfig {
@@ -41,6 +47,8 @@ impl Default for AppConfig {
             user_book_limit: 2000,
             user_source_limit: 50,
             search_source_limit: 200,
+            scan_search_concurrent: 12,
+            scan_validate_concurrent: 6,
         }
     }
 }
@@ -65,6 +73,8 @@ pub fn load() -> anyhow::Result<AppConfig> {
         .set_default("user_book_limit", defaults.user_book_limit as i64)?
         .set_default("user_source_limit", defaults.user_source_limit as i64)?
         .set_default("search_source_limit", defaults.search_source_limit as i64)?
+        .set_default("scan_search_concurrent", defaults.scan_search_concurrent as i64)?
+        .set_default("scan_validate_concurrent", defaults.scan_validate_concurrent as i64)?
         .add_source(config::Environment::default().try_parsing(true))
         .build()?;
     Ok(cfg.try_deserialize()?)

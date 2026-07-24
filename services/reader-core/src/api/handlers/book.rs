@@ -34,10 +34,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_AVAILABLE_RESULT_LIMIT: usize = 20;
 const MAX_AVAILABLE_RESULT_LIMIT: usize = 100;
-const DEFAULT_AVAILABLE_CONCURRENT_COUNT: usize = 8;
-const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 8;
+const MAX_AVAILABLE_CONCURRENT_COUNT: usize = 24;
 const AVAILABLE_SOURCE_SSE_RESULT_LIMIT: usize = 100;
-const AVAILABLE_SOURCE_VALIDATION_CONCURRENT: usize = 4;
 const AVAILABLE_SOURCE_AUTOMATIC_TARGET: usize = 12;
 const AVAILABLE_SOURCE_SEARCH_TIMEOUT_SECONDS: u64 = 8;
 const AVAILABLE_SOURCE_VALIDATION_TIMEOUT_SECONDS: u64 = 10;
@@ -2263,9 +2261,10 @@ async fn find_working_source_for_book(
     prioritize_sources_for_user(state, user_ns, &mut sources).await;
 
     let mut next = 0usize;
+    let validate_lanes = scan_validate_concurrent(state);
     let mut tasks: JoinSet<Option<(BookSource, SearchBook)>> = JoinSet::new();
     loop {
-        while tasks.len() < AVAILABLE_SOURCE_VALIDATION_CONCURRENT && next < sources.len() {
+        while tasks.len() < validate_lanes && next < sources.len() {
             let source = sources[next].clone();
             next += 1;
             let state = state.clone();
@@ -3439,7 +3438,7 @@ pub async fn search_book_source_sse(
     let last_index = q.last_index.unwrap_or(-1);
     let search_size = q.search_size.unwrap_or(30).max(1) as usize;
     let refresh = q.refresh.unwrap_or(0) > 0;
-    let concurrent = DEFAULT_AVAILABLE_CONCURRENT_COUNT;
+    let concurrent = effective_available_concurrent_count(&state, None);
     let book_source_group =
         q.book_source_group
             .clone()
@@ -3609,7 +3608,7 @@ pub async fn get_available_book_source(
     } else {
         usize::MAX
     };
-    let concurrent_count = effective_available_concurrent_count(req.concurrent_count);
+    let concurrent_count = effective_available_concurrent_count(&state, req.concurrent_count);
 
     // Try to find book by URL first, then by name+author
     let book_url = req.url.clone();
@@ -3771,7 +3770,7 @@ pub async fn get_available_book_source_sse(
         .map_err(|_| AppError::BadRequest("NEED_LOGIN".to_string()))?;
     let refresh = req.refresh.unwrap_or(0) > 0;
     let last_index_start = req.last_index.unwrap_or(-1);
-    let concurrent_count = effective_available_concurrent_count(req.concurrent_count);
+    let concurrent_count = effective_available_concurrent_count(&state, req.concurrent_count);
     let book_url = req.url.clone();
 
     let book = if let Some(ref url) = book_url {
@@ -3933,7 +3932,7 @@ pub async fn get_available_book_source_sse(
                 next_index += 1;
             }
 
-            while validation_tasks.len() < AVAILABLE_SOURCE_VALIDATION_CONCURRENT {
+            while validation_tasks.len() < scan_validate_concurrent(&state_clone) {
                 let Some((source_index, source, candidate)) = validation_queue.pop_front() else {
                     break;
                 };
@@ -4614,10 +4613,15 @@ fn effective_available_result_limit(result_limit: Option<i32>) -> usize {
         .clamp(1, MAX_AVAILABLE_RESULT_LIMIT as i32) as usize
 }
 
-fn effective_available_concurrent_count(concurrent_count: Option<i32>) -> usize {
+fn effective_available_concurrent_count(state: &AppState, concurrent_count: Option<i32>) -> usize {
     concurrent_count
-        .unwrap_or(DEFAULT_AVAILABLE_CONCURRENT_COUNT as i32)
+        .filter(|value| *value > 0)
+        .unwrap_or(state.config.scan_search_concurrent as i32)
         .clamp(1, MAX_AVAILABLE_CONCURRENT_COUNT as i32) as usize
+}
+
+fn scan_validate_concurrent(state: &AppState) -> usize {
+    (state.config.scan_validate_concurrent as usize).clamp(1, 16)
 }
 
 fn should_use_available_source_cache(

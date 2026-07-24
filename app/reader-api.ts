@@ -696,9 +696,8 @@ export class ReaderApi {
         origin: book.origin,
         refresh: refresh ? 1 : 0,
         resultLimit: 40,
-        // 8 search lanes + 4 validation lanes peak at 12 in-flight requests,
-        // safely inside the server's global outbound pool of 16.
-        concurrentCount: 8,
+        // Scan concurrency is a server-side deployment setting
+        // (SCAN_SEARCH_CONCURRENT / SCAN_VALIDATE_CONCURRENT).
       }),
     });
     return Array.isArray(result) ? result : result.books || [];
@@ -720,7 +719,6 @@ export class ReaderApi {
       url.searchParams.set("author", book.author);
       if (book.origin) url.searchParams.set("origin", book.origin);
       url.searchParams.set("lastIndex", String(lastIndex));
-      url.searchParams.set("concurrentCount", "8");
       if (refresh) url.searchParams.set("refresh", "1");
       return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
     };
