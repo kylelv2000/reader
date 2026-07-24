@@ -296,9 +296,13 @@ async function handleLogin(request, response) {
     return json(response, 200, { isSuccess: true, data: safeData }, {
       "set-cookie": [...clearCookies(request.headers.cookie, secure), cookie(sessionCookieName, sealSession(token, currentSessionSecret()), { httpOnly: true, secure }), cookie(csrfCookieName, csrf, { secure })],
     });
-  } catch {
+  } catch (error) {
     recordLoginFailure(rateKey);
     recordLoginFailure(addressKey);
+    // A 4xx from core means the credentials were rejected, not an outage.
+    if (error instanceof Error && /^CORE_4\d\d$/.test(error.message)) {
+      return json(response, 401, { isSuccess: false, errorMsg: "用户名或密码错误" });
+    }
     return json(response, 503, { isSuccess: false, errorMsg: "登录服务暂时不可用" });
   }
 }
