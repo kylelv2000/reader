@@ -383,6 +383,7 @@ export function ReaderShell() {
   const [readerChrome, setReaderChrome] = useState(true);
   const [readerMenuOpen, setReaderMenuOpen] = useState(false);
   const [libraryBusy, setLibraryBusy] = useState(false);
+  const [sourceImport, setSourceImport] = useState<"" | "file" | "url">("");
   const [greeting, setGreeting] = useState("欢迎回来");
   const [appTheme, setAppTheme] = useState<AppTheme>("system");
   const [systemDark, setSystemDark] = useState(false);
@@ -1348,10 +1349,12 @@ export function ReaderShell() {
     event.target.value = "";
     if (!file) return;
     if (connection !== "connected") return toast("离线时无法导入书源");
+    setSourceImport("file");
     try {
       const imported = extractBookSources(JSON.parse(await file.text()));
       const valid = imported.filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!valid.length) throw new Error("文件里没有可识别的书源");
+      toast(`正在保存 ${valid.length} 个书源…`);
       if (api && connection === "connected") await api.saveBookSources(valid);
       setSources((current) => {
         const urls = new Set(valid.map((source) => source.bookSourceUrl));
@@ -1360,6 +1363,8 @@ export function ReaderShell() {
       toast(`已导入 ${valid.length} 个书源`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "书源导入失败");
+    } finally {
+      setSourceImport("");
     }
   }
 
@@ -1367,6 +1372,8 @@ export function ReaderShell() {
     if (connection !== "connected") return toast("离线时无法导入书源");
     const url = window.prompt("输入书源 JSON 的网址（服务器会代理下载）");
     if (!url?.trim()) return;
+    setSourceImport("url");
+    toast("正在下载书源…");
     try {
       const rows = await api.readRemoteBookSources(url.trim());
       const imported = rows
@@ -1376,11 +1383,14 @@ export function ReaderShell() {
         })
         .filter((source) => source.bookSourceName && source.bookSourceUrl);
       if (!imported.length) throw new Error("该地址没有可识别的书源");
+      toast(`正在保存 ${imported.length} 个书源…`);
       await api.saveBookSources(imported);
       await hydrateFromServer(api, false);
       toast(`已从网址导入 ${imported.length} 个书源`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "网址导入失败");
+    } finally {
+      setSourceImport("");
     }
   }
 
@@ -1495,6 +1505,7 @@ export function ReaderShell() {
     if (!api || connection !== "connected") return toast("登录已过期，请重新登录");
     if (!filteredSources.length) return;
     setLibraryBusy(true);
+    toast(`正在检测 ${Math.min(filteredSources.length, 100)} 个书源，请稍候…`);
     try {
       const result = await api.testBookSources(filteredSources.slice(0, 100));
       await hydrateFromServer(api, false);
@@ -2527,8 +2538,8 @@ export function ReaderShell() {
                 </div>
                 <div className="intro-actions">
                   <input ref={sourceFileRef} type="file" accept="application/json,.json" hidden onChange={importSources} />
-                  <button className="quiet-button" onClick={() => sourceFileRef.current?.click()}>导入 JSON</button>
-                  <button className="quiet-button" onClick={() => void importSourcesFromUrl()}>网址导入</button>
+                  <button className="quiet-button" disabled={!!sourceImport} onClick={() => sourceFileRef.current?.click()}>{sourceImport === "file" ? "导入中…" : "导入 JSON"}</button>
+                  <button className="quiet-button" disabled={!!sourceImport} onClick={() => void importSourcesFromUrl()}>{sourceImport === "url" ? "导入中…" : "网址导入"}</button>
                   <button className="quiet-button" onClick={() => downloadJson("yomu-book-sources.json", sources)}>导出</button>
                   <button className="quiet-button" onClick={() => void dedupeSources()}>清理重复</button>
                   <button className="quiet-button" disabled={libraryBusy} onClick={testVisibleSources}>{libraryBusy ? "检测中…" : "检测"}</button>
