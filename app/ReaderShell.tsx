@@ -801,10 +801,15 @@ export function ReaderShell() {
   }
 
   function sourceNameFor(book: Book) {
-    return book.originName
-      || sources.find((source) => source.bookSourceUrl === book.origin)?.bookSourceName
-      || book.origin
-      || "未知书源";
+    const known = book.originName
+      || sources.find((source) => source.bookSourceUrl === book.origin)?.bookSourceName;
+    if (known) return known;
+    // Fall back to the hostname; regular users cannot resolve system-source
+    // URLs against their own list and a bare URL reads poorly.
+    if (book.origin?.startsWith("http")) {
+      try { return new URL(book.origin).hostname; } catch { /* keep origin */ }
+    }
+    return book.origin || "未知书源";
   }
 
   async function hydrateFromServer(client: ReaderApi, refresh: boolean) {

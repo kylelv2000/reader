@@ -2444,6 +2444,7 @@ pub async fn set_book_source(
             let mut fallback = SearchBook {
                 book_url: new_book_url.clone(),
                 origin: new_source.book_source_url.clone(),
+                origin_name: Some(new_source.book_source_name.clone()),
                 name: shelf_book.name.clone(),
                 author: shelf_book.author.clone(),
                 ..Default::default()
@@ -3644,13 +3645,14 @@ pub async fn get_available_book_source(
                 .load_book_sources_cache(&user_ns, url)
                 .await?
             {
-                let list = take_available_source_cached_matches(
+                let mut list = take_available_source_cached_matches(
                     list,
                     None,
                     &book.name,
                     &book.author,
                     usize::MAX,
                 );
+                backfill_candidate_origin_names(&state, &user_ns, &mut list).await;
                 return Ok(Json(ApiResponse::ok(
                     serde_json::to_value(list).unwrap_or_default(),
                 )));
@@ -3820,7 +3822,8 @@ pub async fn get_available_book_source_sse(
                         .delete_book_sources_cache(&user_ns, url)
                         .await;
                 } else {
-                    let cached = validated;
+                    let mut cached = validated;
+                    backfill_candidate_origin_names(&state, &user_ns, &mut cached).await;
                     let _ = state
                         .book_service
                         .save_book_sources_cache(&user_ns, url, &cached)
@@ -4734,6 +4737,35 @@ fn prioritize_available_sources(
             response_time.unwrap_or(i64::MAX),
         )
     });
+}
+
+/// Older cached candidates predate the originName field; resolve names from
+/// the merged (own + shared) source list so clients can always show a name.
+async fn backfill_candidate_origin_names(
+    state: &AppState,
+    user_ns: &str,
+    candidates: &mut [SearchBook],
+) {
+    if candidates.iter().all(|candidate| candidate.origin_name.is_some()) {
+        return;
+    }
+    let Ok(sources) = state.book_source_service.list(user_ns).await else {
+        return;
+    };
+    let names: std::collections::HashMap<String, String> = sources
+        .into_iter()
+        .map(|source| {
+            (
+                normalize_source_url(&source.book_source_url),
+                source.book_source_name,
+            )
+        })
+        .collect();
+    for candidate in candidates.iter_mut() {
+        if candidate.origin_name.is_none() {
+            candidate.origin_name = names.get(&normalize_source_url(&candidate.origin)).cloned();
+        }
+    }
 }
 
 /// Per-user prioritisation: loads this user's usage stats and sorts in place.

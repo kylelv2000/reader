@@ -7,6 +7,10 @@ pub struct SearchBook {
     pub author: String,
     pub book_url: String,
     pub origin: String,
+    /// Human-readable source name so clients never have to resolve the origin
+    /// URL against a source list they may not be able to see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_name: Option<String>,
     /// Catalog URL resolved during source validation. Keeping it with the
     /// candidate makes a later source switch a cache-only operation.
     #[serde(skip_serializing_if = "Option::is_none")]
