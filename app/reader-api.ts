@@ -517,12 +517,12 @@ export class ReaderApi {
     return isAbsolute ? url.toString() : `${url.pathname}${url.search}`;
   }
 
-  testBookSources(sources: BookSource[], keyword = "我的") {
+  testBookSources(sources: BookSource[]) {
+    // No keyword: the server prefers each source's own checkKeyWord.
     return this.request<SourceTestSummary>("/testBookSources", {
       method: "POST",
       body: JSON.stringify({
         bookSourceUrls: sources.map((source) => source.bookSourceUrl),
-        keyword,
         markInvalid: true,
         concurrent: 8,
       }),

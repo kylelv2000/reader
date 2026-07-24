@@ -1505,11 +1505,19 @@ export function ReaderShell() {
     if (!api || connection !== "connected") return toast("登录已过期，请重新登录");
     if (!filteredSources.length) return;
     setLibraryBusy(true);
-    toast(`正在检测 ${Math.min(filteredSources.length, 100)} 个书源，请稍候…`);
     try {
-      const result = await api.testBookSources(filteredSources.slice(0, 100));
+      // The server caps one test request at 100 sources, so batch through all of them.
+      let valid = 0;
+      let invalid = 0;
+      for (let start = 0; start < filteredSources.length; start += 100) {
+        const batch = filteredSources.slice(start, start + 100);
+        toast(`正在检测书源 ${start + 1}–${start + batch.length} / ${filteredSources.length}…`);
+        const result = await api.testBookSources(batch);
+        valid += result.valid;
+        invalid += result.invalid;
+      }
       await hydrateFromServer(api, false);
-      toast(`检测完成：${result.valid} 可用，${result.invalid} 失效`);
+      toast(`检测完成：${valid} 可用，${invalid} 失效`);
     } catch (error) {
       toast(error instanceof Error ? error.message : "书源检测失败");
     } finally {
