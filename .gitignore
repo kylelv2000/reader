@@ -31,8 +31,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
-!.env.example
-!deploy/.env.example
+
+# per-server compose overrides stay local
+deploy/compose.override.yml
 
 # vercel
 .vercel

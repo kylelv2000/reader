@@ -99,9 +99,10 @@ async fn fetch_with_webview(
     client: &HttpClient,
     req: &RequestSpec,
 ) -> anyhow::Result<FetchResponse> {
-    let bridge_url = env::var("WEBVIEW_BRIDGE_URL").map_err(|_| {
-        anyhow::anyhow!("source requires WebView but WEBVIEW_BRIDGE_URL is not configured")
-    })?;
+    let bridge_url = env::var("WEBVIEW_BRIDGE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http://webview-bridge:19090".to_string());
     let bridge_key = env::var("WEBVIEW_BRIDGE_KEY").unwrap_or_default();
     let payload = WebViewBridgeRequest {
         url: req.url.clone(),
@@ -124,7 +125,16 @@ async fn fetch_with_webview(
         .header("x-webview-key", bridge_key)
         .json(&payload)
         .send()
-        .await?;
+        .await
+        .map_err(|error| {
+            if error.is_connect() {
+                anyhow::anyhow!(
+                    "该书源需要 WebView，但 WebView 服务未启动（启动命令加 --profile webview）"
+                )
+            } else {
+                error.into()
+            }
+        })?;
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
             "WebView bridge returned {}: {}",

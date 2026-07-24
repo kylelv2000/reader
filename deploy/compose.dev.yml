@@ -1,7 +1,7 @@
 # 开发 / 自编译版：在服务器或本机从源码构建镜像，替代 Docker Hub 预编译镜像。
 # 用法（叠加在 compose.yml 之上）：
-#   docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.dev.yml build
-#   docker compose --env-file deploy/.env -f deploy/compose.yml -f deploy/compose.dev.yml up -d
+#   docker compose -f deploy/compose.yml -f deploy/compose.dev.yml build
+#   docker compose -f deploy/compose.yml -f deploy/compose.dev.yml up -d
 services:
   yomu-app:
     build:
@@ -14,3 +14,9 @@ services:
       context: ../services/reader-core
       dockerfile: Dockerfile
     image: light-reader-core:server
+
+  webview-bridge:
+    build:
+      context: ../services/webview-bridge
+      dockerfile: Dockerfile
+    image: light-reader-webview:server
