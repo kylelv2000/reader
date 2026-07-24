@@ -383,7 +383,8 @@ async function proxyCore(request, response) {
     }
   }
 
-  const isUpload = /upload|import/i.test(pathname);
+  // saveBookSources carries whole source collections (several MB), same as uploads.
+  const isUpload = /upload|import/i.test(pathname) || pathname === "/reader3/saveBookSources";
   let body;
   try {
     if (!["GET", "HEAD"].includes(request.method || "GET")) {
