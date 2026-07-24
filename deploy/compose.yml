@@ -110,7 +110,8 @@ services:
     image: docker.io/komqaq/yomu-reader:webview-${YOMU_IMAGE_VERSION:-latest}
     restart: unless-stopped
     environment:
-      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:?启用 WebView 时需要设置 WEBVIEW_BRIDGE_KEY}
+      # 空 key 时 bridge 会拒绝所有请求；启用 WebView 必须设置随机值。
+      WEBVIEW_BRIDGE_KEY: ${WEBVIEW_BRIDGE_KEY:-}
       WEBVIEW_MAX_CONCURRENT: ${WEBVIEW_MAX_CONCURRENT:-1}
       WEBVIEW_IDLE_SECONDS: ${WEBVIEW_IDLE_SECONDS:-120}
       WEBVIEW_MAX_RESPONSE_BYTES: ${WEBVIEW_MAX_RESPONSE_BYTES:-8388608}
