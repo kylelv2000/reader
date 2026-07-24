@@ -15,14 +15,15 @@ test("parses cookie values without accepting malformed encoding", () => {
   assert.deepEqual(parseCookies("a=1; yomu_csrf=hello%20world; broken=%ZZ"), { a: "1", yomu_csrf: "hello world" });
 });
 
-test("requires the configured same origin in production", () => {
-  assert.equal(isAllowedOrigin("https://reader.example.com", "https://reader.example.com", "production"), true);
-  assert.equal(isAllowedOrigin("https://evil.example", "https://reader.example.com", "production"), false);
-  assert.equal(isAllowedOrigin("http://localhost:3000", "", "test"), true);
-  // Local mode: without a configured public origin only loopback is accepted.
-  assert.equal(isAllowedOrigin("http://localhost:8080", "", "production"), true);
-  assert.equal(isAllowedOrigin("http://127.0.0.1:8080", "", "production"), true);
-  assert.equal(isAllowedOrigin("https://evil.example", "", "production"), false);
+test("origin must match the request host exactly", () => {
+  assert.equal(isAllowedOrigin("https://reader.example.com", "reader.example.com"), true);
+  assert.equal(isAllowedOrigin("https://evil.example", "reader.example.com"), false);
+  assert.equal(isAllowedOrigin("http://localhost:8080", "localhost:8080"), true);
+  assert.equal(isAllowedOrigin("http://127.0.0.1:9101", "127.0.0.1:9101"), true);
+  assert.equal(isAllowedOrigin("http://localhost:8080", "localhost:9999"), false);
+  assert.equal(isAllowedOrigin("", "reader.example.com"), false);
+  assert.equal(isAllowedOrigin("https://reader.example.com", ""), false);
+  assert.equal(isAllowedOrigin("not-a-url", "reader.example.com"), false);
 });
 
 test("strips privilege override parameters and blocks traversal", () => {

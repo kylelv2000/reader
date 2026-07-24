@@ -22,9 +22,6 @@ COPY --from=build --chown=node:node /app/node_modules/scheduler ./node_modules/s
 COPY --chown=node:node services/web-runtime ./services/web-runtime
 COPY --chown=node:node services/security-gateway ./services/security-gateway
 
-# Data volume mount point for the auto-generated session secret.
-RUN mkdir -p /data && chown node:node /data
-
 EXPOSE 8080
 USER node
 CMD ["node", "services/security-gateway/server.mjs"]

@@ -39,7 +39,7 @@ impl Default for AppConfig {
             web_root: "frontend/dist".to_string(),
             assets_dir: "storage/assets".to_string(),
             log_level: "info".to_string(),
-            request_timeout_secs: 15,
+            request_timeout_secs: 30,
             secure: false,
             secure_key: "".to_string(),
             invite_code: "".to_string(),

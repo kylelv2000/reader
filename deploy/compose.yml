@@ -1,101 +1,45 @@
 name: yomu-reader
 
-# ===================== 一键部署 =====================
-# 下载本文件后直接启动：
+# 一键部署：
 #   docker compose up -d
 # 首次启动自动创建管理员 admin，初始密码看日志：
 #   docker compose logs reader-core | grep admin
 # 打开 http://localhost:8080 登录，然后到「用户」页改密码。
 #
-# 公网部署：反向代理转发 HTTPS 到 127.0.0.1:8080，
-# 并把下面的 YOMU_PUBLIC_ORIGIN 改成你的域名。
+# 公网访问：用 frp / Caddy / Nginx 把流量转发到 127.0.0.1:8080 即可，
+# 无需其他配置（反向代理需转发原始 Host 头，Caddy 默认如此）。
 # 需要 WebView 书源时：docker compose --profile webview up -d
-# ====================================================
 
 services:
   # 网页界面 + 安全网关（唯一对外的服务）
   yomu-app:
     image: docker.io/komqaq/yomu-reader:app-latest
     restart: unless-stopped
-    environment:
-      NODE_ENV: production
-      PORT: 8080
-      READER_CORE_ORIGIN: http://reader-core:18080
-      # 公网部署改成你的域名（如 https://reader.example.com）；
-      # 留空 = 本地模式（http://localhost）。
-      YOMU_PUBLIC_ORIGIN: ""
+    ports:
+      - "127.0.0.1:8080:8080"   # 局域网直接访问改成 "8080:8080"
+    volumes:
+      - reader-storage:/storage:ro
     depends_on:
       reader-core:
         condition: service_healthy
-    ports:
-      # 默认只监听本机；想让局域网设备访问改成 "8080:8080"。
-      - "127.0.0.1:8080:8080"
-    volumes:
-      - app-data:/data
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    mem_limit: 192m
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
 
   # 书源抓取与数据存储（不对外开放）
   reader-core:
     image: docker.io/komqaq/yomu-reader:core-latest
     restart: unless-stopped
-    environment:
-      SERVER_HOST: 0.0.0.0
-      SERVER_PORT: 18080
-      SECURE: "true"
-    expose:
-      - "18080"
     volumes:
-      # 全部数据（数据库、缓存、密钥、初始密码）都在这个卷里。
-      # 想直接落盘便于备份：改成绝对路径，如 /srv/yomu-data:/app/storage
+      # 全部数据都在这里。想直接落盘便于备份：
+      # 把三处 reader-storage 都改成绝对路径，如 /srv/yomu-data
       - reader-storage:/app/storage
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    # 小内存机器可改成 512m
-    mem_limit: 1g
 
-  # 可选：内含 Chromium 的 WebView 旁车，仅少数书源需要（约 800MB 内存）。
-  # 启用：docker compose --profile webview up -d（密钥自动共享，无需配置）
+  # 可选：WebView 书源（内置 Chromium，约 800MB 内存，多数人用不到）
   webview-bridge:
     profiles: ["webview"]
     image: docker.io/komqaq/yomu-reader:webview-latest
     restart: unless-stopped
+    shm_size: 512mb
     volumes:
       - reader-storage:/storage:ro
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:19090/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
-      interval: 20s
-      timeout: 5s
-      retries: 8
-    shm_size: 512mb
-    mem_limit: 896m
-    read_only: true
-    tmpfs:
-      - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
 
 volumes:
   reader-storage:
-  app-data:
-
-# 高级调参（配额、并发、超时等）：在本目录新建 compose.override.yml
-# 覆盖对应服务的 environment 即可，参数清单见 deploy/README.md。

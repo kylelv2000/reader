@@ -41,15 +41,12 @@ pub async fn run() -> anyhow::Result<()> {
         .await?;
         tracing::info!("SECURE_KEY not set; using the generated key persisted in storage/data/secure-key.txt");
     }
-    // The WebView bridge key is generated in the shared storage volume; the
-    // optional bridge container reads the same file, so enabling the webview
-    // profile needs no configuration either.
-    let webview_key = load_or_create_secret(
-        &std::path::Path::new(&cfg.storage_dir)
-            .join("data")
-            .join("webview-key.txt"),
-    )
-    .await?;
+    // Companion secrets also live in the storage volume: the gateway reads
+    // the session secret and the optional WebView bridge reads its key from
+    // read-only mounts of the same volume, so nothing needs configuring.
+    let data_dir = std::path::Path::new(&cfg.storage_dir).join("data");
+    load_or_create_secret(&data_dir.join("session-secret.txt")).await?;
+    let webview_key = load_or_create_secret(&data_dir.join("webview-key.txt")).await?;
     if std::env::var("WEBVIEW_BRIDGE_KEY").map(|v| v.trim().is_empty()).unwrap_or(true) {
         std::env::set_var("WEBVIEW_BRIDGE_KEY", &webview_key);
     }

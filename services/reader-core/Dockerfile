@@ -30,10 +30,9 @@ COPY --from=builder /tmp/yomu-reader-core /app/yomu-reader-core
 COPY --from=builder /src/src/storage/db/migrations /app/migrations
 RUN mkdir -p /app/storage/assets && chown -R reader:reader /app/storage
 ENV SERVER_HOST=0.0.0.0 SERVER_PORT=18080 \
-    DATABASE_URL=sqlite:/app/storage/reader.db?mode=rwc \
     STORAGE_DIR=/app/storage ASSETS_DIR=/app/storage/assets \
     MIGRATIONS_DIR=/app/migrations \
-    LOG_LEVEL=info REQUEST_TIMEOUT_SECS=45
+    SECURE=true
 EXPOSE 18080
 VOLUME ["/app/storage"]
 USER reader

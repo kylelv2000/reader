@@ -1,9 +1,6 @@
 # 部署指南
 
-只需要 `compose.yml` 一个文件，**没有任何必填配置**。镜像从 Docker Hub（`komqaq/yomu-reader`）拉取。常驻服务两个：
-
-- **yomu-app** — 网页界面 + 安全网关，唯一对外的服务
-- **reader-core** — 书源抓取与数据存储（SQLite + 文件卷）
+只需要 `compose.yml` 一个文件，**零配置**。镜像来自 Docker Hub（`komqaq/yomu-reader`）。
 
 ## 一键部署
 
@@ -16,19 +13,16 @@ docker compose logs reader-core | grep admin   # 查看初始管理员密码
 
 打开 `http://localhost:8080`，用 `admin` + 日志里的密码登录，然后在「用户」页改密码。
 
-所有密钥自动生成并保存在数据卷里，重启不失效。
+所有密钥自动生成并保存在数据卷里；忘记初始密码可随时执行
+`docker compose exec reader-core cat /app/storage/data/initial-admin-password.txt`。
 
-## 常见调整（直接编辑 compose.yml，都有注释）
+## 公网访问
 
-| 想做什么 | 改哪里 |
-|----------|--------|
-| 公网部署 | `YOMU_PUBLIC_ORIGIN` 改成你的 https 域名，反向代理转发到 `127.0.0.1:8080` |
-| 局域网访问 | `ports` 改成 `"8080:8080"` |
-| 数据直接落盘 | 存储卷改成绝对路径，如 `/srv/yomu-data:/app/storage` |
-| WebView 书源 | 启动命令加 `--profile webview`（密钥自动共享，无需配置） |
-| 小内存机器 | `reader-core` 的 `mem_limit` 改成 `512m` |
+用你习惯的方式（frp、Caddy、Nginx…）把流量转发到 `127.0.0.1:8080` 就行，**无需任何配置**。
+唯一要求：反向代理需转发原始 `Host` 头（Caddy 默认如此；Nginx 加 `proxy_set_header Host $host;`）。
+走 HTTPS 时（代理设置 `X-Forwarded-Proto: https`）Cookie 自动升级为 Secure 并启用 HSTS。
 
-Caddy 反向代理示例（自动 HTTPS）：
+Caddy 示例（自动 HTTPS）：
 
 ```
 reader.example.com {
@@ -36,9 +30,18 @@ reader.example.com {
 }
 ```
 
-## 高级调参（可选）
+## 常见调整（直接编辑 compose.yml，都有注释）
 
-极少需要。在 compose.yml 同目录新建 `compose.override.yml` 覆盖环境变量，`docker compose up -d` 会自动叠加：
+| 想做什么 | 改哪里 |
+|----------|--------|
+| 换端口 | `ports` 的 `8080` 改成别的 |
+| 局域网直接访问 | `ports` 改成 `"8080:8080"` |
+| 数据直接落盘 | 三处 `reader-storage` 卷改成绝对路径，如 `/srv/yomu-data` |
+| WebView 书源 | 启动命令加 `--profile webview`（密钥自动共享） |
+
+## 高级调参（可选，极少需要）
+
+同目录新建 `compose.override.yml`（`docker compose up -d` 自动叠加）：
 
 ```yaml
 services:
@@ -52,7 +55,7 @@ services:
       USER_LIMIT: "50"                 # 用户数上限（默认 50）
       USER_BOOK_LIMIT: "2000"          # 每用户书籍上限（默认 2000）
       USER_SOURCE_LIMIT: "50"          # 每用户自有书源上限（默认 50，0 不限）
-      REQUEST_TIMEOUT_SECS: "20"       # 抓取超时秒数（默认 20）
+      REQUEST_TIMEOUT_SECS: "30"       # 抓取超时秒数（默认 30）
       LOG_LEVEL: "info"                # error / warn / info / debug
 ```
 
@@ -67,8 +70,6 @@ docker compose pull && docker compose up -d
 ```bash
 docker run --rm -v yomu-reader_reader-storage:/data -v "$PWD":/backup alpine tar czf /backup/yomu-backup.tar.gz -C /data .
 ```
-
-忘记初始密码：`docker compose exec reader-core cat /app/storage/data/initial-admin-password.txt`。
 
 旧版 Reader Pro 迁移：把存储卷指向旧数据目录，首次启动自动迁移。安全设计见 [`../docs/SECURITY.md`](../docs/SECURITY.md)。
 
