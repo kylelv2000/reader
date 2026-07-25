@@ -2421,8 +2421,9 @@ fn cookie_domain(source_url: &str) -> String {
     }
 }
 
-fn is_local_txt_book(book: &Book) -> bool {
-    book.origin.trim() == "local-txt" || book.book_url.trim().starts_with("local-txt:")
+fn is_local_book(book: &Book) -> bool {
+    crate::service::local_book_common::is_local_book_origin(&book.origin)
+        || crate::service::local_book_common::is_local_book_url(&book.book_url)
 }
 
 fn books_match_for_save(existing: &Book, incoming: &Book) -> bool {
@@ -2433,7 +2434,9 @@ fn books_match_for_delete(existing: &Book, target: &Book) -> bool {
     if !target.book_url.is_empty() && existing.book_url == target.book_url {
         return true;
     }
-    if is_local_txt_book(existing) || is_local_txt_book(target) {
+    // Local books may legitimately share name/author with a web copy or a
+    // freshly migrated copy; only an exact bookUrl match may remove them.
+    if is_local_book(existing) || is_local_book(target) {
         return false;
     }
     !target.name.is_empty()
@@ -2592,6 +2595,43 @@ fn safe_cover_payload(content_type: &str, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_a_legacy_entry_never_matches_a_local_book_by_name() {
+        // Regression: migrating "loc_book" entries saves a local-epub copy
+        // with the same name/author before deleting the legacy entry; the
+        // name+author fallback must not remove the fresh local copy.
+        let legacy = Book {
+            name: "The House on Mango Street".to_string(),
+            author: "Shmoop".to_string(),
+            origin: "loc_book".to_string(),
+            book_url: "storage/data/admin/x/y.epub".to_string(),
+            ..Book::default()
+        };
+        let migrated = Book {
+            name: "The House on Mango Street".to_string(),
+            author: "Shmoop".to_string(),
+            origin: "local-epub".to_string(),
+            book_url: "local-epub:abc123".to_string(),
+            ..Book::default()
+        };
+        assert!(!books_match_for_delete(&migrated, &legacy));
+        assert!(books_match_for_delete(&legacy, &legacy));
+        // Web books still fall back to name+author matching.
+        let web_a = Book {
+            name: "同名书".to_string(),
+            author: "作者".to_string(),
+            origin: "https://a.test".to_string(),
+            book_url: "https://a.test/1".to_string(),
+            ..Book::default()
+        };
+        let web_b = Book {
+            book_url: "https://b.test/1".to_string(),
+            origin: "https://b.test".to_string(),
+            ..web_a.clone()
+        };
+        assert!(books_match_for_delete(&web_a, &web_b));
+    }
 
     fn test_book_service(name: &str) -> (BookService, PathBuf) {
         let storage_dir = std::env::temp_dir().join(format!(
