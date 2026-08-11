@@ -3120,7 +3120,19 @@ export function ReaderShell() {
             <div className="reader-quick-actions">
               <button onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }} aria-label="目录"><AppIcon name="catalog" /></button>
               <button onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }} aria-label="阅读设置">Aa</button>
-              <button className={readerMenuOpen ? "active" : ""} onClick={() => setReaderMenuOpen((value) => !value)} aria-label="更多阅读操作" aria-expanded={readerMenuOpen}><AppIcon name="more" /></button>
+              <button
+                className={readerMenuOpen ? "active" : ""}
+                type="button"
+                onTouchStart={(event) => event.stopPropagation()}
+                onTouchEnd={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setReaderChrome(true);
+                  setReaderMenuOpen((value) => !value);
+                }}
+                aria-label="更多阅读操作"
+                aria-expanded={readerMenuOpen}
+              ><AppIcon name="more" /></button>
             </div>
             {readerMenuOpen && <div className="reader-more-menu" role="menu">
               <button onClick={() => { setReaderMenuOpen(false); saveCurrentBookmark(); }}>书签</button>
@@ -3133,31 +3145,55 @@ export function ReaderShell() {
             </div>}
           </header>
           {readerMenuOpen && (
-            <div className="reader-mobile-dock" role="toolbar" aria-label="阅读快捷菜单" onClick={(event) => event.stopPropagation()}>
-              <div className="reader-mobile-actions">
-                <button onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }}><span><AppIcon name="catalog" /></span><small>目录</small></button>
-                <button onClick={() => { setReaderMenuOpen(false); void saveCurrentBookmark(); }}><span>⌑</span><small>书签</small></button>
-                <button onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }}><span>Aa</span><small>设置</small></button>
-                <button onClick={() => { setReaderMenuOpen(false); if (offlineDownload?.bookUrl === reader.book.bookUrl) offlineDownloadRef.current?.abort(); else setOfflinePickerBook(reader.book); }}><span>↓</span><small>{offlineDownload?.bookUrl === reader.book.bookUrl ? "停止" : "缓存"}</small></button>
-              </div>
-              {reader.chapters.length > 1 && <div className="reader-mobile-chapter-control">
-                <button aria-label="上一章" disabled={reader.chapterIndex === 0} onClick={() => void changePageOrChapter(-1)}>‹</button>
-                <div className="reader-mobile-chapter-slider">
-                  <input
-                    type="range"
-                    min={0}
-                    max={reader.chapters.length - 1}
-                    value={Math.min(catalogSliderIndex, reader.chapters.length - 1)}
-                    aria-label="快速定位章节"
-                    onChange={(event) => setCatalogSliderIndex(Number(event.target.value))}
-                    onPointerUp={(event) => void loadChapter(Number(event.currentTarget.value))}
-                    onKeyUp={(event) => { if (event.key.startsWith("Arrow")) void loadChapter(Number(event.currentTarget.value)); }}
-                  />
-                  <div><span>第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</span><small>{currentChapter?.title || "快速滑动章节"}</small></div>
+            <>
+              <button className="reader-mobile-menu-scrim" type="button" aria-label="关闭阅读菜单" onClick={() => setReaderMenuOpen(false)} />
+              <div
+                className="reader-mobile-dock"
+                role="toolbar"
+                aria-label="阅读快捷菜单"
+                onTouchStart={(event) => event.stopPropagation()}
+                onTouchEnd={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <span className="reader-mobile-menu-handle" aria-hidden="true" />
+                <header className="reader-mobile-menu-header">
+                  <div><small>阅读操作</small><strong>{currentChapter?.title || reader.book.name}</strong></div>
+                  <button type="button" aria-label="关闭阅读菜单" onClick={() => setReaderMenuOpen(false)}>×</button>
+                </header>
+                <div className="reader-mobile-actions" role="group" aria-label="常用阅读操作">
+                  <button type="button" onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }}><span><AppIcon name="catalog" /></span><small>目录</small></button>
+                  <button type="button" onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }}><span>Aa</span><small>设置</small></button>
+                  {readerSourceType === 0 && <button type="button" onClick={() => { setReaderMenuOpen(false); toggleSpeech(); }}><span>{speaking ? "■" : "◖"}</span><small>{speaking ? "停止朗读" : "朗读"}</small></button>}
+                  {readerSourceType !== 1 && readerSourceType !== 0 && <button type="button" onClick={() => { setReaderMenuOpen(false); setAutoReading((value) => !value); }}><span>↻</span><small>{autoReading ? "停止自动" : "自动阅读"}</small></button>}
+                  <button type="button" onClick={() => { setReaderMenuOpen(false); if (offlineDownload?.bookUrl === reader.book.bookUrl) offlineDownloadRef.current?.abort(); else setOfflinePickerBook(reader.book); }}><span>↓</span><small>{offlineDownload?.bookUrl === reader.book.bookUrl ? "停止缓存" : "缓存章节"}</small></button>
                 </div>
-                <button aria-label="下一章" disabled={reader.chapterIndex === reader.chapters.length - 1} onClick={() => void changePageOrChapter(1)}>›</button>
-              </div>}
-            </div>
+                <div className="reader-mobile-more-actions" role="group" aria-label="更多阅读操作">
+                  {readerSourceType === 0 && <button type="button" onClick={() => { setReaderMenuOpen(false); setAutoReading((value) => !value); }}><span>↻</span><small>{autoReading ? "停止自动阅读" : "自动阅读"}</small></button>}
+                  <button type="button" onClick={() => { setReaderMenuOpen(false); openCoverPicker(reader.book); }}><span>⌂</span><small>更换封面</small></button>
+                  <button type="button" onClick={() => { setReaderMenuOpen(false); void loadAvailableSources(false); }}><span>⇄</span><small>切换书源</small></button>
+                  {readerSourceType === 0 && <button type="button" onClick={() => { setReaderMenuOpen(false); setShowChapterSearch(true); }}><span>⌕</span><small>查找正文</small></button>}
+                </div>
+                {reader.chapters.length > 1 && <div className="reader-mobile-chapter-control">
+                  <button type="button" aria-label="上一章" disabled={reader.chapterIndex === 0} onClick={() => void changePageOrChapter(-1)}>‹</button>
+                  <div className="reader-mobile-chapter-slider">
+                    <div className="reader-mobile-progress-header"><span>章节进度</span><strong>{catalogSliderIndex + 1} / {reader.chapters.length}</strong></div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={reader.chapters.length - 1}
+                      value={Math.min(catalogSliderIndex, reader.chapters.length - 1)}
+                      aria-label="快速定位章节"
+                      style={{ "--reader-progress": `${(catalogSliderIndex / Math.max(1, reader.chapters.length - 1)) * 100}%` } as CSSProperties}
+                      onChange={(event) => setCatalogSliderIndex(Number(event.target.value))}
+                      onPointerUp={(event) => void loadChapter(Number(event.currentTarget.value))}
+                      onKeyUp={(event) => { if (event.key.startsWith("Arrow")) void loadChapter(Number(event.currentTarget.value)); }}
+                    />
+                    <div className="reader-mobile-progress-caption"><span>{reader.chapters[catalogSliderIndex]?.title || currentChapter?.title || "快速滑动章节"}</span><small>松开跳转</small></div>
+                  </div>
+                  <button type="button" aria-label="下一章" disabled={reader.chapterIndex === reader.chapters.length - 1} onClick={() => void changePageOrChapter(1)}>›</button>
+                </div>}
+              </div>
+            </>
           )}
           <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap} onScroll={handlePagedScroll} onWheel={handlePagedWheel}>
             <p className="chapter-kicker">第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</p>
