@@ -127,10 +127,11 @@ export class ReaderApi {
     return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/session");
   }
 
-  login(username: string, password: string) {
+  login(username: string, password: string, signal?: AbortSignal) {
     return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
+      signal,
     });
   }
 

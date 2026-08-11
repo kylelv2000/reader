@@ -354,6 +354,7 @@ export function ReaderShell() {
   const [clientReady, setClientReady] = useState(false);
   const [profile, setProfile] = useState<ServerProfile>({});
   const [showConnect, setShowConnect] = useState(false);
+  const [loginBusy, setLoginBusy] = useState(false);
   const [showCommand, setShowCommand] = useState(false);
   const [message, setMessage] = useState("");
   const [reader, setReader] = useState<ReaderSession | null>(null);
@@ -442,6 +443,7 @@ export function ReaderShell() {
 
   const api = useMemo(() => new ReaderApi(), []);
   const connectionRef = useRef<ConnectionState>("checking");
+  const sessionRestoreRef = useRef<{ startedAt: number; inFlight: Promise<void> | null }>({ startedAt: 0, inFlight: null });
 
   const filteredSources = useMemo(() => {
     let result = sources;
@@ -579,7 +581,9 @@ export function ReaderShell() {
       setIsOnline(true);
       // The session Cookie is restored by the browser automatically. Retry
       // the session and shelf request as soon as the device has a route again.
-      void hydrateFromServer(api, false);
+      // The helper deduplicates bursts of connectivity events so this stays
+      // quiet on mobile radios.
+      void requestSessionRestore(api, false);
     };
     setIsOnline(navigator.onLine);
     window.addEventListener("offline", handleOffline);
@@ -711,7 +715,9 @@ export function ReaderShell() {
 
   useEffect(() => {
     if (!api) return;
-    void hydrateFromServer(api, false);
+    // One automatic Cookie/session restore per app opening. There is no
+    // interval or background polling; online events are throttled as well.
+    void requestSessionRestore(api, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api]);
 
@@ -857,7 +863,45 @@ export function ReaderShell() {
     return book.origin || "未知书源";
   }
 
+  async function enterOfflineMode(client: ReaderApi, notice = "") {
+    const storedProfile = getStoredProfile();
+    if (storedProfile.username) client.setCacheNamespace(storedProfile.username);
+    client.setOfflineMode(true);
+    const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
+    setIsOnline(false);
+    setBooks(offlineBooks);
+    setProfile(storedProfile);
+    setSources([]);
+    setGroups([]);
+    setBookmarks([]);
+    setRssSources([]);
+    setReplaceRules([]);
+    setAdminAuthorized(false);
+    await refreshOfflineStatuses(offlineBooks);
+    setConnection("offline");
+    if (notice) toast(notice);
+  }
+
+  function requestSessionRestore(client: ReaderApi, refresh: boolean, manual = false) {
+    const now = Date.now();
+    const current = sessionRestoreRef.current;
+    if (!manual && navigator.onLine) {
+      if (current.inFlight) return current.inFlight;
+      if (now - current.startedAt < 60_000) return Promise.resolve();
+      current.startedAt = now;
+    }
+    const task = hydrateFromServer(client, refresh);
+    current.inFlight = task;
+    return task.finally(() => {
+      if (current.inFlight === task) current.inFlight = null;
+    });
+  }
+
   async function hydrateFromServer(client: ReaderApi, refresh: boolean) {
+    if (!navigator.onLine) {
+      await enterOfflineMode(client, "当前离线，已打开本机界面");
+      return;
+    }
     setConnection((current) => current === "connected" ? current : "checking");
     const storedProfile = getStoredProfile();
     if (storedProfile.username) client.setCacheNamespace(storedProfile.username);
@@ -903,24 +947,28 @@ export function ReaderShell() {
         setConnection("signedout");
         if (refresh) toast("登录已过期，请重新登录");
       } else {
-        const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
-        if (offlineBooks.length || !navigator.onLine) {
-          setIsOnline(false);
-          setBooks(offlineBooks);
-          setProfile(storedProfile);
-          setSources([]);
-          setGroups([]);
-          setBookmarks([]);
-          setRssSources([]);
-          setReplaceRules([]);
-          setAdminAuthorized(false);
-          await refreshOfflineStatuses(offlineBooks);
-          client.setOfflineMode(true);
-          setConnection("offline");
-          toast(offlineBooks.length ? "已进入离线阅读" : "当前离线，已打开本机界面");
+        if (!navigator.onLine) {
+          await enterOfflineMode(client, "当前离线，已打开本机界面");
         } else {
-          setConnection("signedout");
-          toast(error instanceof Error ? error.message : "阅读服务暂时不可用");
+          const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
+          if (offlineBooks.length) {
+            setIsOnline(false);
+            setBooks(offlineBooks);
+            setProfile(storedProfile);
+            setSources([]);
+            setGroups([]);
+            setBookmarks([]);
+            setRssSources([]);
+            setReplaceRules([]);
+            setAdminAuthorized(false);
+            await refreshOfflineStatuses(offlineBooks);
+            client.setOfflineMode(true);
+            setConnection("offline");
+            toast("服务暂时不可用，已进入离线阅读");
+          } else {
+            setConnection("signedout");
+            toast(error instanceof Error ? error.message : "阅读服务暂时不可用");
+          }
         }
       }
     }
@@ -932,13 +980,17 @@ export function ReaderShell() {
     const username = String(values.get("username") || "").trim();
     const password = String(values.get("password") || "");
     if (!username || !password) return toast("请输入用户名和密码");
-    if (!navigator.onLine || !isOnline || connection === "offline") {
-      api.setOfflineMode(true);
-      return toast("当前没有网络，登录需要恢复网络后再试；本机缓存内容仍可继续阅读");
-    }
+    if (loginBusy) return;
+    const offlineAtStart = !navigator.onLine || !isOnline || connection === "offline";
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 6_000);
+    setLoginBusy(true);
     setConnection("authenticating");
     try {
-      const session = await api.login(username, password);
+      // This request is only made after an explicit tap. It also runs when
+      // navigator.onLine is false because that signal can lag behind a real
+      // network route; the timeout prevents a stalled radio from lingering.
+      const session = await api.login(username, password, controller.signal);
       const sessionUsername = session.userInfo?.username || username;
       localStorage.setItem("yomu-username", sessionUsername);
       api.setCacheNamespace(sessionUsername);
@@ -946,14 +998,18 @@ export function ReaderShell() {
       setShowConnect(false);
       await hydrateFromServer(api, false);
     } catch (error) {
-      const offline = !navigator.onLine;
+      const offline = offlineAtStart || !navigator.onLine || (error instanceof DOMException && error.name === "AbortError");
       if (offline) {
         api.setOfflineMode(true);
+        setIsOnline(false);
         setConnection("offline");
       } else {
         setConnection("signedout");
       }
-      toast(offline ? "登录需要网络，请恢复连接后重试" : error instanceof Error ? error.message : "登录失败");
+      toast(offline ? "已手动检查登录，但当前仍没有网络；恢复连接后可再次尝试" : error instanceof Error ? error.message : "登录失败");
+    } finally {
+      window.clearTimeout(timeout);
+      setLoginBusy(false);
     }
   }
 
@@ -2449,7 +2505,7 @@ export function ReaderShell() {
     void loadUsers();
   }
 
-  if (connection === "authenticating" || (!clientReady && connection === "checking")) {
+  if ((connection === "authenticating" && !showConnect) || (!clientReady && connection === "checking")) {
     return (
       <main className="auth-shell">
         <div className="auth-theme-switch" aria-label="外观模式">
@@ -2941,13 +2997,13 @@ export function ReaderShell() {
             {connection !== "connected" ? <>
               <h2 id="connect-title">登录并同步</h2>
               <p>本机可以先使用已缓存的内容；联网后登录即可恢复书架。登录成功后浏览器会自动保存安全会话，下次打开无需重复填写。</p>
-              <div className="account-session-note"><span className={`status-dot ${!isOnline || connection === "offline" ? "offline" : "signedout"}`} /><div><strong>{!isOnline || connection === "offline" ? "当前没有网络" : "等待登录"}</strong><small>{!isOnline || connection === "offline" ? "恢复网络后再提交登录，离线内容不会丢失。" : "只在登录时验证账号，不会保存密码。"}</small></div></div>
+              <div className="account-session-note"><span className={`status-dot ${!isOnline || connection === "offline" ? "offline" : "signedout"}`} /><div><strong>{!isOnline || connection === "offline" ? "当前没有网络" : loginBusy ? "正在尝试登录" : "等待登录"}</strong><small>{!isOnline || connection === "offline" ? "自动恢复会等待联网事件；点击登录可手动尝试一次，离线内容不会丢失。" : "只在登录时验证账号，不会保存密码。"}</small></div></div>
               <form onSubmit={loginAccount}>
                 <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={3} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
                 <label>密码<input name="password" type="password" autoComplete="current-password" maxLength={128} required /></label>
-                <button className="primary-button full-button" disabled={!isOnline || connection === "offline"}>登录并同步</button>
+                <button className="primary-button full-button" disabled={loginBusy}>{loginBusy ? "尝试中…" : !isOnline || connection === "offline" ? "手动尝试登录" : "登录并同步"}</button>
               </form>
-              {connection === "offline" && <button className="quiet-button full-button" onClick={() => { setIsOnline(true); void hydrateFromServer(api, false); }}>重新检查连接</button>}
+              {connection === "offline" && <button className="quiet-button full-button" disabled={loginBusy} onClick={() => { setIsOnline(navigator.onLine); void requestSessionRestore(api, false, true); }}>重新检查连接</button>}
               <button className="quiet-button full-button" onClick={installApp}>安装到设备</button>
               {profile.username && <button className="text-button danger-text full-button" onClick={logoutAccount}>清除本机缓存并退出</button>}
             </> : <>
