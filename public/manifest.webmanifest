@@ -1,9 +1,13 @@
 {
   "name": "轻阅读",
   "short_name": "轻阅读",
+  "id": "/",
   "description": "现代、轻量、可自托管的 Reader 3 兼容阅读器",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "prefer_related_applications": false,
   "background_color": "#f7f6f1",
   "theme_color": "#202722",
   "lang": "zh-CN",

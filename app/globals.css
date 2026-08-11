@@ -2399,6 +2399,30 @@ textarea:focus-visible {
   line-height: 1.7;
 }
 
+.install-help-steps {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 18px;
+  padding-left: 22px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.install-help-steps li {
+  padding-left: 4px;
+}
+
+.install-help-steps strong,
+.install-help-steps span {
+  display: block;
+}
+
+.install-help-steps strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
 .account-setting {
   display: flex;
   align-items: center;

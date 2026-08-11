@@ -35,6 +35,16 @@ import type {
 
 type LibraryTab = "local" | "bookmarks" | "rss" | "rules" | "backup" | "admin";
 type AppTheme = "system" | "light" | "dark";
+type InstallPromptEvent = Event & {
+  prompt?: () => Promise<void>;
+  userChoice?: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
+
+declare global {
+  interface Window {
+    __yomuInstallPrompt?: InstallPromptEvent;
+  }
+}
 
 interface ArticleSession {
   article: RssArticle;
@@ -364,7 +374,8 @@ export function ReaderShell() {
   const [showChapterSearch, setShowChapterSearch] = useState(false);
   const [chapterQuery, setChapterQuery] = useState("");
   const [preferences, setPreferences] = useState<ReaderPreferences>(defaultPreferences);
-  const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [showInstallHelp, setShowInstallHelp] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<"all" | "enabled" | "compatibility" | "incompatible" | "invalid">("all");
   const [sourceQuery, setSourceQuery] = useState("");
   const [sourceSort, setSourceSort] = useState<"order" | "name" | "latency">("order");
@@ -532,9 +543,18 @@ export function ReaderShell() {
       navigator.serviceWorker.register("/sw.js").catch(() => undefined);
     }
 
+    const pendingInstallPrompt = window.__yomuInstallPrompt;
+    if (pendingInstallPrompt) setInstallPrompt(pendingInstallPrompt);
     const captureInstallPrompt = (event: Event) => {
       event.preventDefault();
-      setInstallPrompt(event);
+      const prompt = event as InstallPromptEvent;
+      window.__yomuInstallPrompt = prompt;
+      setInstallPrompt(prompt);
+    };
+    const handleAppInstalled = () => {
+      window.__yomuInstallPrompt = undefined;
+      setInstallPrompt(null);
+      toast("轻阅读已安装到设备");
     };
     const keyboard = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -555,11 +575,13 @@ export function ReaderShell() {
       if (reader && event.key === "ArrowLeft") void changePageOrChapter(-1);
     };
     window.addEventListener("beforeinstallprompt", captureInstallPrompt);
+    window.addEventListener("appinstalled", handleAppInstalled);
     window.addEventListener("keydown", keyboard);
     const followSystemTheme = (event: MediaQueryListEvent) => setSystemDark(event.matches);
     colorScheme.addEventListener("change", followSystemTheme);
     return () => {
       window.removeEventListener("beforeinstallprompt", captureInstallPrompt);
+      window.removeEventListener("appinstalled", handleAppInstalled);
       window.removeEventListener("keydown", keyboard);
       colorScheme.removeEventListener("change", followSystemTheme);
     };
@@ -724,6 +746,13 @@ export function ReaderShell() {
   useEffect(() => {
     readerRef.current = reader;
   }, [reader]);
+
+  useEffect(() => {
+    if (!reader || readerMenuOpen || !window.matchMedia("(max-width: 900px)").matches) return;
+    // Mobile reading starts in an immersive mode. The menu is the deliberate
+    // way to reveal the title bar again, so closing it returns to the page.
+    setReaderChrome(false);
+  }, [reader, readerMenuOpen]);
 
   useEffect(() => {
     progressSyncRef.current = syncReadingProgress;
@@ -1246,7 +1275,7 @@ export function ReaderShell() {
       loading: true,
     });
     ensureReaderHistory();
-    setReaderChrome(true);
+    setReaderChrome(!window.matchMedia("(max-width: 900px)").matches);
     setReaderMenuOpen(false);
     setReaderError("");
     try {
@@ -2465,13 +2494,21 @@ export function ReaderShell() {
   }
 
   async function installApp() {
-    if (!installPrompt) {
-      toast("可在浏览器菜单中选择“添加到主屏幕”");
+    const prompt = installPrompt || window.__yomuInstallPrompt;
+    if (!prompt || typeof prompt.prompt !== "function") {
+      setShowInstallHelp(true);
       return;
     }
-    const prompt = installPrompt as Event & { prompt?: () => Promise<void> };
-    await prompt.prompt?.();
-    setInstallPrompt(null);
+    try {
+      await prompt.prompt();
+      const choice = await prompt.userChoice;
+      toast(choice?.outcome === "accepted" ? "正在安装轻阅读" : "已取消安装");
+    } catch {
+      setShowInstallHelp(true);
+    } finally {
+      window.__yomuInstallPrompt = undefined;
+      setInstallPrompt(null);
+    }
   }
 
   function applyAppTheme(next: AppTheme) {
@@ -2986,6 +3023,24 @@ export function ReaderShell() {
               </button>)}
             </div>}
             <p className="drawer-note">封面由服务器下载并缓存，浏览器不直接连接图片站点。</p>
+          </section>
+        </div>
+      )}
+
+      {showInstallHelp && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowInstallHelp(false)}>
+          <section className="modal install-help-modal" role="dialog" aria-modal="true" aria-labelledby="install-help-title">
+            <button className="modal-close" onClick={() => setShowInstallHelp(false)} aria-label="关闭">×</button>
+            <p className="eyebrow">安装到设备</p>
+            <h2 id="install-help-title">把轻阅读放到主屏幕</h2>
+            <p>当前浏览器没有提供系统安装按钮，应用本身仍然支持离线缓存和独立窗口。请按浏览器提示完成添加：</p>
+            <ol className="install-help-steps">
+              <li><strong>Android Chrome</strong><span>打开右上角菜单，选择“安装应用”或“添加到主屏幕”。</span></li>
+              <li><strong>iPhone / iPad Safari</strong><span>点分享按钮，选择“添加到主屏幕”。</span></li>
+              <li><strong>电脑 Chrome / Edge</strong><span>点击地址栏右侧的安装图标，或在浏览器菜单中选择安装。</span></li>
+            </ol>
+            <p className="drawer-note">如果系统仍显示 Chrome 标识，通常是添加了网页快捷方式而不是安装 PWA；请优先选择“安装应用”，并确认浏览器允许本站使用离线存储。</p>
+            <button className="primary-button full-button" onClick={() => setShowInstallHelp(false)}>知道了</button>
           </section>
         </div>
       )}

@@ -67,6 +67,9 @@ export default function RootLayout({
     <html lang="zh-CN">
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+        <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png" />
+        <link rel="apple-touch-icon" href="/icon-192.png" sizes="192x192" />
+        <script dangerouslySetInnerHTML={{ __html: "window.addEventListener('beforeinstallprompt',function(event){event.preventDefault();window.__yomuInstallPrompt=event;});" }} />
       </head>
       <body>{children}</body>
     </html>
