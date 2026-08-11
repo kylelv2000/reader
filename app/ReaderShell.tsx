@@ -350,6 +350,8 @@ export function ReaderShell() {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("checking");
+  const [isOnline, setIsOnline] = useState(true);
+  const [clientReady, setClientReady] = useState(false);
   const [profile, setProfile] = useState<ServerProfile>({});
   const [showConnect, setShowConnect] = useState(false);
   const [showCommand, setShowCommand] = useState(false);
@@ -439,6 +441,7 @@ export function ReaderShell() {
   const [shelfRefreshing, setShelfRefreshing] = useState(false);
 
   const api = useMemo(() => new ReaderApi(), []);
+  const connectionRef = useRef<ConnectionState>("checking");
 
   const filteredSources = useMemo(() => {
     let result = sources;
@@ -521,6 +524,7 @@ export function ReaderShell() {
     setExploreEnabled(getStoredExploreEnabled());
     setSystemDark(colorScheme.matches);
     setGreeting(timeGreeting());
+    setClientReady(true);
 
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => undefined);
@@ -560,6 +564,34 @@ export function ReaderShell() {
     // Keyboard listener intentionally follows the active reader session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reader]);
+
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
+
+  useEffect(() => {
+    const handleOffline = () => {
+      setIsOnline(false);
+      api.setOfflineMode(true);
+      if (["checking", "connected"].includes(connectionRef.current)) setConnection("offline");
+    };
+    const handleOnline = () => {
+      setIsOnline(true);
+      // The session Cookie is restored by the browser automatically. Retry
+      // the session and shelf request as soon as the device has a route again.
+      void hydrateFromServer(api, false);
+    };
+    setIsOnline(navigator.onLine);
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
+    };
+    // Network events are intentionally bound once; the current connection
+    // state is read from connectionRef to avoid re-registering listeners.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api]);
 
   useEffect(() => {
     const handleReaderBack = () => {
@@ -637,6 +669,19 @@ export function ReaderShell() {
     document.documentElement.dataset.theme = resolvedAppTheme;
     document.documentElement.style.colorScheme = resolvedAppTheme;
   }, [appTheme, resolvedAppTheme]);
+
+  useEffect(() => {
+    const themeColor = reader
+      ? resolvedReaderTheme === "night"
+        ? "#151714"
+        : resolvedReaderTheme === "green"
+          ? "#dfe8dc"
+          : "#ede5d6"
+      : resolvedAppTheme === "dark"
+        ? "#171a17"
+        : "#f7f6f1";
+    document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => meta.setAttribute("content", themeColor));
+  }, [reader, resolvedAppTheme, resolvedReaderTheme]);
 
   useEffect(() => () => {
     if (pageSnapTimerRef.current !== null) window.clearTimeout(pageSnapTimerRef.current);
@@ -830,6 +875,7 @@ export function ReaderShell() {
         localStorage.setItem("yomu-username", sessionUsername);
       }
       setAdminAuthorized(Boolean(user.adminAuthorized));
+      setIsOnline(true);
       setConnection("connected");
       void refreshOfflineStatuses(serverBooks);
       if (refresh) toast(`已更新 ${serverBooks.length} 本书`);
@@ -851,11 +897,15 @@ export function ReaderShell() {
       });
     } catch (error) {
       if (error instanceof ReaderApiError && error.code === "NEED_LOGIN") {
+        // Keep the last account name so an expired session can be renewed
+        // without losing the local offline namespace.
+        setProfile(storedProfile);
         setConnection("signedout");
         if (refresh) toast("登录已过期，请重新登录");
       } else {
         const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
-        if (offlineBooks.length) {
+        if (offlineBooks.length || !navigator.onLine) {
+          setIsOnline(false);
           setBooks(offlineBooks);
           setProfile(storedProfile);
           setSources([]);
@@ -867,7 +917,7 @@ export function ReaderShell() {
           await refreshOfflineStatuses(offlineBooks);
           client.setOfflineMode(true);
           setConnection("offline");
-          toast("已进入离线阅读");
+          toast(offlineBooks.length ? "已进入离线阅读" : "当前离线，已打开本机界面");
         } else {
           setConnection("signedout");
           toast(error instanceof Error ? error.message : "阅读服务暂时不可用");
@@ -882,15 +932,28 @@ export function ReaderShell() {
     const username = String(values.get("username") || "").trim();
     const password = String(values.get("password") || "");
     if (!username || !password) return toast("请输入用户名和密码");
+    if (!navigator.onLine || !isOnline || connection === "offline") {
+      api.setOfflineMode(true);
+      return toast("当前没有网络，登录需要恢复网络后再试；本机缓存内容仍可继续阅读");
+    }
     setConnection("authenticating");
     try {
-      await api.login(username, password);
-      localStorage.setItem("yomu-username", username);
-      setProfile({ username });
+      const session = await api.login(username, password);
+      const sessionUsername = session.userInfo?.username || username;
+      localStorage.setItem("yomu-username", sessionUsername);
+      api.setCacheNamespace(sessionUsername);
+      setProfile({ username: sessionUsername });
+      setShowConnect(false);
       await hydrateFromServer(api, false);
     } catch (error) {
-      setConnection("signedout");
-      toast(error instanceof Error ? error.message : "登录失败");
+      const offline = !navigator.onLine;
+      if (offline) {
+        api.setOfflineMode(true);
+        setConnection("offline");
+      } else {
+        setConnection("signedout");
+      }
+      toast(offline ? "登录需要网络，请恢复连接后重试" : error instanceof Error ? error.message : "登录失败");
     }
   }
 
@@ -1131,7 +1194,7 @@ export function ReaderShell() {
     setReaderMenuOpen(false);
     setReaderError("");
     try {
-      if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
+      if (!api || !["connected", "offline", "signedout"].includes(connection)) throw new Error("请重新登录");
       // Progress may have advanced on another device; the server copy wins.
       if (connection === "connected" && !preferredChapter) {
         const remote = await api.getShelfBook(book.bookUrl).catch(() => null);
@@ -1184,11 +1247,12 @@ export function ReaderShell() {
 
   async function loadChapter(index: number) {
     if (!reader || index < 0 || index >= reader.chapters.length) return;
+    setCatalogSliderIndex(index);
     setReader((current) => (current ? { ...current, chapterIndex: index, loading: true } : current));
     setShowCatalog(false);
     setReaderError("");
     try {
-      if (!api || !["connected", "offline"].includes(connection)) throw new Error("请重新登录");
+      if (!api || !["connected", "offline", "signedout"].includes(connection)) throw new Error("请重新登录");
       const content = await api.getBookContent(reader.book, reader.chapters[index], index);
       const readAt = Date.now();
       setReader((current) => (current ? {
@@ -1353,7 +1417,12 @@ export function ReaderShell() {
     const ratio = event.clientX / window.innerWidth;
     if (ratio < 0.23) void changePageOrChapter(-1);
     else if (ratio > 0.77) void changePageOrChapter(1);
-    else setReaderChrome((value) => !value);
+    else if (window.matchMedia("(max-width: 900px)").matches) {
+      // On touch screens the center tap is the safe, discoverable way to
+      // reveal controls. The desktop top bar remains available separately.
+      setReaderChrome(true);
+      setReaderMenuOpen(true);
+    } else setReaderChrome((value) => !value);
   }
 
   async function commitImportedSources(list: BookSource[]) {
@@ -2380,8 +2449,7 @@ export function ReaderShell() {
     void loadUsers();
   }
 
-  if (connection !== "connected" && connection !== "offline") {
-    const waiting = connection === "checking" || connection === "authenticating";
+  if (connection === "authenticating" || (!clientReady && connection === "checking")) {
     return (
       <main className="auth-shell">
         <div className="auth-theme-switch" aria-label="外观模式">
@@ -2392,15 +2460,8 @@ export function ReaderShell() {
         <section className="auth-panel">
           <div className="auth-card">
             <div className="auth-brand"><span className="brand-mark" /><div><strong>轻阅读</strong><small>随时继续阅读</small></div></div>
-            <h1>{waiting ? "正在连接" : "登录"}</h1>
-            {waiting ? <div className="auth-loading" role="status"><span /><p>{connection === "authenticating" ? "正在登录…" : "正在连接…"}</p></div> : <>
-              <p className="auth-hint">使用管理员创建的账号</p>
-              <form onSubmit={loginAccount}>
-                <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={3} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
-                <label>密码<input name="password" type="password" autoComplete="current-password" maxLength={128} required /></label>
-                <button className="primary-button full-button">登录</button>
-              </form>
-            </>}
+            <h1>{connection === "authenticating" ? "正在登录" : "正在连接"}</h1>
+            <div className="auth-loading" role="status"><span /><p>{connection === "authenticating" ? "正在登录并恢复书架…" : "正在恢复会话…"}</p></div>
             <small className="auth-footnote">无账号请联系管理员</small>
           </div>
         </section>
@@ -2439,8 +2500,8 @@ export function ReaderShell() {
           <button className="sync-card" onClick={() => setShowConnect(true)}>
             <span className={`status-dot ${connection}`} />
             <span>
-              <strong>{connection === "offline" ? "离线阅读" : "同步正常"}</strong>
-              <small>{profile.username || "已登录"}</small>
+              <strong>{connection === "offline" ? "离线阅读" : connection === "connected" ? "同步正常" : connection === "checking" ? "恢复中" : "未登录"}</strong>
+              <small>{profile.username || (connection === "signedout" ? "点击登录" : "等待会话")}</small>
             </span>
           </button>
           <button className="profile-button" onClick={() => setShowConnect(true)} aria-label="账户设置">
@@ -2475,6 +2536,26 @@ export function ReaderShell() {
         </header>
 
         <div className="view-scroll">
+          {connection !== "connected" && (
+            <section className={`session-banner ${connection === "offline" || !isOnline ? "offline" : connection === "checking" ? "checking" : "signedout"}`} role="status">
+              <span className="session-banner-icon" aria-hidden="true">{connection === "offline" || !isOnline ? "⌁" : connection === "checking" ? "◌" : "○"}</span>
+              <div>
+                <strong>{connection === "offline" || !isOnline ? "离线阅读模式" : connection === "checking" ? "正在恢复登录状态" : "尚未登录"}</strong>
+                <small>
+                  {connection === "offline" || !isOnline
+                    ? profile.username && books.length
+                      ? `当前显示 ${books.length} 本已缓存书籍；网络恢复后会自动同步。`
+                      : "可以先进入界面；登录和同步需要恢复网络，本机缓存仍可继续阅读。"
+                    : connection === "checking"
+                      ? "浏览器正在尝试使用已有的安全会话，稍后会自动更新。"
+                      : "现在可以先浏览界面，登录后即可同步书架、进度和书源。"}
+                </small>
+              </div>
+              <button className="quiet-button" onClick={() => setShowConnect(true)}>
+                {connection === "offline" || !isOnline ? "账户与登录" : "立即登录"}
+              </button>
+            </section>
+          )}
           {view === "shelf" && (
             <div className="view-content shelf-view">
               <section className="welcome-row">
@@ -2857,12 +2938,26 @@ export function ReaderShell() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowConnect(false)}>
           <section className="modal connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title">
             <button className="modal-close" onClick={() => setShowConnect(false)} aria-label="关闭">×</button>
-            <h2 id="connect-title">{profile.username || "我的阅读"}</h2>
-            <div className="account-setting"><span>外观</span><div className="segmented"><button className={appTheme === "system" ? "active" : ""} onClick={() => applyAppTheme("system")}>自动</button><button className={appTheme === "light" ? "active" : ""} onClick={() => applyAppTheme("light")}>浅色</button><button className={appTheme === "dark" ? "active" : ""} onClick={() => applyAppTheme("dark")}>深色</button></div></div>
-            <div className="account-setting"><span>分类发现</span><div className="segmented"><button className={!exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(false)}>关闭</button><button className={exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(true)} disabled={!hasExploreSources}>开启</button></div></div>
-            <button className="quiet-button full-button" onClick={installApp}>安装到设备</button>
-            <button className="quiet-button full-button" onClick={() => { setShowConnect(false); setView("library"); setLibraryTab("admin"); }}>修改密码与账户设置</button>
-            <button className="text-button danger-text full-button" onClick={logoutAccount}>退出登录</button>
+            {connection !== "connected" ? <>
+              <h2 id="connect-title">登录并同步</h2>
+              <p>本机可以先使用已缓存的内容；联网后登录即可恢复书架。登录成功后浏览器会自动保存安全会话，下次打开无需重复填写。</p>
+              <div className="account-session-note"><span className={`status-dot ${!isOnline || connection === "offline" ? "offline" : "signedout"}`} /><div><strong>{!isOnline || connection === "offline" ? "当前没有网络" : "等待登录"}</strong><small>{!isOnline || connection === "offline" ? "恢复网络后再提交登录，离线内容不会丢失。" : "只在登录时验证账号，不会保存密码。"}</small></div></div>
+              <form onSubmit={loginAccount}>
+                <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={3} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
+                <label>密码<input name="password" type="password" autoComplete="current-password" maxLength={128} required /></label>
+                <button className="primary-button full-button" disabled={!isOnline || connection === "offline"}>登录并同步</button>
+              </form>
+              {connection === "offline" && <button className="quiet-button full-button" onClick={() => { setIsOnline(true); void hydrateFromServer(api, false); }}>重新检查连接</button>}
+              <button className="quiet-button full-button" onClick={installApp}>安装到设备</button>
+              {profile.username && <button className="text-button danger-text full-button" onClick={logoutAccount}>清除本机缓存并退出</button>}
+            </> : <>
+              <h2 id="connect-title">{profile.username || "我的阅读"}</h2>
+              <div className="account-setting"><span>外观</span><div className="segmented"><button className={appTheme === "system" ? "active" : ""} onClick={() => applyAppTheme("system")}>自动</button><button className={appTheme === "light" ? "active" : ""} onClick={() => applyAppTheme("light")}>浅色</button><button className={appTheme === "dark" ? "active" : ""} onClick={() => applyAppTheme("dark")}>深色</button></div></div>
+              <div className="account-setting"><span>分类发现</span><div className="segmented"><button className={!exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(false)}>关闭</button><button className={exploreEnabled ? "active" : ""} onClick={() => setExploreEnabled(true)} disabled={!hasExploreSources}>开启</button></div></div>
+              <button className="quiet-button full-button" onClick={installApp}>安装到设备</button>
+              <button className="quiet-button full-button" onClick={() => { setShowConnect(false); setView("library"); setLibraryTab("admin"); }}>修改密码与账户设置</button>
+              <button className="text-button danger-text full-button" onClick={logoutAccount}>退出登录</button>
+            </>}
           </section>
         </div>
       )}
@@ -2981,6 +3076,33 @@ export function ReaderShell() {
               {readerSourceType === 0 && <button onClick={() => { setReaderMenuOpen(false); setShowChapterSearch(true); }}>查找正文</button>}
             </div>}
           </header>
+          {readerMenuOpen && (
+            <div className="reader-mobile-dock" role="toolbar" aria-label="阅读快捷菜单" onClick={(event) => event.stopPropagation()}>
+              <div className="reader-mobile-actions">
+                <button onClick={() => { setReaderMenuOpen(false); setShowCatalog(true); }}><span><AppIcon name="catalog" /></span><small>目录</small></button>
+                <button onClick={() => { setReaderMenuOpen(false); void saveCurrentBookmark(); }}><span>⌑</span><small>书签</small></button>
+                <button onClick={() => { setReaderMenuOpen(false); setShowReaderSettings(true); }}><span>Aa</span><small>设置</small></button>
+                <button onClick={() => { setReaderMenuOpen(false); if (offlineDownload?.bookUrl === reader.book.bookUrl) offlineDownloadRef.current?.abort(); else setOfflinePickerBook(reader.book); }}><span>↓</span><small>{offlineDownload?.bookUrl === reader.book.bookUrl ? "停止" : "缓存"}</small></button>
+              </div>
+              {reader.chapters.length > 1 && <div className="reader-mobile-chapter-control">
+                <button aria-label="上一章" disabled={reader.chapterIndex === 0} onClick={() => void changePageOrChapter(-1)}>‹</button>
+                <div className="reader-mobile-chapter-slider">
+                  <input
+                    type="range"
+                    min={0}
+                    max={reader.chapters.length - 1}
+                    value={Math.min(catalogSliderIndex, reader.chapters.length - 1)}
+                    aria-label="快速定位章节"
+                    onChange={(event) => setCatalogSliderIndex(Number(event.target.value))}
+                    onPointerUp={(event) => void loadChapter(Number(event.currentTarget.value))}
+                    onKeyUp={(event) => { if (event.key.startsWith("Arrow")) void loadChapter(Number(event.currentTarget.value)); }}
+                  />
+                  <div><span>第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</span><small>{currentChapter?.title || "快速滑动章节"}</small></div>
+                </div>
+                <button aria-label="下一章" disabled={reader.chapterIndex === reader.chapters.length - 1} onClick={() => void changePageOrChapter(1)}>›</button>
+              </div>}
+            </div>
+          )}
           <article ref={readingPaperRef} className={`reading-paper font-${preferences.fontFamily} page-${preferences.pageMode} ${readerSourceType === 1 ? "reader-audio" : readerSourceType === 2 ? "reader-comic" : ""}`} onClick={handleReaderTap} onScroll={handlePagedScroll} onWheel={handlePagedWheel}>
             <p className="chapter-kicker">第 {reader.chapterIndex + 1} / {reader.chapters.length} 章</p>
             <h1>{currentChapter?.title}</h1>
