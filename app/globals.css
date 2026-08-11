@@ -2777,9 +2777,18 @@ textarea:focus-visible {
 }
 
 .reader-overlay.chrome-hidden .reader-bar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  min-height: 0;
+  height: 0;
+  padding: 0;
+  overflow: hidden;
   pointer-events: none;
   opacity: 0;
   transform: translateY(-100%);
+  border-bottom: 0;
 }
 
 .reader-bar > button {

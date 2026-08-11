@@ -540,7 +540,7 @@ export function ReaderShell() {
     setClientReady(true);
 
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+      navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => undefined);
     }
 
     const pendingInstallPrompt = window.__yomuInstallPrompt;
