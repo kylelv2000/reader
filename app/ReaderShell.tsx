@@ -455,6 +455,7 @@ export function ReaderShell() {
   const api = useMemo(() => new ReaderApi(), []);
   const connectionRef = useRef<ConnectionState>("checking");
   const sessionRestoreRef = useRef<{ startedAt: number; inFlight: Promise<void> | null }>({ startedAt: 0, inFlight: null });
+  const lifecycleRestoreRef = useRef(0);
 
   const filteredSources = useMemo(() => {
     let result = sources;
@@ -603,9 +604,9 @@ export function ReaderShell() {
       setIsOnline(true);
       // The session Cookie is restored by the browser automatically. Retry
       // the session and shelf request as soon as the device has a route again.
-      // The helper deduplicates bursts of connectivity events so this stays
-      // quiet on mobile radios.
-      void requestSessionRestore(api, false);
+      // Connectivity recovery is an explicit signal, so it bypasses the
+      // normal startup throttle. The helper still deduplicates in-flight work.
+      void requestSessionRestore(api, false, false, true);
     };
     setIsOnline(navigator.onLine);
     window.addEventListener("offline", handleOffline);
@@ -790,22 +791,43 @@ export function ReaderShell() {
   }, [Boolean(reader)]);
 
   useEffect(() => {
-    // PWAs stay alive in the background for days; re-sync shelf data and
-    // check for a new app version whenever the user returns (throttled).
-    const onVisible = () => {
-      if (document.visibilityState !== "visible" || connection !== "connected") return;
-      const last = Number(sessionStorage.getItem("yomu-visible-sync-at") || 0);
-      if (Date.now() - last < 5 * 60_000) return;
-      sessionStorage.setItem("yomu-visible-sync-at", String(Date.now()));
-      void hydrateFromServer(api, false);
+    // A mobile browser may resume without emitting an `online` event. Probe
+    // when the app becomes visible/focused so an offline shelf can recover,
+    // while keeping the retry interval long enough to avoid radio wake-ups.
+    const onResume = () => {
+      if (document.visibilityState !== "visible") return;
+      const currentConnection = connectionRef.current;
+      const recovering = currentConnection === "offline" || currentConnection === "checking";
+      if (!navigator.onLine && !recovering) {
+        setIsOnline(false);
+        return;
+      }
+      const now = Date.now();
+      const last = recovering
+        ? lifecycleRestoreRef.current
+        : Number(sessionStorage.getItem("yomu-visible-sync-at") || 0);
+      const throttle = recovering ? 30_000 : 5 * 60_000;
+      if (now - last < throttle) return;
+      if (recovering) lifecycleRestoreRef.current = now;
+      else sessionStorage.setItem("yomu-visible-sync-at", String(now));
+      setIsOnline(navigator.onLine);
+      void requestSessionRestore(api, false, false, true);
       void navigator.serviceWorker?.getRegistration()
         .then((registration) => registration?.update())
         .catch(() => undefined);
     };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    document.addEventListener("visibilitychange", onResume);
+    window.addEventListener("pageshow", onResume);
+    window.addEventListener("focus", onResume);
+    return () => {
+      document.removeEventListener("visibilitychange", onResume);
+      window.removeEventListener("pageshow", onResume);
+      window.removeEventListener("focus", onResume);
+    };
+    // The current connection is read from connectionRef so this listener is
+    // not recreated on every state transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, connection]);
+  }, [api]);
 
   useEffect(() => {
     if (connection !== "connected" || !profile.username) return;
@@ -897,7 +919,11 @@ export function ReaderShell() {
     if (storedProfile.username) client.setCacheNamespace(storedProfile.username);
     client.setOfflineMode(true);
     const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
-    setIsOnline(false);
+    // `navigator.onLine` is the browser's network signal. Keep it separate
+    // from the server connection state so a temporary server failure can be
+    // retried on the next foreground/focus event even without an `online`
+    // event.
+    setIsOnline(navigator.onLine);
     setBooks(offlineBooks);
     setProfile(storedProfile);
     setSources([]);
@@ -911,23 +937,21 @@ export function ReaderShell() {
     if (notice) toast(notice);
   }
 
-  function requestSessionRestore(client: ReaderApi, refresh: boolean, manual = false) {
+  function requestSessionRestore(client: ReaderApi, refresh: boolean, manual = false, force = false) {
     const now = Date.now();
     const current = sessionRestoreRef.current;
-    if (!manual && navigator.onLine) {
-      if (current.inFlight) return current.inFlight;
-      if (now - current.startedAt < 60_000) return Promise.resolve();
-      current.startedAt = now;
-    }
-    const task = hydrateFromServer(client, refresh);
+    if (current.inFlight) return current.inFlight;
+    if (!manual && !force && navigator.onLine && now - current.startedAt < 60_000) return Promise.resolve();
+    current.startedAt = now;
+    const task = hydrateFromServer(client, refresh, manual || force);
     current.inFlight = task;
     return task.finally(() => {
       if (current.inFlight === task) current.inFlight = null;
     });
   }
 
-  async function hydrateFromServer(client: ReaderApi, refresh: boolean) {
-    if (!navigator.onLine) {
+  async function hydrateFromServer(client: ReaderApi, refresh: boolean, probe = false) {
+    if (!navigator.onLine && !probe) {
       await enterOfflineMode(client, "当前离线，已打开本机界面");
       return;
     }
@@ -935,10 +959,12 @@ export function ReaderShell() {
     const storedProfile = getStoredProfile();
     if (storedProfile.username) client.setCacheNamespace(storedProfile.username);
     client.setOfflineMode(false);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
     try {
       const [user, serverBooks] = await Promise.all([
-        client.getUserInfo(),
-        client.getBookshelf(refresh),
+        client.getUserInfo(controller.signal),
+        client.getBookshelf(refresh, { signal: controller.signal }),
       ]);
       setBooks(serverBooks);
       const sessionUsername = user.userInfo?.username || profile.username || "";
@@ -981,7 +1007,7 @@ export function ReaderShell() {
         } else {
           const offlineBooks = storedProfile.username ? await client.getOfflineBooks().catch(() => []) : [];
           if (offlineBooks.length) {
-            setIsOnline(false);
+            setIsOnline(navigator.onLine);
             setBooks(offlineBooks);
             setProfile(storedProfile);
             setSources([]);
@@ -1000,6 +1026,8 @@ export function ReaderShell() {
           }
         }
       }
+    } finally {
+      window.clearTimeout(timeout);
     }
   }
 
@@ -3052,7 +3080,7 @@ export function ReaderShell() {
             {connection !== "connected" ? <>
               <h2 id="connect-title">登录并同步</h2>
               <p>本机可以先使用已缓存的内容；联网后登录即可恢复书架。登录成功后浏览器会自动保存安全会话，下次打开无需重复填写。</p>
-              <div className="account-session-note"><span className={`status-dot ${!isOnline || connection === "offline" ? "offline" : "signedout"}`} /><div><strong>{!isOnline || connection === "offline" ? "当前没有网络" : loginBusy ? "正在尝试登录" : "等待登录"}</strong><small>{!isOnline || connection === "offline" ? "自动恢复会等待联网事件；点击登录可手动尝试一次，离线内容不会丢失。" : "只在登录时验证账号，不会保存密码。"}</small></div></div>
+              <div className="account-session-note"><span className={`status-dot ${!isOnline || connection === "offline" ? "offline" : "signedout"}`} /><div><strong>{!isOnline ? "当前没有网络" : connection === "offline" ? "服务暂时不可用" : loginBusy ? "正在尝试登录" : "等待登录"}</strong><small>{!isOnline || connection === "offline" ? "回到前台或网络恢复后会自动重试；点击登录也可手动尝试，离线内容不会丢失。" : "只在登录时验证账号，不会保存密码。"}</small></div></div>
               <form onSubmit={loginAccount}>
                 <label>用户名<input name="username" defaultValue={profile.username || ""} autoComplete="username" minLength={3} maxLength={32} pattern="[a-z0-9]+" required autoFocus /></label>
                 <label>密码<input name="password" type="password" autoComplete="current-password" maxLength={128} required /></label>

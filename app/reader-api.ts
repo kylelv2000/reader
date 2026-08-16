@@ -123,8 +123,8 @@ export class ReaderApi {
     return envelope.data;
   }
 
-  getUserInfo() {
-    return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/session");
+  getUserInfo(signal?: AbortSignal) {
+    return this.authRequest<{ secure?: boolean; adminAuthorized?: boolean; userInfo?: { username?: string } }>("/auth/session", { signal });
   }
 
   login(username: string, password: string, signal?: AbortSignal) {
@@ -158,11 +158,12 @@ export class ReaderApi {
     return envelope.data;
   }
 
-  async getBookshelf(refresh = false, options?: { maxAgeMs?: number; limit?: number; concurrentCount?: number }) {
-    if (!refresh) return this.request<Book[]>("/getBookshelf");
+  async getBookshelf(refresh = false, options?: { maxAgeMs?: number; limit?: number; concurrentCount?: number; signal?: AbortSignal }) {
+    if (!refresh) return this.request<Book[]>("/getBookshelf", { signal: options?.signal });
     const result = await this.request<{ books: Book[]; updated: number; failed: number }>("/refreshBookshelf", {
       method: "POST",
       body: JSON.stringify({ concurrentCount: options?.concurrentCount ?? 2, maxAgeMs: options?.maxAgeMs, limit: options?.limit }),
+      signal: options?.signal,
     });
     return result.books;
   }
