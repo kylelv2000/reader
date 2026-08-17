@@ -434,10 +434,11 @@ export function ReaderShell() {
   const activeCatalogChapterRef = useRef<HTMLButtonElement>(null);
   const catalogListRef = useRef<HTMLDivElement>(null);
   const [catalogSliderIndex, setCatalogSliderIndex] = useState(0);
-  const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number } | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number; scrollLeft: number; scrollTop: number } | null>(null);
   const readerTouchActiveRef = useRef(false);
   const pageSnapTimerRef = useRef<number | null>(null);
   const pageWheelLockUntilRef = useRef(0);
+  const bottomChapterLockUntilRef = useRef(0);
   const autoTurnRef = useRef(false);
   const offlineDownloadRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
@@ -1440,6 +1441,7 @@ export function ReaderShell() {
       x: touch.clientX,
       y: touch.clientY,
       scrollLeft: readingPaperRef.current?.scrollLeft || 0,
+      scrollTop: readerOverlayRef.current?.scrollTop || 0,
     };
   }
 
@@ -1449,6 +1451,7 @@ export function ReaderShell() {
     touchStartRef.current = null;
     readerTouchActiveRef.current = false;
     if (!start) return;
+    if (readerMenuOpen) return;
     const dx = touch.clientX - start.x;
     const dy = touch.clientY - start.y;
     if (preferences.pageMode === "paged") {
@@ -1463,9 +1466,7 @@ export function ReaderShell() {
       if (Math.abs(dx) > 24 && Math.abs(dx) > Math.abs(dy) * 1.15) {
         const direction = dx < 0 ? 1 : -1;
         const targetPage = startPage + direction;
-        if (targetPage < 0 || targetPage > lastPage) {
-          void changeChapter(direction);
-        } else {
+        if (targetPage >= 0 && targetPage <= lastPage) {
           paper.scrollTo({ left: targetPage === lastPage ? maxScrollLeft : targetPage * step, behavior: "auto" });
         }
       } else {
@@ -1477,8 +1478,15 @@ export function ReaderShell() {
       }
       return;
     }
-    if (Math.abs(dx) > 58 && Math.abs(dx) > Math.abs(dy) * 1.3) {
-      void changeChapter(dx < 0 ? 1 : -1);
+    const overlay = readerOverlayRef.current;
+    const verticalSwipe = Math.abs(dy) > 58 && Math.abs(dy) > Math.abs(dx) * 1.2;
+    if (!overlay || dy >= -58 || !verticalSwipe) return;
+    const maxScrollTop = Math.max(0, overlay.scrollHeight - overlay.clientHeight);
+    const startedAtBottom = start.scrollTop >= maxScrollTop - 28;
+    const endedAtBottom = overlay.scrollTop >= maxScrollTop - 28;
+    if (startedAtBottom && endedAtBottom && Date.now() >= bottomChapterLockUntilRef.current) {
+      bottomChapterLockUntilRef.current = Date.now() + 900;
+      void changeChapter(1);
     }
   }
 
@@ -1528,9 +1536,8 @@ export function ReaderShell() {
       return;
     }
     const ratio = event.clientX / window.innerWidth;
-    if (ratio < 0.23) void changePageOrChapter(-1);
-    else if (ratio > 0.77) void changePageOrChapter(1);
-    else if (window.matchMedia("(max-width: 900px)").matches) {
+    if (ratio < 0.23 || ratio > 0.77) return;
+    if (window.matchMedia("(max-width: 900px)").matches) {
       // On touch screens the center tap is the safe, discoverable way to
       // reveal controls. The desktop top bar remains available separately.
       setReaderChrome(true);
@@ -3257,7 +3264,7 @@ export function ReaderShell() {
                   {readerSourceType === 0 && <button type="button" onClick={() => { setReaderMenuOpen(false); setShowChapterSearch(true); }}><span>⌕</span><small>查找正文</small></button>}
                 </div>
                 {reader.chapters.length > 1 && <div className="reader-mobile-chapter-control">
-                  <button type="button" aria-label="上一章" disabled={reader.chapterIndex === 0} onClick={() => void changePageOrChapter(-1)}>‹</button>
+                  <button type="button" aria-label="上一章" disabled={reader.chapterIndex === 0} onClick={() => { setReaderMenuOpen(false); void changeChapter(-1); }}>‹</button>
                   <div className="reader-mobile-chapter-slider">
                     <div className="reader-mobile-progress-header"><span>章节进度</span><strong>{catalogSliderIndex + 1} / {reader.chapters.length}</strong></div>
                     <input
@@ -3273,7 +3280,7 @@ export function ReaderShell() {
                     />
                     <div className="reader-mobile-progress-caption"><span>{reader.chapters[catalogSliderIndex]?.title || currentChapter?.title || "快速滑动章节"}</span><small>松开跳转</small></div>
                   </div>
-                  <button type="button" aria-label="下一章" disabled={reader.chapterIndex === reader.chapters.length - 1} onClick={() => void changePageOrChapter(1)}>›</button>
+                  <button type="button" aria-label="下一章" disabled={reader.chapterIndex === reader.chapters.length - 1} onClick={() => { setReaderMenuOpen(false); void changeChapter(1); }}>›</button>
                 </div>}
               </div>
             </>
