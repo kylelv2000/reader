@@ -97,13 +97,9 @@ pub async fn save_book_group_id(
         .book_url
         .ok_or_else(|| AppError::BadRequest("bookUrl required".to_string()))?;
     let gid = param.group_id.unwrap_or(0);
-    let mut book = state
-        .book_service
-        .get_shelf_book(&user_ns, &url)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Book not found".to_string()))?;
-    book.group = Some(gid);
-    state.book_service.save_book(&user_ns, book).await?;
+    state.book_service.update_shelf_book(&user_ns, &url, "group", |book| {
+        book.group = Some(gid);
+    }).await?;
     Ok(Json(ApiResponse::ok(serde_json::json!("success"))))
 }
 
@@ -131,11 +127,9 @@ pub async fn add_book_group_multi(
     // Wait! Original `legado` Reader uses bitwise grouping: book.group is a bitfield!
     // "addBookGroupMulti": books.forEach { it.group = it.group | groupId }
     for url in urls {
-        if let Some(mut book) = state.book_service.get_shelf_book(&user_ns, &url).await? {
-            let cur = book.group.unwrap_or(0);
-            book.group = Some(cur | gid);
-            let _ = state.book_service.save_book(&user_ns, book).await;
-        }
+        state.book_service.update_shelf_book(&user_ns, &url, "group", |book| {
+            book.group = Some(book.group.unwrap_or(0) | gid);
+        }).await?;
     }
     Ok(Json(ApiResponse::ok(serde_json::json!("success"))))
 }
@@ -154,11 +148,9 @@ pub async fn remove_book_group_multi(
     let gid = param.group_id.unwrap_or(0);
     // remove: book.group = book.group & ~groupId
     for url in urls {
-        if let Some(mut book) = state.book_service.get_shelf_book(&user_ns, &url).await? {
-            let cur = book.group.unwrap_or(0);
-            book.group = Some(cur & !gid);
-            let _ = state.book_service.save_book(&user_ns, book).await;
-        }
+        state.book_service.update_shelf_book(&user_ns, &url, "group", |book| {
+            book.group = Some(book.group.unwrap_or(0) & !gid);
+        }).await?;
     }
     Ok(Json(ApiResponse::ok(serde_json::json!("success"))))
 }

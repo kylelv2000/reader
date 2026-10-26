@@ -5,12 +5,14 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
+  type SetStateAction,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { ReaderApi, ReaderApiError } from "./reader-api";
+import { createShelfSync } from "./shelf-sync.mjs";
 import { normalizeReaderText } from "./reader-text.mjs";
 import type {
   Book,
@@ -341,7 +343,12 @@ function resolveChapterIndex(
 
 export function ReaderShell() {
   const [view, setView] = useState<ViewName>("shelf");
-  const [books, setBooks] = useState<Book[]>([]);
+  const [books, setBooksState] = useState<Book[]>([]);
+  const shelfSyncRef = useRef(createShelfSync<Book[]>());
+  function setBooks(value: SetStateAction<Book[]>) {
+    shelfSyncRef.current.changed();
+    setBooksState(value);
+  }
   const [sources, setSources] = useState<BookSource[]>([]);
   const [groups, setGroups] = useState<BookGroup[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
@@ -836,13 +843,13 @@ export function ReaderShell() {
     const lastRefresh = Number(localStorage.getItem(key) || 0);
     if (Date.now() - lastRefresh < 24 * 60 * 60 * 1000) return;
     const timer = window.setTimeout(() => {
-      void api.getBookshelf(true, {
+      void shelfSyncRef.current.load((refresh) => api.getBookshelf(refresh, {
         maxAgeMs: 24 * 60 * 60 * 1000,
         limit: 80,
         concurrentCount: 2,
-      }).then((updatedBooks) => {
+      }), setBooks, true).then((updatedBooks) => {
+        if (!updatedBooks) return;
         localStorage.setItem(key, String(Date.now()));
-        setBooks(updatedBooks);
         void refreshOfflineStatuses(updatedBooks);
       }).catch(() => undefined);
     }, 8000);
@@ -965,9 +972,11 @@ export function ReaderShell() {
     try {
       const [user, serverBooks] = await Promise.all([
         client.getUserInfo(controller.signal),
-        client.getBookshelf(refresh, { signal: controller.signal }),
+        shelfSyncRef.current.load(
+          (shouldRefresh) => client.getBookshelf(shouldRefresh, { signal: controller.signal }),
+          setBooks, refresh,
+        ),
       ]);
-      setBooks(serverBooks);
       const sessionUsername = user.userInfo?.username || profile.username || "";
       setProfile((current) => ({ ...current, username: sessionUsername || current.username }));
       if (sessionUsername) {
@@ -977,8 +986,10 @@ export function ReaderShell() {
       setAdminAuthorized(Boolean(user.adminAuthorized));
       setIsOnline(true);
       setConnection("connected");
-      void refreshOfflineStatuses(serverBooks);
-      if (refresh) toast(`已更新 ${serverBooks.length} 本书`);
+      if (serverBooks) {
+        void refreshOfflineStatuses(serverBooks);
+        if (refresh) toast(`已更新 ${serverBooks.length} 本书`);
+      }
 
       void Promise.allSettled([
         client.getBookSources(),
@@ -1078,6 +1089,7 @@ export function ReaderShell() {
     await api.clearOfflineLibrary().catch(() => undefined);
     localStorage.removeItem("yomu-username");
     setProfile({});
+    shelfSyncRef.current.cancel();
     setBooks([]);
     setSources([]);
     setGroups([]);
@@ -2432,6 +2444,7 @@ export function ReaderShell() {
     try {
       const backup = JSON.parse(await file.text()) as YomuBackup;
       if (backup.format !== "yomu-backup" || backup.version !== 1) throw new Error("不是可识别的轻阅读备份");
+      shelfSyncRef.current.cancel();
       await Promise.all([
         api.saveBooks(backup.books || []),
         api.saveBookGroups(backup.groups || []),

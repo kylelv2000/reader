@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore};
 use tokio::time::{sleep, Duration, Instant};
 
 #[derive(Clone)]
@@ -29,6 +29,7 @@ pub struct BookService {
     parser: RuleEngine,
     cache: FileCache,
     storage_dir: PathBuf,
+    bookshelf_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     source_cookies: Arc<RwLock<HashMap<String, String>>>,
     rate_states: Arc<RwLock<HashMap<String, RateState>>>,
     outbound_slots: Arc<Semaphore>,
@@ -98,6 +99,7 @@ impl BookService {
             parser,
             cache,
             storage_dir,
+            bookshelf_locks: Arc::new(Mutex::new(HashMap::new())),
             source_cookies: Arc::new(RwLock::new(HashMap::new())),
             rate_states: Arc::new(RwLock::new(HashMap::new())),
             outbound_slots: Arc::new(Semaphore::new(outbound_limit)),
@@ -790,7 +792,9 @@ impl BookService {
             return Err(AppError::BadRequest("bookUrl required".to_string()));
         }
 
-        let mut list = self.read_bookshelf(user_ns).await?;
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
         let mut exist_idx: Option<usize> = None;
         for (i, b) in list.iter().enumerate() {
             if books_match_for_save(b, &book) {
@@ -827,8 +831,56 @@ impl BookService {
             list.push(book.clone());
         }
 
-        self.write_bookshelf(user_ns, &list).await?;
+        self.commit_bookshelf(user_ns, &before, &list, "save_book").await?;
         Ok(book)
+    }
+
+    pub async fn update_shelf_book(
+        &self,
+        user_ns: &str,
+        book_url: &str,
+        operation: &str,
+        update: impl FnOnce(&mut Book),
+    ) -> Result<Book, AppError> {
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
+        let book = list.iter_mut().find(|book| book.book_url == book_url)
+            .ok_or_else(|| AppError::NotFound("书籍未加入书架".to_string()))?;
+        update(book);
+        let saved = book.clone();
+        self.commit_bookshelf(user_ns, &before, &list, operation).await?;
+        Ok(saved)
+    }
+
+    /// Merge only metadata from successful fetches into the current shelf.
+    /// An old refresh cannot add/remove books or restore a previous source.
+    pub async fn apply_bookshelf_refresh(
+        &self,
+        user_ns: &str,
+        updates: Vec<Book>,
+    ) -> Result<Vec<Book>, AppError> {
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
+        for update in updates {
+            let Some(book) = list.iter_mut().find(|book| {
+                book.book_url == update.book_url
+                    && book.origin == update.origin
+                    && book.can_update != Some(false)
+                    && book.last_check_time.unwrap_or(0) <= update.last_check_time.unwrap_or(0)
+            }) else { continue; };
+            book.latest_chapter_title = update.latest_chapter_title.or(book.latest_chapter_title.take());
+            book.total_chapter_num = update.total_chapter_num.or(book.total_chapter_num);
+            book.update_time = update.update_time.or(book.update_time.take());
+            book.toc_url = update.toc_url.or(book.toc_url.take());
+            book.intro = update.intro.or(book.intro.take());
+            book.kind = update.kind.or(book.kind.take());
+            book.cover_url = book.cover_url.take().or(update.cover_url);
+            book.last_check_time = update.last_check_time;
+        }
+        self.commit_bookshelf(user_ns, &before, &list, "refresh").await?;
+        Ok(list)
     }
 
     pub async fn replace_book_source(
@@ -836,6 +888,7 @@ impl BookService {
         user_ns: &str,
         old_book_url: &str,
         mut book: Book,
+        align_progress: impl FnOnce(&Book, &mut Book),
     ) -> Result<Book, AppError> {
         sanitize_book_urls(&mut book);
         if book.origin.trim().is_empty() {
@@ -845,33 +898,22 @@ impl BookService {
             return Err(AppError::BadRequest("bookUrl required".to_string()));
         }
 
-        let mut list = self.read_bookshelf(user_ns).await?;
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
         let old_index = list
             .iter()
             .position(|item| item.book_url == old_book_url)
             .ok_or_else(|| AppError::BadRequest("书籍未加入书架".to_string()))?;
         let existing = list[old_index].clone();
-        if book.dur_chapter_index.is_none() {
-            book.dur_chapter_index = existing.dur_chapter_index;
-        }
-        if book.dur_chapter_title.is_none() {
-            book.dur_chapter_title = existing.dur_chapter_title;
-        }
-        if book.dur_chapter_time.is_none() {
-            book.dur_chapter_time = existing.dur_chapter_time;
-        }
-        if book.dur_chapter_pos.is_none() {
-            book.dur_chapter_pos = existing.dur_chapter_pos;
-        }
-        if book.group.is_none() {
-            book.group = existing.group;
-        }
-        if book.custom_cover_url.is_none() {
-            book.custom_cover_url = existing.custom_cover_url;
-        }
-        if book.cover_url.is_none() {
-            book.cover_url = existing.cover_url;
-        }
+        book.dur_chapter_index = existing.dur_chapter_index;
+        book.dur_chapter_title = existing.dur_chapter_title.clone();
+        book.dur_chapter_time = existing.dur_chapter_time;
+        book.dur_chapter_pos = existing.dur_chapter_pos;
+        book.group = existing.group;
+        book.custom_cover_url = existing.custom_cover_url.clone();
+        book.cover_url = existing.cover_url.clone().or(book.cover_url);
+        align_progress(&existing, &mut book);
 
         list[old_index] = book.clone();
         let new_url = book.book_url.clone();
@@ -882,12 +924,13 @@ impl BookService {
                 (index == old_index || item.book_url != new_url).then_some(item)
             })
             .collect();
-        self.write_bookshelf(user_ns, &list).await?;
+        self.commit_bookshelf(user_ns, &before, &list, "switch_source").await?;
         Ok(book)
     }
 
     pub async fn save_books(&self, user_ns: &str, books: Vec<Book>) -> Result<Vec<Book>, AppError> {
-        let existing = self.read_bookshelf(user_ns).await?;
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let existing = self.read_bookshelf_unlocked(user_ns).await?;
         let mut normalized: Vec<Book> = Vec::with_capacity(books.len());
         for mut book in books {
             sanitize_book_urls(&mut book);
@@ -916,12 +959,14 @@ impl BookService {
                 normalized.push(book);
             }
         }
-        self.write_bookshelf(user_ns, &normalized).await?;
+        self.commit_bookshelf(user_ns, &existing, &normalized, "replace_shelf").await?;
         Ok(normalized)
     }
 
     pub async fn delete_book(&self, user_ns: &str, book: &Book) -> Result<bool, AppError> {
-        let mut list = self.read_bookshelf(user_ns).await?;
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
         let orig_len = list.len();
         let removed: Vec<Book> = list
             .iter()
@@ -931,7 +976,7 @@ impl BookService {
         list.retain(|b| !books_match_for_delete(b, book));
         let deleted = list.len() != orig_len;
         if deleted {
-            self.write_bookshelf(user_ns, &list).await?;
+            self.commit_bookshelf(user_ns, &before, &list, "delete_book").await?;
             for removed_book in &removed {
                 let _ = self.clear_book_related_cache(user_ns, removed_book).await;
             }
@@ -940,7 +985,9 @@ impl BookService {
     }
 
     pub async fn delete_books(&self, user_ns: &str, books: Vec<Book>) -> Result<usize, AppError> {
-        let mut list = self.read_bookshelf(user_ns).await?;
+        let _guard = self.lock_bookshelf(user_ns).await;
+        let mut list = self.read_bookshelf_unlocked(user_ns).await?;
+        let before = list.clone();
         let mut deleted = 0usize;
         let mut removed_books: Vec<Book> = Vec::new();
         for book in books {
@@ -957,7 +1004,7 @@ impl BookService {
             }
         }
         if deleted > 0 {
-            self.write_bookshelf(user_ns, &list).await?;
+            self.commit_bookshelf(user_ns, &before, &list, "delete_books").await?;
             for removed_book in &removed_books {
                 let _ = self.clear_book_related_cache(user_ns, removed_book).await;
             }
@@ -1614,7 +1661,18 @@ impl BookService {
             .join("bookshelf.json")
     }
 
+    async fn lock_bookshelf(&self, user_ns: &str) -> OwnedMutexGuard<()> {
+        let lock = self.bookshelf_locks.lock().await
+            .entry(user_ns.to_string()).or_default().clone();
+        lock.lock_owned().await
+    }
+
     async fn read_bookshelf(&self, user_ns: &str) -> Result<Vec<Book>, AppError> {
+        let _guard = self.lock_bookshelf(user_ns).await;
+        self.read_bookshelf_unlocked(user_ns).await
+    }
+
+    async fn read_bookshelf_unlocked(&self, user_ns: &str) -> Result<Vec<Book>, AppError> {
         let path = self.bookshelf_path(user_ns);
         if !path.exists() {
             return Ok(Vec::new());
@@ -1631,7 +1689,7 @@ impl BookService {
                     entries = recovered.len(),
                     "recovered malformed bookshelf"
                 );
-                self.write_bookshelf(user_ns, &recovered).await?;
+                self.write_bookshelf_unlocked(user_ns, &recovered).await?;
                 recovered
             }
         };
@@ -1641,7 +1699,8 @@ impl BookService {
         Ok(list)
     }
 
-    async fn write_bookshelf(&self, user_ns: &str, list: &Vec<Book>) -> Result<(), AppError> {
+    // Called only while holding the per-user lock (or by isolated test fixtures).
+    async fn write_bookshelf_unlocked(&self, user_ns: &str, list: &[Book]) -> Result<(), AppError> {
         let path = self.bookshelf_path(user_ns);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -1649,9 +1708,39 @@ impl BookService {
                 .map_err(|e| AppError::Internal(e.into()))?;
         }
         let data = serde_json::to_string(list).map_err(|e| AppError::BadRequest(e.to_string()))?;
-        fs::write(&path, data)
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?;
+        let temporary = path.with_file_name(format!("bookshelf.{}.tmp", uuid::Uuid::new_v4()));
+        let result = async {
+            use tokio::io::AsyncWriteExt;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temporary).await?;
+            file.write_all(data.as_bytes()).await?;
+            file.sync_all().await?;
+            drop(file);
+            fs::rename(&temporary, &path).await
+        }.await;
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(AppError::Internal(error.into()));
+        }
+        Ok(())
+    }
+
+    async fn commit_bookshelf(
+        &self, user_ns: &str, before: &[Book], after: &[Book], operation: &str,
+    ) -> Result<(), AppError> {
+        if before == after {
+            return Ok(());
+        }
+        self.write_bookshelf_unlocked(user_ns, after).await?;
+        let added: Vec<_> = after.iter().filter(|b| !before.iter().any(|old| old.book_url == b.book_url))
+            .map(|b| md5_hex(&b.book_url)).collect();
+        let removed: Vec<_> = before.iter().filter(|b| !after.iter().any(|new| new.book_url == b.book_url))
+            .map(|b| md5_hex(&b.book_url)).collect();
+        tracing::info!(user = user_ns, operation, before = before.len(), after = after.len(),
+            ?added, ?removed, "bookshelf committed");
         Ok(())
     }
 
@@ -2457,7 +2546,9 @@ fn sanitize_book_urls(book: &mut Book) {
 }
 
 fn progress_updated_at(book: &Book) -> i64 {
-    book.dur_chapter_time.unwrap_or(0)
+    let time = book.dur_chapter_time.unwrap_or(0);
+    // Legacy core writes used Unix seconds; browser/imported records use milliseconds.
+    if time > 0 && time < 100_000_000_000 { time * 1000 } else { time }
 }
 
 fn progress_rank(book: &Book) -> i64 {
@@ -2914,7 +3005,7 @@ mod tests {
         let old = test_book(0, 0, 3000);
         let fresh = test_book(8, 7300, 2000);
         service
-            .write_bookshelf(user_ns, &vec![old, fresh])
+            .write_bookshelf_unlocked(user_ns, &vec![old, fresh])
             .await
             .unwrap();
 
@@ -3007,7 +3098,7 @@ mod tests {
         replacement.dur_chapter_title = None;
         replacement.dur_chapter_pos = None;
         let saved = service
-            .replace_book_source(user_ns, &old_url, replacement)
+            .replace_book_source(user_ns, &old_url, replacement, |_, _| {})
             .await
             .unwrap();
         let shelf = service.get_bookshelf(user_ns).await.unwrap();
@@ -3043,6 +3134,142 @@ mod tests {
         assert_eq!(saved[0].dur_chapter_pos, Some(7300));
         assert_eq!(saved[0].dur_chapter_time, Some(2000));
         assert_eq!(saved[0].dur_chapter_title.as_deref(), Some("第9章"));
+    }
+
+    #[tokio::test]
+    async fn shelf_refresh_preserves_concurrent_add_delete_switch_and_user_fields() {
+        let (service, storage) = test_book_service("refresh-concurrent-edits");
+        let ns = "reader";
+        let first = test_book(1, 100, 1_790_000_000_000);
+        let mut second = first.clone();
+        second.book_url = "https://book.example/2".into();
+        second.name = "second".into();
+        let mut third = first.clone();
+        third.book_url = "https://book.example/3".into();
+        third.name = "third".into();
+        service.save_books(ns, vec![first.clone(), second.clone(), third.clone()]).await.unwrap();
+        // A refresh takes its snapshot before slow network work.
+        let mut snapshot = service.get_bookshelf(ns).await.unwrap();
+        for book in &mut snapshot {
+            book.latest_chapter_title = Some("更新章节".into());
+            book.last_check_time = Some(2_000);
+        }
+        let mut added = first.clone();
+        added.book_url = "https://book.example/4".into();
+        service.save_book(ns, added.clone()).await.unwrap();
+        service.delete_book(ns, &second).await.unwrap();
+        let mut switched = third.clone();
+        switched.book_url = "https://new.example/3".into();
+        service.replace_book_source(ns, &third.book_url, switched.clone(), |_, _| {}).await.unwrap();
+        service.update_shelf_book(ns, &first.book_url, "test", |book| {
+            book.dur_chapter_index = Some(8);
+            book.dur_chapter_time = Some(1_790_000_001_000);
+            book.group = Some(4);
+            book.custom_cover_url = Some("https://covers.example/custom".into());
+        }).await.unwrap();
+        let shelf = service.apply_bookshelf_refresh(ns, snapshot).await.unwrap();
+        assert_eq!(shelf.len(), 3);
+        assert!(shelf.iter().any(|b| b.book_url == added.book_url));
+        assert!(shelf.iter().any(|b| b.book_url == switched.book_url));
+        assert!(!shelf.iter().any(|b| b.book_url == second.book_url || b.book_url == third.book_url));
+        let book = shelf.iter().find(|b| b.book_url == first.book_url).unwrap();
+        assert_eq!(book.dur_chapter_index, Some(8));
+        assert_eq!(book.group, Some(4));
+        assert_eq!(book.custom_cover_url.as_deref(), Some("https://covers.example/custom"));
+        assert_eq!(book.latest_chapter_title.as_deref(), Some("更新章节"));
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn shelf_refresh_ignores_old_metadata_and_changed_source_at_same_url() {
+        let (service, storage) = test_book_service("refresh-stale-metadata");
+        let mut book = test_book(1, 0, 1);
+        book.last_check_time = Some(3000);
+        book.latest_chapter_title = Some("latest".into());
+        service.save_book("reader", book.clone()).await.unwrap();
+        let mut old = book.clone();
+        old.last_check_time = Some(2000);
+        old.latest_chapter_title = Some("old".into());
+        assert_eq!(service.apply_bookshelf_refresh("reader", vec![old.clone()]).await.unwrap(), vec![book.clone()]);
+        old.last_check_time = Some(4000);
+        old.origin = "https://other.example".into();
+        assert_eq!(service.apply_bookshelf_refresh("reader", vec![old]).await.unwrap(), vec![book]);
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn shelf_concurrent_adds_and_field_updates_do_not_lose_writes() {
+        let (service, storage) = test_book_service("concurrent-shelf-writers");
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut book = test_book(0, 0, 1);
+                book.book_url = format!("https://book.example/{i}");
+                barrier.wait().await;
+                service.save_book("reader", book).await.unwrap();
+            }));
+        }
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(service.get_bookshelf("reader").await.unwrap().len(), 16);
+        let url = "https://book.example/0";
+        let (a, b) = tokio::join!(
+            service.update_shelf_book("reader", url, "group", |book| book.group = Some(book.group.unwrap_or(0) | 1)),
+            service.update_shelf_book("reader", url, "group", |book| book.group = Some(book.group.unwrap_or(0) | 2)),
+        );
+        a.unwrap(); b.unwrap();
+        assert_eq!(service.get_shelf_book("reader", url).await.unwrap().unwrap().group, Some(3));
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn shelf_update_after_delete_does_not_readd_book() {
+        let (service, storage) = test_book_service("deleted-book-progress");
+        let book = test_book(0, 0, 1);
+        service.save_book("reader", book.clone()).await.unwrap();
+        service.delete_book("reader", &book).await.unwrap();
+        assert!(service.update_shelf_book("reader", &book.book_url, "progress", |b| b.dur_chapter_index = Some(10)).await.is_err());
+        assert!(service.get_bookshelf("reader").await.unwrap().is_empty());
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[tokio::test]
+    async fn shelf_file_is_always_complete_during_commits() {
+        let (service, storage) = test_book_service("atomic-shelf");
+        let mut book = test_book(0, 0, 1);
+        book.intro = Some("large metadata".repeat(10_000));
+        service.save_book("reader", book.clone()).await.unwrap();
+        let path = service.bookshelf_path("reader");
+        let writer = async {
+            for i in 0..30 {
+                service.update_shelf_book("reader", &book.book_url, "progress", |b| b.dur_chapter_index = Some(i)).await.unwrap();
+            }
+        };
+        let reader = async {
+            for _ in 0..100 {
+                let bytes = fs::read(&path).await.unwrap();
+                assert_eq!(serde_json::from_slice::<Vec<Book>>(&bytes).unwrap().len(), 1);
+            }
+        };
+        tokio::join!(writer, reader);
+        let mut entries = fs::read_dir(path.parent().unwrap()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert_eq!(entry.file_name(), "bookshelf.json");
+        }
+        let _ = fs::remove_dir_all(storage).await;
+    }
+
+    #[test]
+    fn shelf_progress_compares_legacy_seconds_with_milliseconds() {
+        let existing = test_book(8, 0, 1_790_000_002);
+        let mut incoming = test_book(2, 0, 1_790_000_001_000);
+        preserve_newer_reading_progress(&existing, &mut incoming);
+        assert_eq!(incoming.dur_chapter_index, Some(8));
+        let mut reread = test_book(0, 0, 1_790_000_003_000);
+        preserve_newer_reading_progress(&existing, &mut reread);
+        assert_eq!(reread.dur_chapter_index, Some(0));
     }
 
     #[tokio::test]

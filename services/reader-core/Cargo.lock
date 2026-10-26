@@ -3752,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "yomu-reader-core"
-version = "1.4.3"
+version = "1.4.4"
 dependencies = [
  "aes",
  "anyhow",

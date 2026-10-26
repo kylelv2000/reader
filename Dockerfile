@@ -7,6 +7,7 @@ COPY . .
 RUN npm run build
 
 FROM node:22.22-alpine AS runtime
+LABEL org.opencontainers.image.version="1.4.4"
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

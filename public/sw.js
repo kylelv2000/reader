@@ -1,4 +1,4 @@
-const CACHE_NAME = "light-reader-shell-v6";
+const CACHE_NAME = "light-reader-shell-v7";
 const APP_SHELL = ["/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 
 async function cacheAppShell() {

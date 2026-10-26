@@ -1886,12 +1886,14 @@ pub async fn refresh_bookshelf(
         if did_fail {
             failed += 1;
         }
-        refreshed.push((index, book));
+        if success {
+            refreshed.push((index, book));
+        }
     }
     refreshed.sort_by_key(|(index, _)| *index);
     let saved = state
         .book_service
-        .save_books(&user_ns, refreshed.into_iter().map(|(_, book)| book).collect())
+        .apply_bookshelf_refresh(&user_ns, refreshed.into_iter().map(|(_, book)| book).collect())
         .await?;
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "books": saved,
@@ -2564,7 +2566,14 @@ pub async fn set_book_source(
 
     let saved = state
         .book_service
-        .replace_book_source(&user_ns, &shelf_book.book_url, updated)
+        .replace_book_source(&user_ns, &shelf_book.book_url, updated, |latest, switched| {
+            let index = aligned_chapter_index(
+                &chapters, latest.dur_chapter_title.as_deref(),
+                latest.dur_chapter_index.unwrap_or(0).max(0) as usize,
+            );
+            switched.dur_chapter_index = Some(index as i32);
+            switched.dur_chapter_title = Some(chapters[index].title.clone());
+        })
         .await?;
     if let Some((bytes, content_type)) = preserved_cover {
         let source_key = saved
@@ -2656,6 +2665,7 @@ pub async fn save_book_progress(
     Query(q): Query<SaveBookProgressRequest>,
     body: Option<Json<SaveBookProgressRequest>>,
 ) -> Result<Json<ApiResponse<Value>>, AppError> {
+    let progress_time = chrono::Utc::now().timestamp_millis();
     let user_ns = state
         .user_service
         .resolve_user_ns_with_override(auth.access_token(), auth.secure_key(), auth.user_ns())
@@ -2678,7 +2688,6 @@ pub async fn save_book_progress(
         .await?
         .ok_or_else(|| AppError::BadRequest("书籍未加入书架".to_string()))?;
 
-    let mut updated = shelf_book.clone();
     let mut chapter_title: Option<String> = None;
     if is_local_txt_origin(&shelf_book.origin) || is_local_txt_url(&shelf_book.book_url) {
         if let Ok(chapters) = state
@@ -2688,10 +2697,6 @@ pub async fn save_book_progress(
         {
             if index >= 0 && (index as usize) < chapters.len() {
                 chapter_title = Some(chapters[index as usize].title.clone());
-            }
-            updated.total_chapter_num = Some(chapters.len() as i32);
-            if let Some(last) = chapters.last() {
-                updated.latest_chapter_title = Some(last.title.clone());
             }
         }
     } else if is_local_epub_origin(&shelf_book.origin) || is_local_epub_url(&shelf_book.book_url) {
@@ -2703,10 +2708,6 @@ pub async fn save_book_progress(
             if index >= 0 && (index as usize) < chapters.len() {
                 chapter_title = Some(chapters[index as usize].title.clone());
             }
-            updated.total_chapter_num = Some(chapters.len() as i32);
-            if let Some(last) = chapters.last() {
-                updated.latest_chapter_title = Some(last.title.clone());
-            }
         }
     } else if is_local_pdf_origin(&shelf_book.origin) || is_local_pdf_url(&shelf_book.book_url) {
         if let Ok(chapters) = state
@@ -2716,10 +2717,6 @@ pub async fn save_book_progress(
         {
             if index >= 0 && (index as usize) < chapters.len() {
                 chapter_title = Some(chapters[index as usize].title.clone());
-            }
-            updated.total_chapter_num = Some(chapters.len() as i32);
-            if let Some(last) = chapters.last() {
-                updated.latest_chapter_title = Some(last.title.clone());
             }
         }
     } else if let (Some(toc_url), Ok(Some(source))) = (
@@ -2737,22 +2734,20 @@ pub async fn save_book_progress(
             if index >= 0 && (index as usize) < chapters.len() {
                 chapter_title = Some(chapters[index as usize].title.clone());
             }
-            updated.total_chapter_num = Some(chapters.len() as i32);
-            if let Some(last) = chapters.last() {
-                updated.latest_chapter_title = Some(last.title.clone());
-            }
         }
     }
-    updated.dur_chapter_index = Some(index);
-    updated.dur_chapter_time = Some(crate::util::time::now_ts());
-    if let Some(title) = chapter_title {
-        updated.dur_chapter_title = Some(title);
-    }
-    if let Some(pos) = req.position {
-        updated.dur_chapter_pos = Some(pos);
-    }
-
-    let _ = state.book_service.save_book(&user_ns, updated).await?;
+    // Timestamp at request receipt, not after a possibly slow catalog fetch.
+    state.book_service.update_shelf_book(&user_ns, &book_url, "progress", |book| {
+        let existing_time = book.dur_chapter_time.unwrap_or(0);
+        let existing_ms = if existing_time > 0 && existing_time < 100_000_000_000 {
+            existing_time * 1000
+        } else { existing_time };
+        if existing_ms > progress_time || book.origin != shelf_book.origin { return; }
+        book.dur_chapter_index = Some(index);
+        book.dur_chapter_time = Some(progress_time);
+        if let Some(title) = chapter_title { book.dur_chapter_title = Some(title); }
+        if let Some(pos) = req.position { book.dur_chapter_pos = Some(pos); }
+    }).await?;
     Ok(Json(ApiResponse::ok(serde_json::json!(""))))
 }
 
@@ -3039,7 +3034,10 @@ pub async fn set_book_cover(
         book.custom_cover_url = None;
         book.cover_url = None;
     }
-    let saved = state.book_service.save_book(&user_ns, book.clone()).await?;
+    let saved = state.book_service.update_shelf_book(&user_ns, &book.book_url, "cover", |latest| {
+        latest.custom_cover_url = book.custom_cover_url.clone();
+        if cover_url.is_none() { latest.cover_url = None; }
+    }).await?;
     Ok(Json(ApiResponse::ok(
         serde_json::to_value(saved).unwrap_or_default(),
     )))
@@ -4263,22 +4261,13 @@ async fn cache_borrowed_shelf_cover(
         {
             continue;
         }
-        let mut updated = state
-            .book_service
-            .get_shelf_book(user_ns, &shelf_book.book_url)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| shelf_book.clone());
-        if updated
-            .custom_cover_url
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return;
-        }
-        updated.cover_url = Some(cover_url.to_string());
-        if let Err(error) = state.book_service.save_book(user_ns, updated).await {
+        if let Err(error) = state.book_service.update_shelf_book(
+            user_ns, &shelf_book.book_url, "borrow_cover", |book| {
+                if book.custom_cover_url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                    book.cover_url = Some(cover_url.to_string());
+                }
+            },
+        ).await {
             tracing::debug!("failed to persist borrowed cover: {:?}", error);
         }
         return;
